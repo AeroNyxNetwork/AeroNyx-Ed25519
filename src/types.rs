@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::WebSocketStream;
 
 /// Represents client connection state
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Client {
     /// WebSocket connection with client
     pub stream: Arc<Mutex<WebSocketStream<TcpStream>>>,
