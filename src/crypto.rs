@@ -1,6 +1,7 @@
 use aes::Aes256;
-use cbc::{Decryptor, Encryptor, cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit}};
-use ed25519_dalek::{Keypair as Ed25519Keypair, PublicKey as Ed25519PublicKey, SecretKey as Ed25519SecretKey};
+use cbc::{Decryptor, Encryptor};
+use ed25519_dalek::Keypair as Ed25519Keypair;
+use rand::RngCore;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha512};
 use solana_sdk::signature::Keypair;
@@ -9,8 +10,8 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey
 
 use crate::types::{Result, VpnError};
 
-type Aes256CbcEnc = Encryptor<Aes256, Pkcs7>;
-type Aes256CbcDec = Decryptor<Aes256, Pkcs7>;
+type Aes256CbcEnc = Encryptor<Aes256>;
+type Aes256CbcDec = Decryptor<Aes256>;
 
 /// Generate a new Solana keypair
 pub fn generate_keypair() -> Keypair {
@@ -94,7 +95,8 @@ pub fn generate_shared_secret(local_private: &Keypair, remote_public: &Pubkey) -
 pub fn encrypt(data: &[u8], shared_secret: &[u8; 32]) -> Result<Vec<u8>> {
     // Generate a random 16-byte IV
     let mut iv = [0u8; 16];
-    OsRng.fill_bytes(&mut iv);
+    let mut rng = rand::thread_rng();
+    rng.fill_bytes(&mut iv);
     
     // Create AES-256-CBC encryptor
     let encryptor = Aes256CbcEnc::new(shared_secret.into(), &iv.into());
