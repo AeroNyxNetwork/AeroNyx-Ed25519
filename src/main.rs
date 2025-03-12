@@ -4,7 +4,8 @@ mod server;
 mod types;
 
 use clap::Parser;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::fmt;
+use tracing_subscriber::EnvFilter;
 
 use crate::server::VpnServer;
 use crate::types::Args;
@@ -23,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
     
-    tracing::info!("Starting Solana Private Server...");
+    tracing::info!("Starting Solana VPN Server...");
     
     // Create and start VPN server
     let server = VpnServer::new(args.clone()).await?;
