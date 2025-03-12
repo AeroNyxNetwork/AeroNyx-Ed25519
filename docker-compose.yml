@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  vpn-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: solana-vpn
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN  # Required for TUN device and iptables
+      - SYS_MODULE # For loading kernel modules if needed
+    devices:
+      - /dev/net/tun:/dev/net/tun  # Expose TUN device
+    ports:
+      - "8080:8080"  # WebSocket port
+    environment:
+      - RUST_LOG=info
+      - ENABLE_NAT=true
+      - SUBNET=10.7.0.0/24
+    command: [
+      "solana-vpn",
+      "--listen", "0.0.0.0:8080",
+      "--tun-name", "tun0",
+      "--subnet", "10.7.0.0/24",
+      "--log-level", "info"
+    ]
+    networks:
+      vpn_net:
+        ipv4_address: 172.28.0.2
+
+networks:
+  vpn_net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
