@@ -18,7 +18,7 @@ tun = { version = "0.5", features = ["async"] }
 socket2 = "0.5"
 
 # Cryptography
-solana-sdk = "1.16"
+solana-sdk = "=1.14.18"
 ed25519-dalek = "1.0"
 x25519-dalek = "1.2"
 rand = "0.8"
