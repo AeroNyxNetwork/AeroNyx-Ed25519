@@ -2,7 +2,7 @@ use ipnetwork::Ipv4Network;
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
-use tun::Device;
+use tun::platform::Device;
 use tun::Configuration;
 
 use crate::types::{Result, VpnError};
