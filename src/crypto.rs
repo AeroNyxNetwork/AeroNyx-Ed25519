@@ -1,7 +1,9 @@
 use aes::Aes256;
 use cbc::{Decryptor, Encryptor};
-use ed25519_dalek::Keypair as Ed25519Keypair;
+use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use rand::RngCore;
+use rand::rngs::ThreadRng;
+use sha2::{Digest, Sha512};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha512};
 use solana_sdk::signature::Keypair;
@@ -99,8 +101,9 @@ pub fn encrypt(data: &[u8], shared_secret: &[u8; 32]) -> Result<Vec<u8>> {
     rng.fill_bytes(&mut iv);
     
     // Create AES-256-CBC encryptor
-    let encryptor = Aes256CbcEnc::new(shared_secret.into(), &iv.into());
-    
+    let encryptor = Aes256CbcEnc::new_from_slices(shared_secret, &iv)
+        .map_err(|e| VpnError::Crypto(format!("Encryption setup failed: {}", e)))?;
+        
     // Encrypt the data
     let mut buffer = vec![0u8; data.len() + 32]; // Allow space for padding
     let ciphertext = encryptor.encrypt_padded_b2b_mut::<Pkcs7>(data, &mut buffer)
@@ -125,7 +128,8 @@ pub fn decrypt(encrypted: &[u8], shared_secret: &[u8; 32]) -> Result<Vec<u8>> {
     let ciphertext = &encrypted[16..];
     
     // Create AES-256-CBC decryptor
-    let decryptor = Aes256CbcDec::new(shared_secret.into(), iv.into());
+    let decryptor = Aes256CbcDec::new_from_slices(shared_secret, iv)
+        .map_err(|e| VpnError::Crypto(format!("Decryption setup failed: {}", e)))?;
     
     // Decrypt the data
     let mut buffer = vec![0u8; ciphertext.len()];
