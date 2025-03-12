@@ -1,5 +1,5 @@
 use futures::{SinkExt, StreamExt};
-use solana_sdk::signature::Keypair;
+use solana_sdk::signature::{Keypair, Signer};
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tokio_tungstenite::tungstenite::Message;
-use tun::Device;
+use tun::platform::Device;
 
 use crate::crypto::{decrypt_packet, encrypt_packet};
 use crate::network::{process_packet, setup_tun_device, generate_ip_pool};
@@ -58,7 +58,7 @@ impl VpnServer {
         // Spawn TUN reader task
         let tun_device = self.tun_device.clone();
         let clients = self.clients.clone();
-        let server_keypair = self.server_keypair.clone();
+        let server_keypair = self.server_keypair.pubkey();
         
         tokio::spawn(async move {
             Self::handle_tun_packets(tun_device, clients, server_keypair).await;
@@ -70,7 +70,7 @@ impl VpnServer {
             
             let clients_clone = self.clients.clone();
             let ip_pool_clone = self.ip_pool.clone();
-            let server_keypair_clone = self.server_keypair.clone();
+            let server_keypair_clone = self.server_keypair.to_bytes(); // We will recreate the keypair later
             
             // Handle each client in a separate task
             tokio::spawn(async move {
@@ -93,7 +93,7 @@ impl VpnServer {
     async fn handle_tun_packets(
         tun_device: Arc<Mutex<Device>>,
         clients: Arc<Mutex<HashMap<SocketAddr, Client>>>,
-        server_keypair: Keypair,
+        server_pubkey: Pubkey,
     ) {
         let mut buffer = vec![0u8; 2048];
         
@@ -230,7 +230,8 @@ impl VpnServer {
         client: Client,
         clients: Arc<Mutex<HashMap<SocketAddr, Client>>>,
         ip_pool: Arc<Mutex<VecDeque<String>>>,
-        server_keypair: Keypair,
+        server_keypair_bytes: [u8; 64],
+        tun_device: Arc<Mutex<Device>>,
     ) -> Result<()> {
         let client_public_key = client.public_key;
         let assigned_ip = client.assigned_ip.clone();
