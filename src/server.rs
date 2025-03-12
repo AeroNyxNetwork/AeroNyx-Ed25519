@@ -1,11 +1,11 @@
-use futures::{SinkExt, StreamExt};
-use solana_sdk::signature::{Keypair, Signer};
-use solana_sdk::pubkey::Pubkey;
+use std::io::{Read, Write};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use futures::{SinkExt, StreamExt};
+use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::pubkey::Pubkey;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
@@ -16,6 +16,12 @@ use tun::platform::Device;
 use crate::crypto::{decrypt_packet, encrypt_packet};
 use crate::network::{process_packet, setup_tun_device, generate_ip_pool};
 use crate::types::{Args, Client, PacketType, Result, VpnError};
+
+// Helper function to clone a Keypair
+fn clone_keypair(keypair: &Keypair) -> Keypair {
+    let bytes = keypair.to_bytes();
+    Keypair::from_bytes(&bytes).unwrap()
+}
 
 /// VPN Server main structure
 pub struct VpnServer {
@@ -51,17 +57,17 @@ impl VpnServer {
     
     /// Start the VPN server
     pub async fn start(&self, listen_addr: &str) -> Result<()> {
-        let listener = TcpListener::bind(listen_addr).await.map_err(VpnError::Io)?;
+        let listener = TcpListener::bind(listen_addr).await.map_err(|e| VpnError::Network(e.to_string()))?;
         tracing::info!("VPN Server listening on: {}", listen_addr);
         tracing::info!("Server public key: {}", self.server_keypair.pubkey());
         
         // Spawn TUN reader task
         let tun_device = self.tun_device.clone();
         let clients = self.clients.clone();
-        let server_keypair = self.server_keypair.pubkey();
+        let server_keypair_clone = clone_keypair(&self.server_keypair);
         
         tokio::spawn(async move {
-            Self::handle_tun_packets(tun_device, clients, server_keypair).await;
+            Self::handle_tun_packets(tun_device, clients, server_keypair_clone).await;
         });
         
         // Accept incoming WebSocket connections
@@ -70,7 +76,8 @@ impl VpnServer {
             
             let clients_clone = self.clients.clone();
             let ip_pool_clone = self.ip_pool.clone();
-            let server_keypair_clone = self.server_keypair.to_bytes(); // We will recreate the keypair later
+            let tun_device_clone = self.tun_device.clone();
+            let server_keypair_clone = clone_keypair(&self.server_keypair);
             
             // Handle each client in a separate task
             tokio::spawn(async move {
@@ -79,6 +86,7 @@ impl VpnServer {
                     addr,
                     clients_clone,
                     ip_pool_clone,
+                    tun_device_clone,
                     server_keypair_clone,
                 ).await {
                     tracing::error!("Error handling client {}: {}", addr, e);
@@ -93,24 +101,23 @@ impl VpnServer {
     async fn handle_tun_packets(
         tun_device: Arc<Mutex<Device>>,
         clients: Arc<Mutex<HashMap<SocketAddr, Client>>>,
-        server_pubkey: Pubkey,
+        server_keypair: Keypair,
     ) {
         let mut buffer = vec![0u8; 2048];
         
         loop {
-            let mut device = tun_device.lock().await;
-            let n = match device.read(&mut buffer).await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::error!("Error reading from TUN: {}", e);
-                    drop(device); // Release the lock before sleep
-                    time::sleep(Duration::from_millis(100)).await;
-                    continue;
+            let n = {
+                let mut device = tun_device.lock().await;
+                match device.read(&mut buffer) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!("Error reading from TUN: {}", e);
+                        drop(device); // Release the lock before sleep
+                        time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
                 }
             };
-            
-            // Release the TUN device lock as soon as possible
-            drop(device);
             
             if n > 0 {
                 // Process the packet and determine destination
@@ -155,10 +162,11 @@ impl VpnServer {
         addr: SocketAddr,
         clients: Arc<Mutex<HashMap<SocketAddr, Client>>>,
         ip_pool: Arc<Mutex<VecDeque<String>>>,
+        tun_device: Arc<Mutex<Device>>,
         server_keypair: Keypair,
     ) -> Result<()> {
         // Upgrade connection to WebSocket
-        let ws_stream = accept_async(stream).await.map_err(VpnError::WebSocket)?;
+        let ws_stream = accept_async(stream).await.map_err(|e| VpnError::Network(e.to_string()))?;
         tracing::info!("WebSocket connection established with {}", addr);
         
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
@@ -192,7 +200,7 @@ impl VpnServer {
                         .map_err(VpnError::Json)?;
                     
                     ws_sender.send(Message::Text(json)).await
-                        .map_err(VpnError::WebSocket)?;
+                        .map_err(|e| VpnError::Network(e.to_string()))?;
                     
                     // Recreate WebSocket stream
                     let ws_stream = ws_sender.reunite(ws_receiver)
@@ -214,7 +222,14 @@ impl VpnServer {
                     tracing::info!("Client {} connected, assigned IP: {}", addr, assigned_ip);
                     
                     // Handle client in a separate function
-                    Self::process_client_messages(addr, client, clients.clone(), ip_pool.clone(), server_keypair).await?;
+                    Self::process_client_messages(
+                        addr, 
+                        client, 
+                        clients.clone(), 
+                        ip_pool.clone(),
+                        server_keypair,
+                        tun_device
+                    ).await?;
                 } else {
                     return Err(VpnError::AuthenticationFailed);
                 }
@@ -230,7 +245,7 @@ impl VpnServer {
         client: Client,
         clients: Arc<Mutex<HashMap<SocketAddr, Client>>>,
         ip_pool: Arc<Mutex<VecDeque<String>>>,
-        server_keypair_bytes: [u8; 64],
+        server_keypair: Keypair,
         tun_device: Arc<Mutex<Device>>,
     ) -> Result<()> {
         let client_public_key = client.public_key;
@@ -275,7 +290,7 @@ impl VpnServer {
                                         Ok(decrypted) => {
                                             // Write decrypted packet to TUN
                                             let mut tun = tun_device.lock().await;
-                                            if let Err(e) = tun.write(&decrypted).await {
+                                            if let Err(e) = tun.write(&decrypted) {
                                                 tracing::error!("Error writing to TUN: {}", e);
                                             }
                                         }
@@ -311,7 +326,7 @@ impl VpnServer {
                                 Ok(decrypted) => {
                                     // Write decrypted packet to TUN
                                     let mut tun = tun_device.lock().await;
-                                    if let Err(e) = tun.write(&decrypted).await {
+                                    if let Err(e) = tun.write(&decrypted) {
                                         tracing::error!("Error writing to TUN: {}", e);
                                     }
                                 }
