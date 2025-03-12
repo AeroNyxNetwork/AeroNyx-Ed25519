@@ -9,7 +9,7 @@ use solana_sdk::pubkey::Pubkey;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
-use tokio_tungstenite::{accept_async, WebSocketStream};
+use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use tun::platform::Device;
 
