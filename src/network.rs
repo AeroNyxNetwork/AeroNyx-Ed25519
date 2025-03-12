@@ -8,7 +8,7 @@ use tun::Configuration;
 use crate::types::{Result, VpnError};
 
 /// Configure and create a TUN device
-pub fn setup_tun_device(name: &str) -> Result<Device> {
+pub fn setup_tun_device(name: &str) -> Result<tun::platform::Device> {
     let mut config = Configuration::default();
     
     // Configure TUN device
@@ -20,7 +20,7 @@ pub fn setup_tun_device(name: &str) -> Result<Device> {
         .destination(Ipv4Addr::from_str("10.7.0.2").unwrap()); // Default route
     
     // Create the TUN device
-    let dev = tun::create(&config).map_err(VpnError::Io)?;
+    let dev = tun::create(&config).map_err(|e| VpnError::Network(e.to_string()))?;
     
     tracing::info!("TUN device {} created successfully", name);
     
