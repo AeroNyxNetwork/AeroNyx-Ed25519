@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
