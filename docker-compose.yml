@@ -15,7 +15,7 @@ services:
     ports:
       - "8080:8080"  # WebSocket port
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=debug  # More verbose logging to troubleshoot issues
       - ENABLE_NAT=true
       - SUBNET=10.7.0.0/24
     command: [
@@ -23,8 +23,10 @@ services:
       "--listen", "0.0.0.0:8080",
       "--tun-name", "tun0",
       "--subnet", "10.7.0.0/24",
-      "--log-level", "info"
+      "--log-level", "debug"
     ]
+    volumes:
+      - ./logs:/app/logs  # Mount a volume for logs
     networks:
       vpn_net:
         ipv4_address: 172.28.0.2
