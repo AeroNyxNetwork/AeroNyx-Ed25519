@@ -1,99 +1,96 @@
-use serde::{Deserialize, Serialize};
-use solana_sdk::pubkey::Pubkey;
-use std::sync::Arc;
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio_tungstenite::WebSocketStream;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use rand::{Rng, thread_rng};
+use crate::config;
+use crate::types::Result;
 
-/// Represents client connection state
-#[derive(Debug, Clone)]
-pub struct Client {
-    /// WebSocket connection with client
-    pub stream: Arc<Mutex<WebSocketStream<TcpStream>>>,
-    /// Client's Solana public key
-    pub public_key: Pubkey,
-    /// Assigned VPN IP address
-    pub assigned_ip: String,
+/// Generate a random delay for jitter
+pub fn random_jitter() -> Duration {
+    let millis = thread_rng().gen_range(0..config::JITTER_MAX_MS);
+    Duration::from_millis(millis)
 }
 
-/// Information about available VPN nodes
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NodeInfo {
-    /// Node's public key (Base58 encoded)
-    pub public_key: String,
-    /// Node's IP address
-    pub ip_address: String,
-    /// Node's port
-    pub port: u16,
+/// Generate random padding bytes
+pub fn generate_padding(min_size: usize, max_size: usize) -> Vec<u8> {
+    let size = thread_rng().gen_range(min_size..=max_size);
+    let mut padding = vec![0u8; size];
+    thread_rng().fill(&mut padding[..]);
+    padding
 }
 
-/// Error types for VPN operations
-#[derive(thiserror::Error, Debug)]
-pub enum VpnError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    
-    #[error("WebSocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
-    
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-    
-    #[error("Crypto error: {0}")]
-    Crypto(String),
-    
-    #[error("Network error: {0}")]
-    Network(String),
-    
-    #[error("IP pool exhausted")]
-    IpPoolExhausted,
-    
-    #[error("Invalid packet")]
-    InvalidPacket,
-    
-    #[error("Authentication failed")]
-    AuthenticationFailed,
+/// Decide whether to add padding based on probability
+pub fn should_add_padding() -> bool {
+    thread_rng().gen::<f32>() < config::PAD_PROBABILITY
 }
 
-/// Result type for VPN operations
-pub type Result<T> = std::result::Result<T, VpnError>;
-
-/// Command line arguments for VPN server
-#[derive(clap::Parser, Debug, Clone)]
-#[clap(author, version, about = "Solana-based VPN Server")]
-pub struct Args {
-    /// Server listen address
-    #[clap(short, long, default_value = "0.0.0.0:8080")]
-    pub listen: String,
-    
-    /// TUN interface name
-    #[clap(short, long, default_value = "tun0")]
-    pub tun_name: String,
-    
-    /// VPN subnet
-    #[clap(short, long, default_value = "10.7.0.0/24")]
-    pub subnet: String,
-    
-    /// Log level
-    #[clap(short, long, default_value = "info")]
-    pub log_level: String,
+/// Generate padding if enabled and probability hits
+pub fn maybe_add_padding() -> Vec<u8> {
+    if config::ENABLE_TRAFFIC_PADDING && should_add_padding() {
+        generate_padding(config::MIN_PADDING_SIZE, config::MAX_PADDING_SIZE)
+    } else {
+        Vec::new()
+    }
 }
 
-/// Packet types exchanged between server and clients
-#[derive(Debug, Serialize, Deserialize)]
-pub enum PacketType {
-    /// Client authentication with public key
-    Auth { public_key: String },
+/// Get current timestamp in milliseconds
+pub fn current_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis() as u64
+}
+
+/// Check if an Instant has expired given a TTL
+pub fn is_expired(timestamp: Instant, ttl: Duration) -> bool {
+    timestamp.elapsed() > ttl
+}
+
+/// Generate a random alphanumeric string of specified length
+pub fn random_string(length: usize) -> String {
+    use rand::distributions::{Alphanumeric, DistString};
+    Alphanumeric.sample_string(&mut thread_rng(), length)
+}
+
+/// Convert bytes to a hex string
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
+    hex::encode(bytes)
+}
+
+/// Convert hex string to bytes
+pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
+    hex::decode(hex).map_err(|e| crate::types::VpnError::Crypto(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
     
-    /// Server assigns IP address to client
-    IpAssign { ip_address: String },
+    #[test]
+    fn test_random_jitter() {
+        let jitter = random_jitter();
+        assert!(jitter.as_millis() <= config::JITTER_MAX_MS as u128);
+    }
     
-    /// Encrypted data packet
-    Data { encrypted: Vec<u8> },
+    #[test]
+    fn test_generate_padding() {
+        let min_size = 10;
+        let max_size = 20;
+        let padding = generate_padding(min_size, max_size);
+        assert!(padding.len() >= min_size && padding.len() <= max_size);
+    }
     
-    /// Ping to keep connection alive
-    Ping,
+    #[test]
+    fn test_is_expired() {
+        let now = Instant::now();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(!is_expired(now, Duration::from_millis(20)));
+        assert!(is_expired(now, Duration::from_millis(5)));
+    }
     
-    /// Pong response to ping
-    Pong,
+    #[test]
+    fn test_hex_conversion() {
+        let original = vec![0, 1, 2, 3, 255];
+        let hex = bytes_to_hex(&original);
+        let bytes = hex_to_bytes(&hex).unwrap();
+        assert_eq!(original, bytes);
+    }
 }
