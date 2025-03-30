@@ -7,7 +7,6 @@ mod server;
 mod types;
 mod utils;
 
-use clap::Parser;
 use std::path::Path;
 use tracing_subscriber::fmt;
 use tracing_subscriber::EnvFilter;
