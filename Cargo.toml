@@ -11,7 +11,7 @@ tokio = { version = "1.28", features = ["full"] }
 futures = "0.3"
 
 # WebSockets
-tokio-tungstenite = "0.19"
+tokio-tungstenite = { version = "0.19", features = ["rustls-tls-webpki-roots"] }
 
 # Networking
 tun = { version = "0.5", features = ["async"] }
@@ -27,19 +27,59 @@ hex = "0.4"
 aes = "0.8"
 cbc = { version = "0.1", features = ["std"] }
 hmac = "0.12"
+chacha20poly1305 = "0.9"
+curve25519-dalek = "3.2"
+hkdf = "0.12"
+
+# TLS and certificates
+rustls = "0.20"
+rustls-pemfile = "1.0"
+tokio-rustls = "0.23"
+rustls-native-certs = "0.6"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Utilities
-clap = { version = "4.3", features = ["derive"] }
+clap = { version = "4.3", features = ["derive", "cargo"] }
 log = "0.4"
 env_logger = "0.10"
 anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "std"] }
+tempfile = "3.3"
 
 # IP address handling
 ipnetwork = "0.20"
+
+# Unix-specific
+nix = { version = "0.26", features = ["user"] }
+
+# Setup utilities
+dialoguer = "0.10"
+indicatif = "0.17"
+console = "0.15"
+reqwest = { version = "0.11", features = ["blocking"] }
+
+# Examples
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.26", features = ["user"] }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "shellapi"] }
+
+[features]
+default = []
+setup = []
+
+[[bin]]
+name = "aeronyx-private-ed25519"
+path = "src/main.rs"
+
+[[example]]
+name = "client_example"
+path = "examples/client_example.rs"
