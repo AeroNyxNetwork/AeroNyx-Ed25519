@@ -153,6 +153,13 @@ impl IpPoolManager {
             Err(IpPoolError::PoolExhausted)
         }
     }
+
+    
+    /// Get the default lease duration
+    pub fn get_default_lease_duration(&self) -> Duration {
+        Duration::from_secs(self.default_lease_duration)
+    }
+
     
     /// Release an IP address
     pub async fn release_ip(&self, ip: &str) -> Result<(), IpPoolError> {
