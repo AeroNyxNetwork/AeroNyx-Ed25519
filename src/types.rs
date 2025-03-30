@@ -7,10 +7,9 @@ use clap::Parser;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::WebSocketStream;
-use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, Signature};
+use solana_sdk::signature::Keypair;
 
 // Custom type for results
 pub type Result<T> = std::result::Result<T, VpnError>;
@@ -209,8 +208,8 @@ pub struct Args {
     pub max_connections_per_ip: usize,
 }
 
-/// Server configuration
-pub struct ServerConfig {
+/// Server configuration - renamed to fix name conflict
+pub struct ServerConfigVPN {
     /// TLS acceptor
     pub tls_acceptor: Arc<TlsAcceptor>,
     /// Server keypair
@@ -265,6 +264,7 @@ pub struct IpAllocation {
 }
 
 /// Client connection
+#[derive(Clone)]
 pub struct Client {
     /// WebSocket stream
     pub stream: Arc<Mutex<WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>>>,
@@ -284,6 +284,17 @@ pub struct Client {
     pub packet_counter: Arc<Mutex<u64>>,
     /// Rate limiting
     pub rate_limit: Arc<Mutex<std::collections::HashMap<String, (usize, Instant)>>>,
+}
+
+// Add Debug implementation manually since WebSocketStream doesn't implement Debug
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("public_key", &self.public_key)
+            .field("assigned_ip", &self.assigned_ip)
+            .field("connected_at", &self.connected_at)
+            .finish()
+    }
 }
 
 /// Client session
