@@ -3,12 +3,12 @@ use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use rand::distributions::{Alphanumeric, DistString};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_sdk::signer::Signer;
 use tokio::sync::Mutex;
-use crate::types::{AccessControlEntry, AccessControlList, Result, VpnError, SerializableInstant};
+use crate::types::{AccessControlEntry, AccessControlList, Result, VpnError};
 use crate::utils;
 use crate::crypto;
 
