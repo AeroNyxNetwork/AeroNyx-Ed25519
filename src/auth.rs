@@ -6,6 +6,8 @@ use rand::distributions::{Alphanumeric, DistString};
 use tokio::sync::Mutex;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
+use solana_sdk::signature::Keypair;
+use solana_sdk::signer::Signer; // Added the Signer trait import
 
 use crate::types::{AccessControlEntry, AccessControlList, Result, VpnError};
 use crate::utils;
@@ -234,7 +236,7 @@ impl AuthManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::signature::Keypair;
+    use solana_sdk::signer::Signer; // Added the Signer trait import for tests
     
     #[tokio::test]
     async fn test_challenge_verification() {
