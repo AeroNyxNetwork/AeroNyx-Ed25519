@@ -31,8 +31,9 @@ pub const MAX_PADDING_SIZE: usize = 128; // Reduced from 256 to improve performa
 pub const JITTER_MAX_MS: u64 = 50; // Reduced from 100ms to decrease latency
 
 /// IP allocation - Optimized for longer sessions
-pub const IP_LEASE_DURATION: Duration = Duration::from_hours(24);
-pub const IP_RENEWAL_THRESHOLD: Duration = Duration::from_hours(22); // Changed from 20 to reduce renewal overhead
+// Fix for constant duration issues
+pub const IP_LEASE_DURATION_SECS: u64 = 86400; // 24 hours in seconds
+pub const IP_RENEWAL_THRESHOLD_SECS: u64 = 79200; // 22 hours in seconds
 
 /// Access control
 pub const ACCESS_CONTROL_ENABLED: bool = true;
@@ -55,7 +56,7 @@ pub const HMAC_VERIFY_ENABLED: bool = true; // Enable HMAC verification
 pub const REPLAY_PROTECTION_ENABLED: bool = true; // Enable replay attack protection
 pub const MAX_PACKET_COUNTER_SKEW: u64 = 100; // Maximum allowed packet counter skew
 
-/// Extension methods for Duration
+/// Extension methods (to be used in functions, not constants)
 pub trait DurationExt {
     fn from_hours(hours: u64) -> Self;
 }
@@ -64,6 +65,15 @@ impl DurationExt for Duration {
     fn from_hours(hours: u64) -> Self {
         Duration::from_secs(hours * 3600)
     }
+}
+
+// Functions to get durations (use these instead of constant duration constructions)
+pub fn get_ip_lease_duration() -> Duration {
+    Duration::from_secs(IP_LEASE_DURATION_SECS)
+}
+
+pub fn get_ip_renewal_threshold() -> Duration {
+    Duration::from_secs(IP_RENEWAL_THRESHOLD_SECS)
 }
 
 // Helper methods for testing
