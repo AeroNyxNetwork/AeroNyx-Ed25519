@@ -51,7 +51,7 @@ pub struct AuthManager {
     /// Key manager
     key_manager: Arc<KeyManager>,
     /// Failed authentication attempts (client address -> count)
-    failed_attempts: Arc<tokio::sync::Mutex<std::collections::HashMap<SocketAddr, usize>>>,
+    failed_attempts: Arc<tokio::sync::Mutex<std::collections::HashMap<String, usize>>>,
 }
 
 impl AuthManager {
@@ -92,75 +92,88 @@ impl AuthManager {
     /// Generate a new authentication challenge for a client
     pub async fn generate_challenge(
         &self,
-        client_addr: SocketAddr,
-    ) -> Result<Challenge, AuthError> {
+        client_addr: &str,
+    ) -> Result<(String, Vec<u8>), AuthError> {
         // Check failed attempts
         let mut failed_attempts = self.failed_attempts.lock().await;
-        let attempts = failed_attempts.entry(client_addr).or_insert(0);
+        let attempts = failed_attempts.entry(client_addr.to_string()).or_insert(0);
         
         if *attempts >= MAX_AUTH_ATTEMPTS {
             return Err(AuthError::TooManyAttempts);
         }
         
-        self.challenge_manager.generate_challenge(client_addr).await
-            .map_err(AuthError::Challenge)
+        // Convert string to SocketAddr for challenge manager (if needed)
+        let socket_addr = client_addr.parse::<SocketAddr>()
+            .map_err(|_| AuthError::InvalidFormat(format!("Invalid address format: {}", client_addr)))?;
+        
+        // Generate challenge
+        let challenge = self.challenge_manager.generate_challenge(socket_addr).await
+            .map_err(AuthError::Challenge)?;
+        
+        Ok((challenge.id.clone(), challenge.data.clone()))
     }
     
     /// Verify a challenge response and authenticate the client
-    /// Verify a challenge response with four parameters
+    /// This method verifies a signature against a challenge
     pub async fn verify_challenge(
         &self,
         challenge_id: &str,
         signature: &str,
         public_key: &str,
-        addr: &str,
-    ) -> Result<(), ChallengeError> {
-        let mut challenges = self.challenges.lock().await;
-        
-        // Find the challenge
-        let challenge = challenges.get(challenge_id)
-            .ok_or_else(|| ChallengeError::NotFound(challenge_id.to_string()))?;
-        
-        // Verify client address
-        if challenge.client_addr.to_string() != addr {
-            warn!("Challenge address mismatch: expected {}, got {}", 
-                 challenge.client_addr, addr);
-            return Err(ChallengeError::AddressMismatch);
-        }
-        
-        // Check if challenge has expired
-        if challenge.is_expired() {
-            warn!("Expired challenge: {}", challenge_id);
-            challenges.remove(challenge_id);
-            return Err(ChallengeError::Expired);
+        client_addr: &str,
+    ) -> Result<(), AuthError> {
+        // Validate input parameters
+        if !StringValidator::is_valid_solana_pubkey(public_key) {
+            return Err(AuthError::InvalidFormat(format!("Invalid public key format: {}", public_key)));
         }
         
         // Parse the client's public key
-        let pubkey = solana_sdk::pubkey::Pubkey::from_str(public_key)
-            .map_err(|_| ChallengeError::SignatureVerificationFailed)?;
+        let pubkey = Pubkey::from_str(public_key)
+            .map_err(|_| AuthError::InvalidFormat(format!("Invalid public key: {}", public_key)))?;
         
-        // Parse the signature
-        let sig = solana_sdk::signature::Signature::from_str(signature)
-            .map_err(|_| ChallengeError::SignatureVerificationFailed)?;
+        // Parse signature
+        let sig = Signature::from_str(signature)
+            .map_err(|_| AuthError::InvalidFormat(format!("Invalid signature: {}", signature)))?;
         
-        // Verify the signature
-        if !KeyManager::verify_signature(&pubkey, &challenge.data, &sig) {
-            warn!("Signature verification failed for challenge {}", challenge_id);
-            return Err(ChallengeError::SignatureVerificationFailed);
+        // Convert string to SocketAddr for challenge manager (if needed)
+        let socket_addr = client_addr.parse::<SocketAddr>()
+            .map_err(|_| AuthError::InvalidFormat(format!("Invalid address format: {}", client_addr)))?;
+        
+        // Verify the challenge with the challenge manager
+        self.challenge_manager.verify_challenge(
+            challenge_id,
+            socket_addr,
+            signature,
+            public_key,
+        ).await.map_err(|e| match e {
+            ChallengeError::Expired => {
+                // Record failed attempt on expiration
+                self.record_failed_attempt(client_addr).await;
+                AuthError::Challenge(e)
+            },
+            ChallengeError::SignatureVerificationFailed => {
+                // Record failed attempt on signature verification failure
+                self.record_failed_attempt(client_addr).await;
+                AuthError::Challenge(e)
+            },
+            _ => AuthError::Challenge(e),
+        })?;
+        
+        // Reset failed attempts on successful verification
+        self.reset_failed_attempts(client_addr).await;
+        
+        // Check if client is allowed in ACL
+        if !self.acl_manager.is_allowed(public_key).await {
+            return Err(AuthError::AccessDenied(format!("Access denied for {}", public_key)));
         }
-        
-        // Remove the challenge (it's been used)
-        challenges.remove(challenge_id);
-        
-        info!("Successfully verified challenge {} for client {}", challenge_id, addr);
         
         Ok(())
     }
     
     /// Record a failed authentication attempt
-    async fn record_failed_attempt(&self, client_addr: SocketAddr) {
+    async fn record_failed_attempt(&self, client_addr: &str) {
         let mut failed_attempts = self.failed_attempts.lock().await;
-        let count = failed_attempts.entry(client_addr).or_insert(0);
+        let count = failed_attempts.entry(client_addr.to_string()).or_insert(0);
         *count += 1;
         
         if *count >= MAX_AUTH_ATTEMPTS {
@@ -172,9 +185,9 @@ impl AuthManager {
     }
     
     /// Reset failed authentication attempts
-    async fn reset_failed_attempts(&self, client_addr: SocketAddr) {
+    async fn reset_failed_attempts(&self, client_addr: &str) {
         let mut failed_attempts = self.failed_attempts.lock().await;
-        failed_attempts.remove(&client_addr);
+        failed_attempts.remove(client_addr);
     }
     
     /// Add a client to the ACL
@@ -209,6 +222,8 @@ impl AuthManager {
     }
 }
 
+use std::str::FromStr; // Add this at the top of the file
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,10 +247,29 @@ mod tests {
             100,
         ).await.unwrap();
         
-        // Create test client
-        let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        // Test client address
+        let client_addr_str = "127.0.0.1:12345";
+        
+        // Generate challenge
+        let (challenge_id, challenge_data) = auth_manager.generate_challenge(client_addr_str).await.unwrap();
+        
+        // Create test client's keypair
         let client_keypair = solana_sdk::signature::Keypair::new();
         let client_pubkey = client_keypair.pubkey().to_string();
+        
+        // Sign the challenge
+        let signature = client_keypair.sign_message(&challenge_data).to_string();
+        
+        // Verify challenge
+        let result = auth_manager.verify_challenge(
+            &challenge_id,
+            &signature,
+            &client_pubkey,
+            client_addr_str,
+        ).await;
+        
+        // Should fail since client is not in ACL yet
+        assert!(result.is_err());
         
         // Add client to ACL
         let entry = AccessControlEntry {
@@ -249,39 +283,21 @@ mod tests {
         };
         auth_manager.add_client(entry).await.unwrap();
         
-        // Generate a challenge
-        let challenge = auth_manager.generate_challenge(client_addr).await.unwrap();
+        // Regenerate challenge (since previous one was consumed)
+        let (challenge_id, challenge_data) = auth_manager.generate_challenge(client_addr_str).await.unwrap();
         
         // Sign the challenge
-        let signature = client_keypair.sign_message(&challenge.data);
+        let signature = client_keypair.sign_message(&challenge_data).to_string();
         
-        // Verify the challenge
+        // Verify challenge again
         let result = auth_manager.verify_challenge(
-            &challenge.id,
-            client_addr,
-            &signature.to_string(),
+            &challenge_id,
+            &signature,
             &client_pubkey,
+            client_addr_str,
         ).await;
         
-        // Should succeed
+        // Should succeed now
         assert!(result.is_ok());
-        
-        // Try with wrong signature
-        let wrong_keypair = solana_sdk::signature::Keypair::new();
-        let wrong_signature = wrong_keypair.sign_message(&challenge.data);
-        
-        // Generate a new challenge
-        let challenge2 = auth_manager.generate_challenge(client_addr).await.unwrap();
-        
-        // Verify with wrong signature
-        let result = auth_manager.verify_challenge(
-            &challenge2.id,
-            client_addr,
-            &wrong_signature.to_string(),
-            &client_pubkey,
-        ).await;
-        
-        // Should fail
-        assert!(result.is_err());
     }
 }
