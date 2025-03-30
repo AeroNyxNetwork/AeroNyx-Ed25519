@@ -6,7 +6,7 @@ use chacha20poly1305::aead::{Aead, NewAead};
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::{Keypair as Ed25519Keypair, PublicKey as Ed25519PublicKey, SecretKey as Ed25519SecretKey, Verifier};
-use hmac::{Hmac, Mac, NewMac};
+use hmac::{Hmac, Mac};
 use rand::{Rng, RngCore};
 use sha2::{Digest, Sha256, Sha512};
 use solana_sdk::signature::{Keypair, Signature};
@@ -33,14 +33,14 @@ pub struct CachedSecretKey {
     /// Remote endpoint's public key
     pub public_key: Pubkey,
     /// Shared secret derived via ECDH
-    pub shared_secret: [u8; 32],
+    pub shared_secret: Vec<u8>,
     /// Last time this key was used
     pub last_used: Instant,
 }
 
 impl CachedSecretKey {
     /// Create a new cached secret key
-    pub fn new(public_key: Pubkey, shared_secret: [u8; 32]) -> Self {
+    pub fn new(public_key: Pubkey, shared_secret: Vec<u8>) -> Self {
         Self {
             public_key,
             shared_secret,
@@ -78,14 +78,14 @@ impl SecretKeyCache {
         &self,
         local_keypair: &Keypair,
         remote_public: &Pubkey,
-    ) -> Result<[u8; 32]> {
+    ) -> Result<Vec<u8>> {
         let mut cache = self.cache.lock().await;
         
         // Check if we have a cached key
         if let Some(cached_key) = cache.get_mut(remote_public) {
-            if !cached_key.is_expired(Duration::from_secs(config::SECRET_CACHE_TTL.as_secs())) {
+            if !cached_key.is_expired(config::SECRET_CACHE_TTL) {
                 cached_key.touch();
-                return Ok(cached_key.shared_secret);
+                return Ok(cached_key.shared_secret.clone());
             }
         }
         
@@ -95,7 +95,7 @@ impl SecretKeyCache {
         // Add to cache
         cache.insert(
             *remote_public,
-            CachedSecretKey::new(*remote_public, shared_secret),
+            CachedSecretKey::new(*remote_public, shared_secret.clone()),
         );
         
         // Clean up expired keys if cache is too large
@@ -155,7 +155,7 @@ impl SessionKeyManager {
     
     /// Get a session key
     pub async fn get_key(&self, client_id: &str) -> Option<Vec<u8>> {
-        let mut keys = self.session_keys.lock().await;
+        let keys = self.session_keys.lock().await;
         if let Some((key, created_at)) = keys.get(client_id) {
             // Check if key needs rotation
             if utils::is_expired(*created_at, config::KEY_ROTATION_INTERVAL) {
@@ -222,11 +222,15 @@ pub fn ed25519_public_to_x25519(ed25519_public: &[u8]) -> Result<[u8; 32]> {
     }
     
     // Decompress the Edwards point from the Ed25519 public key
-    let compressed = CompressedEdwardsY::from_slice(ed25519_public)
-        .map_err(|_| VpnError::Crypto("Invalid Ed25519 public key format".into()))?;
-        
-    let edwards_point = compressed.decompress()
-        .ok_or_else(|| VpnError::Crypto("Invalid Ed25519 point".into()))?;
+    let compressed = match CompressedEdwardsY::from_slice(ed25519_public) {
+        Ok(c) => c,
+        Err(_) => return Err(VpnError::Crypto("Invalid Ed25519 public key format".into())),
+    };
+    
+    let edwards_point = match compressed.decompress() {
+        Some(point) => point,
+        None => return Err(VpnError::Crypto("Invalid Ed25519 point".into())),
+    };
     
     // Convert to Montgomery form (X25519)
     let montgomery_point: MontgomeryPoint = edwards_point.into();
@@ -235,7 +239,7 @@ pub fn ed25519_public_to_x25519(ed25519_public: &[u8]) -> Result<[u8; 32]> {
 }
 
 /// Generate a shared secret using X25519 ECDH with converted Ed25519 keys
-pub fn generate_shared_secret(local_private: &Keypair, remote_public: &Pubkey) -> Result<[u8; 32]> {
+pub fn generate_shared_secret(local_private: &Keypair, remote_public: &Pubkey) -> Result<Vec<u8>> {
     // Convert Solana keypair to Ed25519 secret key bytes
     let ed25519_private = solana_keypair_to_bytes(local_private)?;
     
@@ -256,7 +260,7 @@ pub fn generate_shared_secret(local_private: &Keypair, remote_public: &Pubkey) -
     hkdf.expand(b"AERONYX-VPN-KEY", &mut output)
         .map_err(|_| VpnError::Crypto("HKDF expansion failed".into()))?;
     
-    Ok(output)
+    Ok(output.to_vec())
 }
 
 /// Encrypt data using ChaCha20-Poly1305 AEAD with authentication
@@ -314,14 +318,23 @@ pub fn decrypt_chacha20(ciphertext: &[u8], key: &[u8], nonce: &[u8]) -> Result<V
 }
 
 /// Encrypt data using AES-256-CBC with a shared secret and HMAC for authentication
-pub fn encrypt(data: &[u8], shared_secret: &[u8; 32]) -> Result<Vec<u8>> {
+pub fn encrypt(data: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>> {
+    // Check shared_secret length
+    if shared_secret.len() != 32 {
+        return Err(VpnError::Crypto("Invalid shared secret length for AES-256-CBC".into()));
+    }
+    
     // Generate a random 16-byte IV
     let mut iv = [0u8; 16];
     let mut rng = rand::thread_rng();
     rng.fill_bytes(&mut iv);
     
+    // Extract 32 bytes for AES key
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&shared_secret[0..32]);
+    
     // Create AES-256-CBC encryptor
-    let encryptor = Aes256CbcEnc::new_from_slices(shared_secret, &iv)
+    let encryptor = Aes256CbcEnc::new_from_slices(&key_bytes, &iv)
         .map_err(|e| VpnError::Crypto(format!("Encryption setup failed: {}", e)))?;
         
     // Encrypt the data
@@ -335,20 +348,29 @@ pub fn encrypt(data: &[u8], shared_secret: &[u8; 32]) -> Result<Vec<u8>> {
     result.extend_from_slice(ciphertext);
     
     // Add HMAC for authentication
-    let mut mac = HmacSha256::new_from_slice(shared_secret)
+    let mut mac = HmacSha256::new_from_slice(&key_bytes)
         .map_err(|_| VpnError::Crypto("Invalid key length for HMAC".into()))?;
     mac.update(&result);
     let hmac_result = mac.finalize();
-    result.extend_from_slice(&hmac_result.into_bytes());
+    result.extend_from_slice(hmac_result.into_bytes().as_slice());
     
     Ok(result)
 }
 
 /// Decrypt data using AES-256-CBC with a shared secret and verify HMAC
-pub fn decrypt(encrypted: &[u8], shared_secret: &[u8; 32]) -> Result<Vec<u8>> {
+pub fn decrypt(encrypted: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>> {
+    // Check shared_secret length
+    if shared_secret.len() != 32 {
+        return Err(VpnError::Crypto("Invalid shared secret length for AES-256-CBC".into()));
+    }
+    
     if encrypted.len() < 16 + 32 { // IV + HMAC
         return Err(VpnError::Crypto("Encrypted data too short".into()));
     }
+    
+    // Extract 32 bytes for AES key
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&shared_secret[0..32]);
     
     // Extract HMAC (last 32 bytes)
     let hmac_offset = encrypted.len() - 32;
@@ -356,7 +378,7 @@ pub fn decrypt(encrypted: &[u8], shared_secret: &[u8; 32]) -> Result<Vec<u8>> {
     let authenticated_part = &encrypted[..hmac_offset];
     
     // Verify HMAC in constant time
-    let mut mac = HmacSha256::new_from_slice(shared_secret)
+    let mut mac = HmacSha256::new_from_slice(&key_bytes)
         .map_err(|_| VpnError::Crypto("Invalid key length for HMAC".into()))?;
     mac.update(authenticated_part);
     
@@ -368,7 +390,7 @@ pub fn decrypt(encrypted: &[u8], shared_secret: &[u8; 32]) -> Result<Vec<u8>> {
     let ciphertext = &encrypted[16..hmac_offset];
     
     // Create AES-256-CBC decryptor
-    let decryptor = Aes256CbcDec::new_from_slices(shared_secret, iv)
+    let decryptor = Aes256CbcDec::new_from_slices(&key_bytes, iv)
         .map_err(|e| VpnError::Crypto(format!("Decryption setup failed: {}", e)))?;
     
     // Decrypt the data
@@ -437,7 +459,7 @@ pub fn decrypt_session_key(
 pub fn compute_key_fingerprint(pubkey: &Pubkey) -> String {
     let bytes = pubkey.to_bytes();
     let hash = Sha256::digest(&bytes);
-    format!("{:x}", &hash[0..4])
+    hex::encode(&hash[0..4])
 }
 
 #[cfg(test)]
