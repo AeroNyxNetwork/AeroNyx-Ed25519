@@ -289,11 +289,12 @@ impl VpnServer {
                 let mut addrs_to_remove = Vec::new();
                 
                 for (addr, client) in clients_lock.iter() {
-                    let activity_lock = client.last_activity.lock().await;
-                    if activity_lock.elapsed() > Duration::from_secs(300) { // 5 minutes
-                        addrs_to_remove.push(*addr);
-                    }
+                    if let Ok(activity_lock) = client.last_activity.try_lock() {
+                        if activity_lock.elapsed() > Duration::from_secs(300) { // 5 minutes
+                            addrs_to_remove.push(*addr);
                 }
+                    }
+                        }
                 
                 // Now remove the clients
                 for addr in addrs_to_remove {
