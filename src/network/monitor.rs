@@ -512,4 +512,202 @@ async fn detect_anomalies(
     
     for (client_id, stats) in clients.iter() {
         // Check for high latency
-        if stats.stats.latency_ms > 200.0
+        // Check for high latency
+        if stats.stats.latency_ms > 200.0 {
+            new_anomalies.push(TrafficAnomaly {
+                anomaly_type: "High Latency".to_string(),
+                source: client_id.clone(),
+                detected_at: Instant::now(),
+                details: format!("{:.2} ms latency detected", stats.stats.latency_ms),
+                severity: 2,
+            });
+        }
+        
+        // Check for significant packet loss
+        if stats.stats.packet_loss > 0.05 {
+            new_anomalies.push(TrafficAnomaly {
+                anomaly_type: "Packet Loss".to_string(),
+                source: client_id.clone(),
+                detected_at: Instant::now(),
+                details: format!("{:.2}% packet loss detected", stats.stats.packet_loss * 100.0),
+                severity: 3,
+            });
+        }
+        
+        // Check for unusually high bandwidth usage
+        if stats.stats.send_rate > 10_000_000.0 || stats.stats.receive_rate > 10_000_000.0 {
+            new_anomalies.push(TrafficAnomaly {
+                anomaly_type: "High Bandwidth".to_string(),
+                source: client_id.clone(),
+                detected_at: Instant::now(),
+                details: format!(
+                    "Unusual bandwidth: {} in, {} out",
+                    format_bytes(stats.stats.receive_rate as u64),
+                    format_bytes(stats.stats.send_rate as u64)
+                ),
+                severity: 4,
+            });
+        }
+    }
+    
+    // Add new anomalies to the log
+    if !new_anomalies.is_empty() {
+        let mut anomalies_lock = anomalies.lock().await;
+        
+        for anomaly in new_anomalies {
+            warn!(
+                "Network anomaly detected: [{}] {} - {} (severity: {})",
+                anomaly.source, anomaly.anomaly_type, anomaly.details, anomaly.severity
+            );
+            
+            anomalies_lock.push_back(anomaly);
+            
+            // Limit size
+            if anomalies_lock.len() > 100 {
+                anomalies_lock.pop_front();
+            }
+        }
+    }
+}
+
+/// Calculate a connection quality score (0-100)
+fn calculate_connection_quality(stats: &NetworkStats) -> u8 {
+    // Start with a perfect score
+    let mut score = 100.0;
+    
+    // Deduct for high latency
+    if stats.latency_ms > 50.0 {
+        let latency_penalty = ((stats.latency_ms - 50.0) / 5.0).min(40.0);
+        score -= latency_penalty;
+    }
+    
+    // Deduct for packet loss
+    score -= (stats.packet_loss * 200.0).min(50.0);
+    
+    // Deduct for low throughput
+    if stats.send_rate < 1_000_000.0 || stats.receive_rate < 1_000_000.0 {
+        // Less than 1 MB/s is considered low for a VPN
+        let throughput_penalty = 10.0;
+        score -= throughput_penalty;
+    }
+    
+    // Ensure score is in range 0-100
+    score = score.max(0.0).min(100.0);
+    
+    score as u8
+}
+
+/// Get a human-readable description of connection quality
+fn connection_quality_description(score: u8) -> String {
+    match score {
+        90..=100 => "Excellent: Your connection is performing optimally with low latency and high throughput.".to_string(),
+        75..=89 => "Good: Your connection is stable and suitable for most applications.".to_string(),
+        50..=74 => "Fair: Your connection may experience occasional issues, particularly with latency-sensitive applications.".to_string(),
+        25..=49 => "Poor: Your connection is experiencing significant issues that may impact performance.".to_string(),
+        _ => "Critical: Your connection is severely degraded and may be unstable.".to_string(),
+    }
+}
+
+/// Format bytes as human-readable string
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[tokio::test]
+    async fn test_record_traffic() {
+        let monitor = NetworkMonitor::new(Duration::from_secs(1), 10);
+        
+        // Record some traffic
+        monitor.record_sent(1000).await;
+        monitor.record_received(2000).await;
+        
+        // Check global stats
+        let stats = monitor.get_stats().await;
+        assert_eq!(stats.bytes_sent, 1000);
+        assert_eq!(stats.bytes_received, 2000);
+        assert_eq!(stats.packets_sent, 1);
+        assert_eq!(stats.packets_received, 1);
+    }
+    
+    #[tokio::test]
+    async fn test_client_traffic() {
+        let monitor = NetworkMonitor::new(Duration::from_secs(1), 10);
+        let client_id = "test-client";
+        
+        // Record client traffic
+        assert!(monitor.record_client_traffic(client_id, 1000, 2000).await);
+        
+        // Check client stats
+        let client_stats = monitor.get_client_stats(client_id).await.unwrap();
+        assert_eq!(client_stats.stats.bytes_sent, 1000);
+        assert_eq!(client_stats.stats.bytes_received, 2000);
+    }
+    
+    #[tokio::test]
+    async fn test_bandwidth_limit() {
+        let monitor = NetworkMonitor::new(Duration::from_secs(1), 10);
+        let client_id = "limited-client";
+        
+        // Set a bandwidth limit
+        monitor.set_bandwidth_limit(client_id, 1000).await; // 1000 bytes/sec
+        
+        // Test exceeding the limit
+        let exceeded = monitor.check_bandwidth_limit(client_id, 2000, Duration::from_secs(1)).await;
+        assert!(exceeded);
+        
+        // Test within the limit
+        let within_limit = monitor.check_bandwidth_limit(client_id, 500, Duration::from_secs(1)).await;
+        assert!(!within_limit);
+        
+        // Check that rate limited flag was set
+        let client_stats = monitor.get_client_stats(client_id).await.unwrap();
+        assert!(client_stats.rate_limited);
+    }
+    
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(100), "100 B");
+        assert_eq!(format_bytes(1500), "1.46 KB");
+        assert_eq!(format_bytes(1500000), "1.43 MB");
+        assert_eq!(format_bytes(1500000000), "1.40 GB");
+    }
+    
+    #[test]
+    fn test_connection_quality() {
+        // Excellent connection
+        let excellent = NetworkStats {
+            latency_ms: 20.0,
+            packet_loss: 0.0,
+            send_rate: 5_000_000.0,
+            receive_rate: 5_000_000.0,
+            ..NetworkStats::default()
+        };
+        assert!(calculate_connection_quality(&excellent) >= 90);
+        
+        // Poor connection
+        let poor = NetworkStats {
+            latency_ms: 300.0,
+            packet_loss: 0.1,
+            send_rate: 500_000.0,
+            receive_rate: 500_000.0,
+            ..NetworkStats::default()
+        };
+        assert!(calculate_connection_quality(&poor) < 50);
+    }
+}
