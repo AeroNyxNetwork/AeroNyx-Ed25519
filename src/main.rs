@@ -19,7 +19,7 @@ mod server;
 mod utils;
 
 use config::settings::{ServerConfig, ServerArgs};
-use server::core::VpnServer;
+use server::VpnServer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
