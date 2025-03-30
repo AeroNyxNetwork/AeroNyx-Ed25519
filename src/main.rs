@@ -2,15 +2,18 @@ mod auth;
 mod config;
 mod crypto;
 mod network;
+mod network_monitor;
 mod obfuscation;
 mod server;
 mod types;
 mod utils;
+mod client;
 
 use clap::Parser;
 use std::path::Path;
 use tracing_subscriber::fmt;
 use tracing_subscriber::EnvFilter;
+use solana_sdk::signer::Signer; // Import Signer trait
 
 use crate::server::VpnServer;
 use crate::types::Args;
@@ -53,6 +56,15 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Traffic padding enabled");
     }
     
+    // Create network monitoring
+    let network_monitor = network_monitor::NetworkMonitor::new(
+        std::time::Duration::from_secs(30), // Monitoring interval
+        100 // Maximum history entries
+    );
+    network_monitor.start().await;
+    tracing::info!("Network monitoring enabled");
+    
+    // Start server
     server.start(&args.listen).await?;
     
     Ok(())
