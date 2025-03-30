@@ -251,76 +251,7 @@ impl NetworkMonitor {
         }
     }
     
-    /// Record client traffic
-    pub async fn record_client_traffic(&self, client_id: &str, bytes_sent: u64, bytes_received: u64) {
-        let mut client_stats_map = self.client_stats.lock().await;
-        
-        let client_stat = client_stats_map.entry(client_id.to_string()).or_insert_with(|| {
-            ClientStats {
-                client_id: client_id.to_string(),
-                stats: NetworkStats::default(),
-                rate_limited: false,
-                bandwidth_limit: 0,
-            }
-        });
-        
-        client_stat.stats.bytes_sent += bytes_sent;
-        client_stat.stats.bytes_received += bytes_received;
-        
-        if bytes_sent > 0 {
-            client_stat.stats.packets_sent += 1;
-        }
-        
-        if bytes_received > 0 {
-            client_stat.stats.packets_received += 1;
-        }
-        
-        // Update rates (simple EMA with 0.3 alpha)
-        let alpha = 0.3;
-        let now = Instant::now();
-        let elapsed = now.duration_since(client_stat.stats.timestamp).as_secs_f64();
-        
-        if elapsed > 0.0 {
-            let send_rate = bytes_sent as f64 / elapsed;
-            let receive_rate = bytes_received as f64 / elapsed;
-            
-            client_stat.stats.send_rate = (alpha * send_rate) + ((1.0 - alpha) * client_stat.stats.send_rate);
-            client_stat.stats.receive_rate = (alpha * receive_rate) + ((1.0 - alpha) * client_stat.stats.receive_rate);
-            client_stat.stats.timestamp = now;
-        }
-    }
-    
-    /// Record latency sample
-    pub async fn record_latency(&self, client_id: &str, latency_ms: f64) {
-        // Update global latency samples
-        {
-            let mut samples = self.latency_samples.lock().await;
-            samples.push_back(latency_ms);
-            while samples.len() > 20 {
-                samples.pop_front();
-            }
-        }
-        
-        // Update client-specific latency
-        {
-            let mut client_stats_map = self.client_stats.lock().await;
-            
-            if let Some(client_stat) = client_stats_map.get_mut(client_id) {
-                client_stat.stats.latency_ms = latency_ms;
-            }
-        }
-    }
-    
-    /// Record packet loss sample (0.0-1.0)
-    pub async fn record_packet_loss(&self, loss: f64) {
-        let mut samples = self.packet_loss_samples.lock().await;
-        samples.push_back(loss);
-        while samples.len() > 10 {
-            samples.pop_front();
-        }
-    }
-
-        /// Record client traffic metrics
+    /// Record client traffic metrics
     pub async fn record_client_traffic(&self, client_id: &str, bytes_sent: u64, bytes_received: u64) -> bool {
         let mut client_stats_map = self.client_stats.lock().await;
         
@@ -360,7 +291,7 @@ impl NetworkMonitor {
         
         true
     }
-
+    
     /// Record latency measurement for a client
     pub async fn record_latency(&self, client_id: &str, latency_ms: f64) -> bool {
         // Update global latency samples
@@ -384,6 +315,14 @@ impl NetworkMonitor {
         true
     }
     
+    /// Record packet loss sample (0.0-1.0)
+    pub async fn record_packet_loss(&self, loss: f64) {
+        let mut samples = self.packet_loss_samples.lock().await;
+        samples.push_back(loss);
+        while samples.len() > 10 {
+            samples.pop_front();
+        }
+    }
     
     /// Get current stats
     pub async fn get_stats(&self) -> NetworkStats {
@@ -401,8 +340,6 @@ impl NetworkMonitor {
         let client_stats_map = self.client_stats.lock().await;
         client_stats_map.get(client_id).cloned()
     }
-
-                            
     
     /// Get all client stats
     pub async fn get_all_client_stats(&self) -> HashMap<String, ClientStats> {
@@ -575,201 +512,4 @@ async fn detect_anomalies(
     
     for (client_id, stats) in clients.iter() {
         // Check for high latency
-        if stats.stats.latency_ms > 200.0 {
-            new_anomalies.push(TrafficAnomaly {
-                anomaly_type: "High Latency".to_string(),
-                source: client_id.clone(),
-                detected_at: Instant::now(),
-                details: format!("{:.2} ms latency detected", stats.stats.latency_ms),
-                severity: 2,
-            });
-        }
-        
-        // Check for significant packet loss
-        if stats.stats.packet_loss > 0.05 {
-            new_anomalies.push(TrafficAnomaly {
-                anomaly_type: "Packet Loss".to_string(),
-                source: client_id.clone(),
-                detected_at: Instant::now(),
-                details: format!("{:.2}% packet loss detected", stats.stats.packet_loss * 100.0),
-                severity: 3,
-            });
-        }
-        
-        // Check for unusually high bandwidth usage
-        if stats.stats.send_rate > 10_000_000.0 || stats.stats.receive_rate > 10_000_000.0 {
-            new_anomalies.push(TrafficAnomaly {
-                anomaly_type: "High Bandwidth".to_string(),
-                source: client_id.clone(),
-                detected_at: Instant::now(),
-                details: format!(
-                    "Unusual bandwidth: {} in, {} out",
-                    format_bytes(stats.stats.receive_rate as u64),
-                    format_bytes(stats.stats.send_rate as u64)
-                ),
-                severity: 4,
-            });
-        }
-    }
-    
-    // Add new anomalies to the log
-    if !new_anomalies.is_empty() {
-        let mut anomalies_lock = anomalies.lock().await;
-        
-        for anomaly in new_anomalies {
-            warn!(
-                "Network anomaly detected: [{}] {} - {} (severity: {})",
-                anomaly.source, anomaly.anomaly_type, anomaly.details, anomaly.severity
-            );
-            
-            anomalies_lock.push_back(anomaly);
-            
-            // Limit size
-            if anomalies_lock.len() > 100 {
-                anomalies_lock.pop_front();
-            }
-        }
-    }
-}
-
-/// Calculate a connection quality score (0-100)
-fn calculate_connection_quality(stats: &NetworkStats) -> u8 {
-    // Start with a perfect score
-    let mut score = 100.0;
-    
-    // Deduct for high latency
-    if stats.latency_ms > 50.0 {
-        let latency_penalty = ((stats.latency_ms - 50.0) / 5.0).min(40.0);
-        score -= latency_penalty;
-    }
-    
-    // Deduct for packet loss
-    score -= (stats.packet_loss * 200.0).min(50.0);
-    
-    // Deduct for low throughput
-    if stats.send_rate < 1_000_000.0 || stats.receive_rate < 1_000_000.0 {
-        // Less than 1 MB/s is considered low for a VPN
-        let throughput_penalty = 10.0;
-        score -= throughput_penalty;
-    }
-    
-    // Ensure score is in range 0-100
-    score = score.max(0.0).min(100.0);
-    
-    score as u8
-}
-
-/// Get a human-readable description of connection quality
-fn connection_quality_description(score: u8) -> String {
-    match score {
-        90..=100 => "Excellent: Your connection is performing optimally with low latency and high throughput.".to_string(),
-        75..=89 => "Good: Your connection is stable and suitable for most applications.".to_string(),
-        50..=74 => "Fair: Your connection may experience occasional issues, particularly with latency-sensitive applications.".to_string(),
-        25..=49 => "Poor: Your connection is experiencing significant issues that may impact performance.".to_string(),
-        _ => "Critical: Your connection is severely degraded and may be unstable.".to_string(),
-    }
-}
-
-/// Format bytes as human-readable string
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[tokio::test]
-    async fn test_record_traffic() {
-        let monitor = NetworkMonitor::new(Duration::from_secs(1), 10);
-        
-        // Record some traffic
-        monitor.record_sent(1000).await;
-        monitor.record_received(2000).await;
-        
-        // Check global stats
-        let stats = monitor.get_stats().await;
-        assert_eq!(stats.bytes_sent, 1000);
-        assert_eq!(stats.bytes_received, 2000);
-        assert_eq!(stats.packets_sent, 1);
-        assert_eq!(stats.packets_received, 1);
-    }
-    
-    #[tokio::test]
-    async fn test_client_traffic() {
-        let monitor = NetworkMonitor::new(Duration::from_secs(1), 10);
-        let client_id = "test-client";
-        
-        // Record client traffic
-        monitor.record_client_traffic(client_id, 1000, 2000).await;
-        
-        // Check client stats
-        let client_stats = monitor.get_client_stats(client_id).await.unwrap();
-        assert_eq!(client_stats.stats.bytes_sent, 1000);
-        assert_eq!(client_stats.stats.bytes_received, 2000);
-    }
-    
-    #[tokio::test]
-    async fn test_bandwidth_limit() {
-        let monitor = NetworkMonitor::new(Duration::from_secs(1), 10);
-        let client_id = "limited-client";
-        
-        // Set a bandwidth limit
-        monitor.set_bandwidth_limit(client_id, 1000).await; // 1000 bytes/sec
-        
-        // Test exceeding the limit
-        let exceeded = monitor.check_bandwidth_limit(client_id, 2000, Duration::from_secs(1)).await;
-        assert!(exceeded);
-        
-        // Test within the limit
-        let within_limit = monitor.check_bandwidth_limit(client_id, 500, Duration::from_secs(1)).await;
-        assert!(!within_limit);
-        
-        // Check that rate limited flag was set
-        let client_stats = monitor.get_client_stats(client_id).await.unwrap();
-        assert!(client_stats.rate_limited);
-    }
-    
-    #[test]
-    fn test_format_bytes() {
-        assert_eq!(format_bytes(100), "100 B");
-        assert_eq!(format_bytes(1500), "1.46 KB");
-        assert_eq!(format_bytes(1500000), "1.43 MB");
-        assert_eq!(format_bytes(1500000000), "1.40 GB");
-    }
-    
-    #[test]
-    fn test_connection_quality() {
-        // Excellent connection
-        let excellent = NetworkStats {
-            latency_ms: 20.0,
-            packet_loss: 0.0,
-            send_rate: 5_000_000.0,
-            receive_rate: 5_000_000.0,
-            ..NetworkStats::default()
-        };
-        assert!(calculate_connection_quality(&excellent) >= 90);
-        
-        // Poor connection
-        let poor = NetworkStats {
-            latency_ms: 300.0,
-            packet_loss: 0.1,
-            send_rate: 500_000.0,
-            receive_rate: 500_000.0,
-            ..NetworkStats::default()
-        };
-        assert!(calculate_connection_quality(&poor) < 50);
-    }
-}
+        if stats.stats.latency_ms > 200.0
