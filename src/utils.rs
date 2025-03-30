@@ -2,6 +2,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rand::{Rng, thread_rng};
 use crate::config;
 use crate::types::Result;
+use crate::types::VpnError;
 
 /// Generate a random delay for jitter
 pub fn random_jitter() -> Duration {
@@ -57,7 +58,7 @@ pub fn bytes_to_hex(bytes: &[u8]) -> String {
 
 /// Convert hex string to bytes
 pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
-    hex::decode(hex).map_err(|e| crate::types::VpnError::Crypto(e.to_string()))
+    hex::decode(hex).map_err(|e| VpnError::Crypto(e.to_string()))
 }
 
 #[cfg(test)]
