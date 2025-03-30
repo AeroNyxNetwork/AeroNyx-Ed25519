@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 authors = ["hi@aeronyx.network"]
 description = "A private server using Solana keypairs for authentication and encryption"
+repository = "https://github.com/aeronyx/private-ed25519"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["vpn", "ed25519", "solana", "privacy", "security"]
+categories = ["networking", "cryptography"]
 
 [dependencies]
 # Async runtime
@@ -50,9 +55,15 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "std"] }
 tempfile = "3.3"
+once_cell = "1.17"
+parking_lot = "0.12"
 
 # IP address handling
 ipnetwork = "0.20"
+
+# Metrics and monitoring
+metrics = "0.20"
+metrics-exporter-prometheus = "0.11"
 
 # Unix-specific
 nix = { version = "0.26", features = ["user"] }
@@ -63,8 +74,10 @@ indicatif = "0.17"
 console = "0.15"
 reqwest = { version = "0.11", features = ["blocking"] }
 
-# Examples
+# Examples and code utilities
 tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.4"
+crossbeam-channel = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.26", features = ["user"] }
@@ -72,9 +85,37 @@ nix = { version = "0.26", features = ["user"] }
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winuser", "shellapi"] }
 
+[dev-dependencies]
+criterion = "0.4"
+tokio-test = "0.4"
+test-case = "3.1"
+quickcheck = "1.0"
+mockall = "0.11"
+
 [features]
 default = []
 setup = []
+metrics = ["metrics", "metrics-exporter-prometheus"]
+admin-api = []
+advanced-obfuscation = []
+multi-routing = []
+prometheus = ["metrics-exporter-prometheus"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+debug = false
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.test]
+opt-level = 0
+debug = true
 
 [[bin]]
 name = "aeronyx-private-ed25519"
@@ -83,3 +124,8 @@ path = "src/main.rs"
 [[example]]
 name = "client_example"
 path = "examples/client_example.rs"
+
+[[bench]]
+name = "crypto_benchmarks"
+harness = false
+required-features = ["metrics"]
