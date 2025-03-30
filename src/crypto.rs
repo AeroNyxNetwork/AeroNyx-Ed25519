@@ -5,8 +5,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use chacha20poly1305::aead::{Aead, NewAead};
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use curve25519_dalek::montgomery::MontgomeryPoint;
-use ed25519_dalek::Verifier;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, Mac, digest::MacError};
 use rand::RngCore;
 use sha2::{Digest, Sha256, Sha512};
 use solana_sdk::signature::{Keypair, Signature};
@@ -221,11 +220,8 @@ pub fn ed25519_public_to_x25519(ed25519_public: &[u8]) -> Result<[u8; 32]> {
         return Err(VpnError::Crypto("Invalid Ed25519 public key length".into()));
     }
     
-    // Try to create a CompressedEdwardsY point from the public key
-    let compressed = match CompressedEdwardsY::from_slice(ed25519_public) {
-        Ok(c) => c,
-        Err(_) => return Err(VpnError::Crypto("Invalid Ed25519 point".into())),
-    };
+    // Create a compressed Edwards point from the public key bytes
+    let compressed = CompressedEdwardsY::from_slice(ed25519_public);
     
     // Decompress the Edwards point from the Ed25519 public key
     let edwards_point = compressed.decompress()
@@ -382,8 +378,8 @@ pub fn decrypt(encrypted: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| VpnError::Crypto("Invalid key length for HMAC".into()))?;
     mac.update(authenticated_part);
     
-    // Newer version of hmac requires this format for verification
-    mac.verify(hmac_received)
+    // Create a new HMAC with the verification method that takes the slice directly
+    mac.verify_slice(hmac_received)
         .map_err(|_| VpnError::Crypto("HMAC verification failed".into()))?;
     
     // Extract IV and encrypted data
@@ -558,5 +554,48 @@ mod tests {
         let different_nonce = [4u8; 12];
         let session_key3 = derive_session_key(&shared_secret, &different_nonce).unwrap();
         assert_ne!(session_key1, session_key3);
+    }
+    
+    #[test]
+    fn test_hmac_verification() {
+        let key = [0u8; 32];
+        let data = b"Data to authenticate";
+        
+        // Create HMAC
+        let mut mac = HmacSha256::new_from_slice(&key).unwrap();
+        mac.update(data);
+        let result = mac.finalize();
+        let hmac_bytes = result.into_bytes();
+        
+        // Verify HMAC
+        let mut verify_mac = HmacSha256::new_from_slice(&key).unwrap();
+        verify_mac.update(data);
+        assert!(verify_mac.verify_slice(&hmac_bytes).is_ok());
+        
+        // Tamper with data and verify failure
+        let mut tampered_hmac = hmac_bytes.to_vec();
+        tampered_hmac[0] ^= 1; // Flip one bit
+        
+        let mut verify_mac = HmacSha256::new_from_slice(&key).unwrap();
+        verify_mac.update(data);
+        assert!(verify_mac.verify_slice(&tampered_hmac).is_err());
+    }
+    
+    #[test]
+    fn test_key_fingerprint() {
+        let keypair = generate_keypair();
+        let fingerprint = compute_key_fingerprint(&keypair.pubkey());
+        
+        // Fingerprint should be 8 hex characters (4 bytes)
+        assert_eq!(fingerprint.len(), 8);
+        
+        // Same key should produce same fingerprint
+        let fingerprint2 = compute_key_fingerprint(&keypair.pubkey());
+        assert_eq!(fingerprint, fingerprint2);
+        
+        // Different keys should produce different fingerprints
+        let keypair2 = generate_keypair();
+        let different_fingerprint = compute_key_fingerprint(&keypair2.pubkey());
+        assert_ne!(fingerprint, different_fingerprint);
     }
 }
