@@ -1,6 +1,5 @@
 use ipnetwork::Ipv4Network;
 use std::collections::{HashMap, VecDeque};
-use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,7 +7,6 @@ use tokio::sync::Mutex;
 use tun::Configuration;
 
 use crate::config;
-use crate::obfuscation::{ObfuscationMethod, TrafficShaper};
 use crate::types::{IpAllocation, Result, VpnError};
 use crate::utils;
 
@@ -177,7 +175,7 @@ impl IpPoolManager {
         let mut available = self.available_ips.lock().await;
         if let Some(ip) = available.pop_front() {
             let now = utils::current_timestamp_millis();
-            let expires_at = now + config::IP_LEASE_DURATION.as_secs() * 1000;
+            let expires_at = now + config::IP_LEASE_DURATION_SECS * 1000;
             
             let allocation = IpAllocation {
                 ip_address: ip.clone(),
@@ -212,7 +210,7 @@ impl IpPoolManager {
     /// Check and cleanup expired IP allocations
     pub async fn cleanup_expired(&self) -> Result<()> {
         let now = utils::current_timestamp_millis();
-        let mut to_release = Vec::new();
+        let mut to_release = Vec::<String>::new();
         
         {
             let allocated = self.allocated_ips.lock().await;
@@ -236,7 +234,7 @@ impl IpPoolManager {
         
         if let Some(allocation) = allocated.get_mut(ip) {
             let now = utils::current_timestamp_millis();
-            let expires_at = now + config::IP_LEASE_DURATION.as_secs() * 1000;
+            let expires_at = now + config::IP_LEASE_DURATION_SECS * 1000;
             allocation.expires_at = expires_at;
             Ok(expires_at)
         } else {
@@ -438,7 +436,7 @@ impl TrafficAnalyzer {
     }
     
     /// Analyze traffic patterns for anomalies
-    fn analyze_patterns(&mut self, src_ip: &str, dest_ip: &str) {
+    fn analyze_patterns(&mut self, src_ip: &str, _dest_ip: &str) {
         // In a real implementation, this would use more sophisticated anomaly detection
         // For now, just check for basic rate limiting
         if let Some(pattern) = self.client_patterns.get(src_ip) {
