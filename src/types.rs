@@ -208,7 +208,7 @@ pub struct Args {
     pub max_connections_per_ip: usize,
 }
 
-/// Server configuration - renamed to fix name conflict
+/// Server configuration - renamed to avoid the name conflict with rustls ServerConfig
 pub struct ServerConfigVPN {
     /// TLS acceptor
     pub tls_acceptor: Arc<TlsAcceptor>,
@@ -294,6 +294,23 @@ impl std::fmt::Debug for Client {
             .field("assigned_ip", &self.assigned_ip)
             .field("connected_at", &self.connected_at)
             .finish()
+    }
+}
+
+// Add Clone implementation for Client
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        Client {
+            stream: self.stream.clone(),
+            public_key: self.public_key,
+            assigned_ip: self.assigned_ip.clone(),
+            connected_at: self.connected_at,
+            last_activity: self.last_activity.clone(),
+            session_key: self.session_key.clone(),
+            key_created_at: self.key_created_at.clone(),
+            packet_counter: self.packet_counter.clone(),
+            rate_limit: self.rate_limit.clone(),
+        }
     }
 }
 
