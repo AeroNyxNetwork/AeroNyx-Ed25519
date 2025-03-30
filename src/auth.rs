@@ -1,21 +1,19 @@
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use rand::distributions::{Alphanumeric, DistString};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, Signature};
+use solana_sdk::signature::Signature;
 use solana_sdk::signer::Signer;
 use tokio::sync::Mutex;
-use crate::config;
-use crate::crypto;
-use crate::types::{AccessControlEntry, AccessControlList, Result, VpnError};
+use crate::types::{AccessControlEntry, AccessControlList, Result, VpnError, SerializableInstant};
 use crate::utils;
+use crate::crypto;
 
 /// Authentication challenge
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Challenge {
     /// Unique challenge ID
     pub id: String,
@@ -55,14 +53,14 @@ impl AuthManager {
     }
     
     /// Load access control list from file
-    pub async fn load_acl(&self, filename: &str) -> Result<()> {
+    pub async fn load_acl(&self, filename: &str) -> Result<bool> {
         match fs::read_to_string(filename) {
             Ok(content) => {
                 let acl: AccessControlList = serde_json::from_str(&content)
                     .map_err(|e| VpnError::Json(e))?;
                 let mut access_control = self.access_control.lock().await;
                 *access_control = acl;
-                Ok(())
+                Ok(true)
             }
             Err(e) => {
                 // If file doesn't exist, create a default ACL
@@ -76,7 +74,7 @@ impl AuthManager {
                     fs::write(filename, json)?;
                     let mut access_control = self.access_control.lock().await;
                     *access_control = default_acl;
-                    Ok(())
+                    Ok(false)
                 } else {
                     Err(VpnError::Io(e))
                 }
@@ -237,6 +235,7 @@ impl AuthManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_sdk::signature::Keypair;
     
     #[tokio::test]
     async fn test_challenge_verification() {
