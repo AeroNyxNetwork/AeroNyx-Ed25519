@@ -107,56 +107,54 @@ impl AuthManager {
     }
     
     /// Verify a challenge response and authenticate the client
+    /// Verify a challenge response with four parameters
     pub async fn verify_challenge(
         &self,
         challenge_id: &str,
-        client_addr: SocketAddr,
         signature: &str,
         public_key: &str,
-    ) -> Result<(), AuthError> {
-        // Validate the public key format
-        if !StringValidator::is_valid_solana_pubkey(public_key) {
-            // Record failed attempt
-            self.record_failed_attempt(client_addr).await;
-            
-            return Err(AuthError::InvalidFormat(format!(
-                "Invalid public key format: {}", public_key
-            )));
+        addr: &str,
+    ) -> Result<(), ChallengeError> {
+        let mut challenges = self.challenges.lock().await;
+        
+        // Find the challenge
+        let challenge = challenges.get(challenge_id)
+            .ok_or_else(|| ChallengeError::NotFound(challenge_id.to_string()))?;
+        
+        // Verify client address
+        if challenge.client_addr.to_string() != addr {
+            warn!("Challenge address mismatch: expected {}, got {}", 
+                 challenge.client_addr, addr);
+            return Err(ChallengeError::AddressMismatch);
         }
         
-        // Verify the challenge response
-        match self.challenge_manager.verify_challenge(
-            challenge_id,
-            client_addr,
-            signature,
-            public_key,
-        ).await {
-            Ok(()) => {
-                // Challenge verified, now check ACL
-                if self.acl_manager.is_allowed(public_key).await {
-                    // Reset failed attempts
-                    self.reset_failed_attempts(client_addr).await;
-                    
-                    info!("Successfully authenticated client {} ({})", public_key, client_addr);
-                    Ok(())
-                } else {
-                    // Record failed attempt
-                    self.record_failed_attempt(client_addr).await;
-                    
-                    warn!("Access denied for client {} ({})", public_key, client_addr);
-                    Err(AuthError::AccessDenied(format!(
-                        "Client {} not allowed by ACL", public_key
-                    )))
-                }
-            }
-            Err(e) => {
-                // Record failed attempt
-                self.record_failed_attempt(client_addr).await;
-                
-                warn!("Challenge verification failed for client {}: {}", client_addr, e);
-                Err(AuthError::Challenge(e))
-            }
+        // Check if challenge has expired
+        if challenge.is_expired() {
+            warn!("Expired challenge: {}", challenge_id);
+            challenges.remove(challenge_id);
+            return Err(ChallengeError::Expired);
         }
+        
+        // Parse the client's public key
+        let pubkey = solana_sdk::pubkey::Pubkey::from_str(public_key)
+            .map_err(|_| ChallengeError::SignatureVerificationFailed)?;
+        
+        // Parse the signature
+        let sig = solana_sdk::signature::Signature::from_str(signature)
+            .map_err(|_| ChallengeError::SignatureVerificationFailed)?;
+        
+        // Verify the signature
+        if !KeyManager::verify_signature(&pubkey, &challenge.data, &sig) {
+            warn!("Signature verification failed for challenge {}", challenge_id);
+            return Err(ChallengeError::SignatureVerificationFailed);
+        }
+        
+        // Remove the challenge (it's been used)
+        challenges.remove(challenge_id);
+        
+        info!("Successfully verified challenge {} for client {}", challenge_id, addr);
+        
+        Ok(())
     }
     
     /// Record a failed authentication attempt
