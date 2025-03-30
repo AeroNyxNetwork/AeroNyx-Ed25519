@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::Mutex;
-use solana_sdk::signer::Signer;
+use solana_sdk::signer::Signer;  // Import the Signer trait here
 
 use aeronyx_private_ed25519::client::{VpnClient, ClientConfig};
 
@@ -70,6 +70,29 @@ async fn main() -> anyhow::Result<()> {
             stats.bytes_received,
             stats.session_duration
         );
+        
+        // Get network performance metrics
+        if let Ok(performance) = client.get_network_performance().await {
+            if let Some(latency) = performance.get("latency_ms") {
+                tracing::debug!("Connection latency: {:.2} ms", latency);
+            }
+            
+            if let Some(tx_throughput) = performance.get("tx_bytes_per_second") {
+                tracing::debug!("Upload speed: {:.2} bytes/sec", tx_throughput);
+            }
+            
+            if let Some(rx_throughput) = performance.get("rx_bytes_per_second") {
+                tracing::debug!("Download speed: {:.2} bytes/sec", rx_throughput);
+            }
+        }
+        
+        // Check for connection issues and attempt auto-recovery if needed
+        if !client.is_connected().await && client.config.auto_reconnect {
+            tracing::warn!("Connection dropped, attempting to reconnect...");
+            if let Err(e) = client.check_and_reconnect().await {
+                tracing::error!("Auto-reconnect failed: {}", e);
+            }
+        }
         
         // Check if we need to exit
         if *shutdown.lock().await {
