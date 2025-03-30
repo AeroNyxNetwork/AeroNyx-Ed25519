@@ -1,467 +1,4 @@
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, ErrorKind, Read, Write};
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use futures::{SinkExt, StreamExt};
-use rustls::{ClientConfig, RootCertStore};
-use serde::{Deserialize, Serialize};
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, Signature};
-use solana_sdk::signer::Signer;
-use tokio::net::TcpStream;
-use tokio::process::Command as TokioCommand;
-use tokio::sync::Mutex;
-use tokio_rustls::TlsConnector;
-use tokio_tungstenite::{connect_async_tls_with_config, WebSocketStream};
-use tokio_tungstenite::tungstenite::{Message, Result as WsResult};
-use tun::{Device as TunDevice, Configuration as TunConfiguration};
-
-use crate::config;
-use crate::crypto::{self, SecretKeyCache, SessionKeyManager};
-use crate::obfuscation::{ObfuscationMethod, TrafficShaper};
-use crate::types::{PacketType, Result, VpnError};
-use crate::utils;
-
-/// VPN Client configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientConfig {
-    /// Server hostname or IP
-    pub server_host: String,
-    /// Server port
-    pub server_port: u16,
-    /// Client's Solana keypair file path
-    pub keypair_path: String,
-    /// TUN device name
-    pub tun_name: String,
-    /// Enable obfuscation
-    pub enable_obfuscation: bool,
-    /// Obfuscation method
-    pub obfuscation_method: String,
-    /// Enable traffic padding
-    pub enable_padding: bool,
-    /// Log level
-    pub log_level: String,
-    /// Socket read timeout in seconds
-    pub socket_timeout: u64,
-    /// Reconnect attempts
-    pub reconnect_attempts: u32,
-    /// Reconnect delay in seconds
-    pub reconnect_delay: u64,
-    /// Auto-generate certificates if missing
-    pub auto_generate_certs: bool,
-    /// Custom TLS certificate path
-    pub custom_cert_path: Option<String>,
-    /// Trust custom certificates
-    pub trust_custom_certs: bool,
-    /// Auto-elevate privileges (requires password prompt)
-    pub auto_elevate: bool,
-    /// Connection auto-recovery
-    pub auto_reconnect: bool,
-    /// Certificate verification mode
-    pub verify_certificates: bool,
-    /// Data directory for storing configuration and keys
-    pub data_dir: String,
-}
-
-impl Default for ClientConfig {
-    fn default() -> Self {
-        // Determine default data directory
-        let data_dir = if cfg!(windows) {
-            format!("{}\\AeroNyx", std::env::var("APPDATA").unwrap_or_else(|_| "C:\\Users\\Public\\Documents".to_string()))
-        } else if cfg!(target_os = "macos") {
-            format!("{}/Library/Application Support/AeroNyx", std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
-        } else {
-            format!("{}/.aeronyx", std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
-        };
-
-        Self {
-            server_host: "localhost".to_string(),
-            server_port: 8080,
-            keypair_path: format!("{}/solana-keypair.json", data_dir),
-            tun_name: if cfg!(windows) { "aeronyx0" } else { "tun0" }.to_string(),
-            enable_obfuscation: false,
-            obfuscation_method: "none".to_string(),
-            enable_padding: false,
-            log_level: "info".to_string(),
-            socket_timeout: 60,
-            reconnect_attempts: 5,
-            reconnect_delay: 5,
-            auto_generate_certs: true,
-            custom_cert_path: None,
-            trust_custom_certs: false,
-            auto_elevate: true,
-            auto_reconnect: true,
-            verify_certificates: true,
-            data_dir,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientStats {
-    /// Connection start time
-    pub connected_since: Option<u64>,
-    /// Assigned IP address
-    pub assigned_ip: Option<String>,
-    /// Bytes sent
-    pub bytes_sent: u64,
-    /// Bytes received
-    pub bytes_received: u64,
-    /// Current session duration in seconds
-    pub session_duration: u64,
-    /// Connection latency in milliseconds
-    pub latency_ms: u64,
-    /// Connection status
-    pub status: String,
-    /// Server public key
-    pub server_pubkey: Option<String>,
-    /// Current session ID
-    pub session_id: Option<String>,
-}
-
-impl Default for ClientStats {
-    fn default() -> Self {
-        Self {
-            connected_since: None,
-            assigned_ip: None,
-            bytes_sent: 0,
-            bytes_received: 0,
-            session_duration: 0,
-            latency_ms: 0,
-            status: "Disconnected".to_string(),
-            server_pubkey: None,
-            session_id: None,
-        }
-    }
-}
-
-/// Connection state
-enum ConnectionState {
-    Disconnected,
-    Connecting,
-    Connected,
-    Reconnecting,
-    Failed(String),
-}
-
-/// VPN Client state
-#[derive(Debug)]
-pub struct VpnClient {
-    /// Client configuration
-    config: ClientConfig,
-    /// Client's Solana keypair
-    keypair: Keypair,
-    /// WebSocket connection
-    ws_stream: Option<Arc<Mutex<WebSocketStream<tokio_tungstenite::stream::Stream<TcpStream, tokio_rustls::client::TlsStream<TcpStream>>>>>>,
-    /// TUN device
-    tun_device: Option<Arc<Mutex<TunDevice>>>,
-    /// Session key
-    session_key: Arc<Mutex<Option<Vec<u8>>>>,
-    /// Session ID
-    session_id: Arc<Mutex<Option<String>>>,
-    /// Assigned IP address
-    assigned_ip: Arc<Mutex<Option<String>>>,
-    /// Connection state
-    connection_state: Arc<Mutex<ConnectionState>>,
-    /// Session key manager
-    session_manager: Arc<SessionKeyManager>,
-    /// Traffic shaper for obfuscation
-    traffic_shaper: Arc<TrafficShaper>,
-    /// Secret key cache
-    secret_cache: Arc<SecretKeyCache>,
-    /// Packet counter for replay protection
-    packet_counter: Arc<Mutex<u64>>,
-    /// Server's public key
-    server_pubkey: Arc<Mutex<Option<Pubkey>>>,
-    /// Statistics
-    stats: Arc<Mutex<ClientStats>>,
-    /// Running tasks handles
-    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    /// Cancellation flag for all tasks
-    cancel_flag: Arc<Mutex<bool>>,
-}
-
-impl VpnClient {
-    /// Create a new VPN client
-    pub async fn new(config: ClientConfig) -> Result<Self> {
-        // Ensure data directory exists
-        fs::create_dir_all(&config.data_dir)
-            .map_err(|e| VpnError::Io(e))?;
-
-        // Create or load client keypair
-        let keypair = Self::ensure_keypair(&config.keypair_path).await?;
-        
-        // Initialize traffic shaper
-        let obfuscation_method = ObfuscationMethod::from_str(&config.obfuscation_method);
-        let traffic_shaper = TrafficShaper::new(obfuscation_method);
-        
-        let client = Self {
-            config,
-            keypair,
-            ws_stream: None,
-            tun_device: None,
-            session_key: Arc::new(Mutex::new(None)),
-            session_id: Arc::new(Mutex::new(None)),
-            assigned_ip: Arc::new(Mutex::new(None)),
-            connection_state: Arc::new(Mutex::new(ConnectionState::Disconnected)),
-            session_manager: Arc::new(SessionKeyManager::new()),
-            traffic_shaper: Arc::new(traffic_shaper),
-            secret_cache: Arc::new(SecretKeyCache::new()),
-            packet_counter: Arc::new(Mutex::new(0)),
-            server_pubkey: Arc::new(Mutex::new(None)),
-            stats: Arc::new(Mutex::new(ClientStats::default())),
-            tasks: Arc::new(Mutex::new(Vec::new())),
-            cancel_flag: Arc::new(Mutex::new(false)),
-        };
-        
-        Ok(client)
-    }
-
-    /// Ensure Solana keypair exists, create if it doesn't
-    pub async fn ensure_keypair(path: &str) -> Result<Keypair> {
-        // Check if keypair file exists
-        if Path::new(path).exists() {
-            // Load existing keypair
-            return Self::load_keypair(path);
-        }
-        
-        // Create directory if it doesn't exist
-        if let Some(parent) = Path::new(path).parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| VpnError::Io(e))?;
-        }
-        
-        // Generate new keypair
-        tracing::info!("Generating new Solana keypair at {}", path);
-        let keypair = Keypair::new();
-        
-        // Save keypair to file
-        let keypair_bytes = keypair.to_bytes();
-        let json = serde_json::to_vec(&keypair_bytes.to_vec())
-            .map_err(|e| VpnError::Json(e))?;
-            
-        fs::write(path, json)
-            .map_err(|e| VpnError::Io(e))?;
-            
-        tracing::info!("New keypair generated with public key: {}", keypair.pubkey());
-        
-        Ok(keypair)
-    }
-    
-    /// Load Solana keypair from file
-    fn load_keypair(path: &str) -> Result<Keypair> {
-        let keypair_bytes = std::fs::read_to_string(path)
-            .map_err(|e| VpnError::Io(e))?;
-            
-        let keypair_json: Vec<u8> = serde_json::from_str(&keypair_bytes)
-            .map_err(|e| VpnError::Json(e))?;
-            
-        let keypair = Keypair::from_bytes(&keypair_json)
-            .map_err(|e| VpnError::Crypto(e.to_string()))?;
-            
-        tracing::info!("Loaded keypair with public key: {}", keypair.pubkey());
-        
-        Ok(keypair)
-    }
-    
-    /// Generate a self-signed TLS certificate for development
-    pub async fn generate_self_signed_cert(
-        common_name: &str,
-        cert_path: &str,
-        key_path: &str,
-    ) -> Result<()> {
-        // Ensure OpenSSL is available
-        let openssl_check = TokioCommand::new("openssl")
-            .arg("version")
-            .output()
-            .await;
-            
-        if openssl_check.is_err() {
-            return Err(VpnError::Crypto("OpenSSL not found in PATH. Please install OpenSSL or manually generate certificates.".into()));
-        }
-        
-        // Create directories if they don't exist
-        if let Some(parent) = Path::new(cert_path).parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| VpnError::Io(e))?;
-        }
-        
-        if let Some(parent) = Path::new(key_path).parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| VpnError::Io(e))?;
-        }
-        
-        tracing::info!("Generating self-signed TLS certificate for {}", common_name);
-        
-        // Generate self-signed certificate using OpenSSL
-        let output = TokioCommand::new("openssl")
-            .arg("req")
-            .arg("-x509")
-            .arg("-newkey")
-            .arg("rsa:4096")
-            .arg("-keyout")
-            .arg(key_path)
-            .arg("-out")
-            .arg(cert_path)
-            .arg("-days")
-            .arg("365")
-            .arg("-nodes")
-            .arg("-subj")
-            .arg(format!("/CN={}", common_name))
-            .output()
-            .await
-            .map_err(|e| VpnError::Crypto(format!("Failed to execute OpenSSL: {}", e)))?;
-            
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            return Err(VpnError::Crypto(format!("Failed to generate certificate: {}", error)));
-        }
-        
-        tracing::info!("Self-signed certificate generated successfully");
-        
-        Ok(())
-    }
-    
-    /// Check if we have root/admin privileges
-    pub fn has_elevated_privileges() -> bool {
-        #[cfg(unix)]
-        {
-            nix::unistd::geteuid().is_root()
-        }
-        
-        #[cfg(windows)]
-        {
-            // Check for admin privileges on Windows (simplified method)
-            // In a real implementation, use IsUserAnAdmin from shell32.dll
-            let output = Command::new("net")
-                .args(&["session"])
-                .output();
-                
-            match output {
-                Ok(o) => o.status.success(),
-                Err(_) => false,
-            }
-        }
-        
-        #[cfg(not(any(unix, windows)))]
-        {
-            false
-        }
-    }
-    
-    /// Attempt to elevate privileges if needed
-    pub async fn elevate_privileges() -> Result<bool> {
-        if Self::has_elevated_privileges() {
-            return Ok(true);
-        }
-        
-        tracing::warn!("AeroNyx VPN requires elevated privileges to create TUN devices");
-        tracing::info!("Attempting to restart with elevated privileges...");
-        
-        #[cfg(unix)]
-        {
-            // On Unix, use sudo
-            let args: Vec<String> = std::env::args().collect();
-            let current_exe = std::env::current_exe()
-                .map_err(|e| VpnError::Io(e))?;
-                
-            let result = TokioCommand::new("sudo")
-                .arg("-p")
-                .arg("[sudo] Password required to create VPN tunnel: ")
-                .arg(current_exe)
-                .args(&args[1..])
-                .spawn();
-                
-            match result {
-                Ok(_) => {
-                    tracing::info!("Launched with elevated privileges, exiting current process");
-                    std::process::exit(0);
-                }
-                Err(e) => {
-                    tracing::error!("Failed to elevate privileges: {}", e);
-                    return Err(VpnError::Network(format!("Failed to elevate privileges: {}", e)));
-                }
-            }
-        }
-        
-        #[cfg(windows)]
-        {
-            // On Windows, use ShellExecute with "runas"
-            use std::os::windows::process::CommandExt;
-            
-            let args: Vec<String> = std::env::args().collect();
-            let current_exe = std::env::current_exe()
-                .map_err(|e| VpnError::Io(e))?;
-                
-            const RUNAS_FLAG: u32 = 0x00000002;
-            
-            let result = Command::new("cmd")
-                .args(&["/C", "start", "AeroNyx VPN (Administrator)", "/wait"])
-                .arg(current_exe)
-                .args(&args[1..])
-                .creation_flags(RUNAS_FLAG)
-                .spawn();
-                
-            match result {
-                Ok(_) => {
-                    tracing::info!("Launched with elevated privileges, exiting current process");
-                    std::process::exit(0);
-                }
-                Err(e) => {
-                    tracing::error!("Failed to elevate privileges: {}", e);
-                    return Err(VpnError::Network(format!("Failed to elevate privileges: {}", e)));
-                }
-            }
-        }
-        
-        #[cfg(not(any(unix, windows)))]
-        {
-            return Err(VpnError::Network("Privilege elevation not supported on this platform".into()));
-        }
-        
-        // Should never reach here because we exit the process above
-        Ok(false)
-    }
-    
-    /// Connect to the VPN server
-    pub async fn connect(&mut self) -> Result<()> {
-        // Check if already connected
-        if self.is_connected().await {
-            tracing::info!("Already connected to VPN server");
-            return Ok(());
-        }
-        
-        // Update connection state
-        *self.connection_state.lock().await = ConnectionState::Connecting;
-        *self.cancel_flag.lock().await = false;
-        
-        // Check if we need elevated privileges
-        if !Self::has_elevated_privileges() {
-            if self.config.auto_elevate {
-                Self::elevate_privileges().await?;
-                // If we get here, elevation failed but we want to continue anyway
-                tracing::warn!("Continuing without elevated privileges, this may fail");
-            } else {
-                tracing::warn!("AeroNyx VPN requires elevated privileges to create TUN devices");
-                tracing::warn!("Please run as root/administrator or enable auto_elevate in config");
-            }
-        }
-        
-        // Create TUN device
-        match self.setup_tun_device().await {
-            Ok(_) => tracing::info!("TUN device created successfully"),
-            Err(e) => {
-                *self.connection_state.lock().await = ConnectionState::Failed(format!("TUN setup failed: {}", e));
-                return Err(e);
-            }
-        }
-        
-        // Connect to server
+// Connect to server
         match self.connect_to_server().await {
             Ok(_) => tracing::info!("Connected to VPN server"),
             Err(e) => {
@@ -1198,7 +735,7 @@ impl VpnClient {
     pub async fn is_connected(&self) -> bool {
         matches!(*self.connection_state.lock().await, ConnectionState::Connected)
     }
-    
+
     /// Get the current connection state
     pub async fn get_connection_state(&self) -> String {
         match *self.connection_state.lock().await {
@@ -1257,6 +794,241 @@ impl VpnClient {
             
         Ok(config)
     }
+    
+    /// Enhanced network performance monitoring
+    pub async fn get_network_performance(&self) -> Result<HashMap<String, f64>> {
+        let mut performance = HashMap::new();
+        
+        // Get current stats
+        let stats = self.stats.lock().await;
+        
+        // Calculate throughput
+        let time_connected = if let Some(connected_since) = stats.connected_since {
+            (utils::current_timestamp_millis() - connected_since) as f64 / 1000.0
+        } else {
+            0.0
+        };
+        
+        if time_connected > 0.0 {
+            let tx_throughput = stats.bytes_sent as f64 / time_connected;
+            let rx_throughput = stats.bytes_received as f64 / time_connected;
+            
+            performance.insert("tx_bytes_per_second".to_string(), tx_throughput);
+            performance.insert("rx_bytes_per_second".to_string(), rx_throughput);
+        }
+        
+        // Add latency
+        performance.insert("latency_ms".to_string(), stats.latency_ms as f64);
+        
+        // Run network quality test if connected
+        if self.is_connected().await {
+            if let Some(ws_stream) = &self.ws_stream {
+                // Send a series of ping messages to measure jitter
+                let mut jitter_measurements = Vec::new();
+                let mut latencies = Vec::new();
+                
+                let mut stream = ws_stream.lock().await;
+                
+                for i in 0..5 {
+                    let start_time = utils::current_timestamp_millis();
+                    
+                    // Send ping
+                    let ping = PacketType::Ping {
+                        timestamp: start_time,
+                        sequence: i,
+                    };
+                    
+                    if let Ok(json) = serde_json::to_string(&ping) {
+                        if let Err(e) = stream.send(Message::Text(json)).await {
+                            tracing::error!("Error sending ping: {}", e);
+                            continue;
+                        }
+                    }
+                    
+                    // Wait for pong with timeout
+                    let mut received_pong = false;
+                    
+                    for _ in 0..10 {
+                        match tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
+                            Ok(Some(Ok(msg))) => {
+                                if let Ok(text) = msg.to_text() {
+                                    if let Ok(packet) = serde_json::from_str::<PacketType>(text) {
+                                        if let PacketType::Pong { echo_timestamp, server_timestamp: _, sequence: resp_seq } = packet {
+                                            if resp_seq == i {
+                                                let latency = utils::current_timestamp_millis() - echo_timestamp;
+                                                latencies.push(latency);
+                                                received_pong = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            _ => {
+                                // Timeout or error, continue to next iteration
+                            }
+                        }
+                    }
+                    
+                    if !received_pong {
+                        tracing::warn!("No pong response received for ping {}", i);
+                    }
+                    
+                    // Wait before next ping
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                
+                // Calculate jitter if we have enough measurements
+                if latencies.len() >= 2 {
+                    for i in 1..latencies.len() {
+                        let jitter = (latencies[i] as i64 - latencies[i-1] as i64).abs() as u64;
+                        jitter_measurements.push(jitter);
+                    }
+                    
+                    let avg_jitter = jitter_measurements.iter().sum::<u64>() as f64 / jitter_measurements.len() as f64;
+                    performance.insert("jitter_ms".to_string(), avg_jitter);
+                    
+                    // Calculate average latency
+                    let avg_latency = latencies.iter().sum::<u64>() as f64 / latencies.len() as f64;
+                    performance.insert("avg_latency_ms".to_string(), avg_latency);
+                }
+            }
+        }
+        
+        // Add packet loss metrics if connected long enough
+        if time_connected > 10.0 {
+            // This is just a placeholder - in a real implementation, we'd track sent/received packet counts
+            // and calculate actual packet loss
+            performance.insert("packet_loss_percent".to_string(), 0.0);
+        }
+        
+        Ok(performance)
+    }
+    
+    /// Test server connectivity and measure latency without establishing a full connection
+    pub async fn test_connectivity(&self) -> Result<HashMap<String, u64>> {
+        let mut results = HashMap::new();
+        let start_time = Instant::now();
+        
+        // Test DNS resolution
+        let dns_start = Instant::now();
+        
+        let addr_str = format!("{}:{}", self.config.server_host, self.config.server_port);
+        let addr_result = tokio::net::lookup_host(addr_str).await;
+        
+        let dns_time = dns_start.elapsed().as_millis() as u64;
+        results.insert("dns_resolution_ms".to_string(), dns_time);
+        
+        if let Err(e) = addr_result {
+            results.insert("error_code".to_string(), 1);
+            results.insert("error_type".to_string(), 1); // DNS error
+            return Ok(results);
+        }
+        
+        // Test TCP connection
+        let tcp_start = Instant::now();
+        
+        let tcp_result = TcpStream::connect(format!("{}:{}", self.config.server_host, self.config.server_port)).await;
+        
+        let tcp_time = tcp_start.elapsed().as_millis() as u64;
+        results.insert("tcp_connect_ms".to_string(), tcp_time);
+        
+        if let Err(e) = tcp_result {
+            results.insert("error_code".to_string(), 2);
+            results.insert("error_type".to_string(), 2); // TCP error
+            return Ok(results);
+        }
+        
+        // Test TLS handshake
+        let tls_start = Instant::now();
+        
+        let tls_config = self.setup_tls_config().await?;
+        let connector = TlsConnector::from(Arc::new(tls_config));
+        
+        let server_name = rustls::ServerName::try_from(self.config.server_host.as_str())
+            .map_err(|_| VpnError::Tls("Invalid DNS name".into()))?;
+            
+        let tls_result = connector.connect(server_name, tcp_result.unwrap()).await;
+        
+        let tls_time = tls_start.elapsed().as_millis() as u64;
+        results.insert("tls_handshake_ms".to_string(), tls_time);
+        
+        if let Err(e) = tls_result {
+            results.insert("error_code".to_string(), 3);
+            results.insert("error_type".to_string(), 3); // TLS error
+            return Ok(results);
+        }
+        
+        // Calculate total connection time
+        results.insert("total_connection_ms".to_string(), start_time.elapsed().as_millis() as u64);
+        results.insert("error_code".to_string(), 0); // No error
+        
+        Ok(results)
+    }
+    
+    /// Enhanced error recovery system
+    pub async fn attempt_recovery(&mut self) -> Result<bool> {
+        tracing::info!("Attempting connection recovery...");
+        
+        // Check if we're already in a recovery state
+        if matches!(*self.connection_state.lock().await, ConnectionState::Reconnecting) {
+            return Err(VpnError::Network("Recovery already in progress".into()));
+        }
+        
+        // Update state
+        *self.connection_state.lock().await = ConnectionState::Reconnecting;
+        
+        // First try to clean up the existing connection
+        self.cleanup_connection().await;
+        
+        // Wait a moment before reconnecting
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // Try to reconnect with exponential backoff
+        let mut retry_delay = Duration::from_secs(1);
+        let max_retries = self.config.reconnect_attempts;
+        
+        for attempt in 1..=max_retries {
+            tracing::info!("Recovery attempt {} of {}", attempt, max_retries);
+            
+            // Try to connect
+            match self.connect().await {
+                Ok(_) => {
+                    tracing::info!("Recovery successful!");
+                    return Ok(true);
+                }
+                Err(e) => {
+                    tracing::warn!("Recovery attempt {} failed: {}", attempt, e);
+                    
+                    if attempt < max_retries {
+                        // Wait before retry with exponential backoff
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = retry_delay.mul_f32(1.5);
+                    }
+                }
+            }
+        }
+        
+        // All attempts failed
+        *self.connection_state.lock().await = ConnectionState::Failed("Recovery failed after all attempts".into());
+        
+        Ok(false)
+    }
+    
+    /// Check if automatic reconnect is needed and attempt it
+    pub async fn check_and_reconnect(&mut self) -> Result<bool> {
+        // Only attempt reconnect if configured and disconnected
+        if !self.config.auto_reconnect {
+            return Ok(false);
+        }
+        
+        if matches!(*self.connection_state.lock().await, ConnectionState::Disconnected | ConnectionState::Failed(_)) {
+            tracing::info!("Auto-reconnect triggered");
+            return self.attempt_recovery().await;
+        }
+        
+        Ok(false)
+    }
 }
 
 // This is only used when certificate verification is disabled (not recommended for production)
@@ -1287,6 +1059,7 @@ mod danger {
 mod tests {
     use super::*;
     use tokio::runtime::Runtime;
+    use solana_sdk::signer::Signer; // Add Signer trait here for tests
     
     #[test]
     fn test_client_config() {
@@ -1327,5 +1100,27 @@ mod tests {
         });
     }
     
-    // More comprehensive tests would require mocking the server
+    #[test]
+    fn test_keypair_generation() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            // Create a temporary directory
+            let temp_dir = tempfile::tempdir().unwrap();
+            let keypair_path = temp_dir.path().join("test_keypair.json");
+            
+            // Generate keypair
+            let keypair = VpnClient::ensure_keypair(keypair_path.to_str().unwrap()).await.unwrap();
+            
+            // Check that keypair was generated
+            assert!(keypair_path.exists());
+            
+            // Check that pubkey is valid
+            let pubkey = keypair.pubkey();
+            assert_eq!(pubkey.to_string().len(), 44); // Base58 encoded Ed25519 public key is 44 chars
+            
+            // Test loading the keypair
+            let loaded_keypair = VpnClient::load_keypair(keypair_path.to_str().unwrap()).unwrap();
+            assert_eq!(loaded_keypair.pubkey(), keypair.pubkey());
+        });
+    }
 }
