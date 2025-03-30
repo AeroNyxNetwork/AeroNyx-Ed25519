@@ -9,7 +9,6 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use rand::{Rng, thread_rng};
 use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, trace, warn};
 
 use crate::config::constants::{MIN_PADDING_SIZE, MAX_PADDING_SIZE, PAD_PROBABILITY};
@@ -130,9 +129,7 @@ impl PacketRouter {
         // Send to client
         session.send_packet(&data_packet)
             .await
-            .map_err(|e| RoutingError::WebSocket(tokio_tungstenite::tungstenite::Error::Protocol(
-                tokio_tungstenite::tungstenite::error::ProtocolError::SendAfterClosing
-            )))?;
+            .map_err(|e| RoutingError::WebSocket(e))?;
         
         Ok(())
     }
@@ -168,13 +165,18 @@ impl PacketRouter {
             decrypted
         };
         
-        // Write the packet to the TUN device
-        // In a real implementation, we would write to the TUN device here
-        // For the skeleton, we'll just log and return the packet size
-        let packet_size = packet_data.len();
-        trace!("Would write {} bytes to TUN device for {}", packet_size, session.ip_address);
-        
-        Ok(packet_size)
+        // Get the TUN device from the global reference
+        if let Some(tun_device) = crate::server::globals::SERVER_TUN_DEVICE.get() {
+            // Write the packet to the TUN device
+            let written = {
+                let mut device = tun_device.lock().await;
+                device.write(&packet_data).map_err(|e| RoutingError::TunWrite(e.to_string()))?
+            };
+            
+            Ok(written)
+        } else {
+            Err(RoutingError::TunWrite("TUN device not initialized".to_string()))
+        }
     }
     
     /// Check if padding should be added based on probability
@@ -230,35 +232,19 @@ impl PacketRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_tungstenite::tungstenite::protocol::{Role, WebSocket};
-    use tokio::io::duplex;
+    use tokio_tungstenite::tungstenite::Message;
     use crate::server::session::ClientSession;
     
-    // Helper to create a mock WebSocket stream for testing
-    fn create_mock_session() -> ClientSession {
-        // Create a mock TLS stream
-        let (client, _server) = duplex(Vec::new(), Vec::new());
-        let mock_tls_stream = tokio_rustls::server::TlsStream::new(client);
-        
-        // Wrap in a WebSocket stream
-        let mock_stream = WebSocketStream::from_raw_socket(
-            WebSocket::from_partially_read(
-                mock_tls_stream,
-                None,
-                Role::Server,
-                None,
-            ),
-            Role::Server,
-            None,
-        );
-        
-        ClientSession::new(
-            "test-session".to_string(),
-            "client123".to_string(),
-            "10.0.0.1".to_string(),
-            "127.0.0.1:12345".parse().unwrap(),
-            mock_stream,
-        ).unwrap()
+    // Mock implementation of ClientSession for testing
+    struct MockClientSession {
+        client_id: String,
+        ip_address: String,
+    }
+    
+    impl MockClientSession {
+        async fn send_packet(&self, _packet: &PacketType) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+            Ok(())
+        }
     }
     
     #[test]
