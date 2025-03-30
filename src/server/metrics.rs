@@ -159,6 +159,7 @@ impl ServerMetricsCollector {
 
                     // Store the current metrics in history
                     let metrics_clone = metrics_guard.clone();
+                    
                     let mut history_guard = metrics_history.write().await;
                     history_guard.push_back(metrics_clone);
 
@@ -294,12 +295,12 @@ impl ServerMetricsCollector {
         report.push_str(&format!("Total Connections: {}\n", metrics.total_connections));
         
         // Traffic
-        report.push_str(&format!("\nTraffic:\n"));
+        report.push_str("\nTraffic:\n");
         report.push_str(&format!("  Bytes Sent: {}\n", format_bytes(metrics.bytes_sent)));
         report.push_str(&format!("  Bytes Received: {}\n", format_bytes(metrics.bytes_received)));
         
         // Authentication
-        report.push_str(&format!("\nAuthentication:\n"));
+        report.push_str("\nAuthentication:\n");
         report.push_str(&format!("  Successful: {}\n", metrics.auth_successes));
         report.push_str(&format!("  Failed: {}\n", metrics.auth_failures));
         let auth_success_rate = if metrics.auth_successes + metrics.auth_failures > 0 {
@@ -310,7 +311,7 @@ impl ServerMetricsCollector {
         report.push_str(&format!("  Success Rate: {:.2}%\n", auth_success_rate));
         
         // System metrics
-        report.push_str(&format!("\nSystem Metrics:\n"));
+        report.push_str("\nSystem Metrics:\n");
         report.push_str(&format!("  CPU Usage: {:.2}%\n", metrics.cpu_usage));
         report.push_str(&format!("  Memory Usage: {:.2}%\n", metrics.memory_usage));
         report.push_str(&format!("  Load Average: {:.2}, {:.2}, {:.2}\n", 
@@ -320,11 +321,34 @@ impl ServerMetricsCollector {
         ));
         
         // TLS
-        report.push_str(&format!("\nTLS Handshakes:\n"));
+        report.push_str("\nTLS Handshakes:\n");
         report.push_str(&format!("  Active: {}\n", metrics.active_handshakes));
         report.push_str(&format!("  Total: {}\n", metrics.total_handshakes));
         
         report
+    }
+    
+    /// Get a compact status report for admin interface
+    pub async fn get_status(&self) -> String {
+        let metrics = self.metrics.read().await;
+        let uptime = metrics.start_time.elapsed();
+        
+        let uptime_str = format!(
+            "{}d {}h {}m",
+            uptime.as_secs() / 86400,
+            (uptime.as_secs() % 86400) / 3600,
+            (uptime.as_secs() % 3600) / 60
+        );
+        
+        format!(
+            "Active: {} conns | Traffic: {} sent, {} recv | Auth: {}/{} | Uptime: {}",
+            metrics.active_connections,
+            format_bytes(metrics.bytes_sent),
+            format_bytes(metrics.bytes_received),
+            metrics.auth_successes,
+            metrics.auth_successes + metrics.auth_failures,
+            uptime_str
+        )
     }
 }
 
