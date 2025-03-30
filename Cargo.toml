@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["hi@aeronyx.network"]
 description = "A private server using Solana keypairs for authentication and encryption"
-repository = "https://github.com/AeroNyxNetwork/AeroNyx-Ed25519/"
+repository = "https://github.com/aeronyx/private-ed25519"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["vpn", "ed25519", "solana", "privacy", "security"]
@@ -124,8 +124,3 @@ path = "src/main.rs"
 [[example]]
 name = "client_example"
 path = "examples/client_example.rs"
-
-[[bench]]
-name = "crypto_benchmarks"
-harness = false
-required-features = ["metrics"]
