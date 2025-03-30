@@ -264,7 +264,7 @@ pub struct IpAllocation {
 }
 
 /// Client connection
-#[derive(Clone)]
+#[derive(Debug)]
 pub struct Client {
     /// WebSocket stream
     pub stream: Arc<Mutex<WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>>>,
@@ -286,18 +286,7 @@ pub struct Client {
     pub rate_limit: Arc<Mutex<std::collections::HashMap<String, (usize, Instant)>>>,
 }
 
-// Add Debug implementation manually since WebSocketStream doesn't implement Debug
-impl std::fmt::Debug for Client {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Client")
-            .field("public_key", &self.public_key)
-            .field("assigned_ip", &self.assigned_ip)
-            .field("connected_at", &self.connected_at)
-            .finish()
-    }
-}
-
-// Add Clone implementation for Client
+// Implement Clone manually for Client instead of deriving
 impl Clone for Client {
     fn clone(&self) -> Self {
         Client {
