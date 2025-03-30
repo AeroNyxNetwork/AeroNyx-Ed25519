@@ -3,11 +3,11 @@ use cbc::{Decryptor, Encryptor};
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use chacha20poly1305::aead::{Aead, NewAead};
-use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
+use curve25519_dalek::edwards::{CompressedEdwardsY};
 use curve25519_dalek::montgomery::MontgomeryPoint;
-use ed25519_dalek::{Keypair as Ed25519Keypair, PublicKey as Ed25519PublicKey, SecretKey as Ed25519SecretKey, Verifier};
+use ed25519_dalek::{PublicKey as Ed25519PublicKey, SecretKey as Ed25519SecretKey};
 use hmac::{Hmac, Mac};
-use rand::{Rng, RngCore};
+use rand::{RngCore};
 use sha2::{Digest, Sha256, Sha512};
 use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::pubkey::Pubkey;
@@ -221,16 +221,12 @@ pub fn ed25519_public_to_x25519(ed25519_public: &[u8]) -> Result<[u8; 32]> {
         return Err(VpnError::Crypto("Invalid Ed25519 public key length".into()));
     }
     
-    // Decompress the Edwards point from the Ed25519 public key
-    let compressed = match CompressedEdwardsY::from_slice(ed25519_public) {
-        Ok(c) => c,
-        Err(_) => return Err(VpnError::Crypto("Invalid Ed25519 public key format".into())),
-    };
+    // Try to create a CompressedEdwardsY point from the public key
+    let compressed = CompressedEdwardsY::from_slice(ed25519_public);
     
-    let edwards_point = match compressed.decompress() {
-        Some(point) => point,
-        None => return Err(VpnError::Crypto("Invalid Ed25519 point".into())),
-    };
+    // Decompress the Edwards point from the Ed25519 public key
+    let edwards_point = compressed.decompress()
+        .ok_or_else(|| VpnError::Crypto("Invalid Ed25519 point".into()))?;
     
     // Convert to Montgomery form (X25519)
     let montgomery_point: MontgomeryPoint = edwards_point.into();
@@ -352,7 +348,8 @@ pub fn encrypt(data: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| VpnError::Crypto("Invalid key length for HMAC".into()))?;
     mac.update(&result);
     let hmac_result = mac.finalize();
-    result.extend_from_slice(hmac_result.into_bytes().as_slice());
+    let hmac_bytes = hmac_result.into_bytes();
+    result.extend_from_slice(hmac_bytes.as_slice());
     
     Ok(result)
 }
@@ -382,7 +379,8 @@ pub fn decrypt(encrypted: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| VpnError::Crypto("Invalid key length for HMAC".into()))?;
     mac.update(authenticated_part);
     
-    mac.verify(hmac_received)
+    // Newer version of hmac requires this format for verification
+    mac.verify_slice(hmac_received)
         .map_err(|_| VpnError::Crypto("HMAC verification failed".into()))?;
     
     // Extract IV and encrypted data
