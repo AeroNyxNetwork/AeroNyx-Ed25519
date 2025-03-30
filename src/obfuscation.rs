@@ -7,7 +7,6 @@ use tokio::time;
 
 use crate::config;
 use crate::types::Result;
-use crate::types::VpnError;
 use crate::utils;
 
 /// Traffic obfuscation strategy
