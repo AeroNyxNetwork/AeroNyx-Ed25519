@@ -319,6 +319,71 @@ impl NetworkMonitor {
             samples.pop_front();
         }
     }
+
+        /// Record client traffic metrics
+    pub async fn record_client_traffic(&self, client_id: &str, bytes_sent: u64, bytes_received: u64) -> bool {
+        let mut client_stats_map = self.client_stats.lock().await;
+        
+        let client_stat = client_stats_map.entry(client_id.to_string()).or_insert_with(|| {
+            ClientStats {
+                client_id: client_id.to_string(),
+                stats: NetworkStats::default(),
+                rate_limited: false,
+                bandwidth_limit: 0,
+            }
+        });
+        
+        client_stat.stats.bytes_sent += bytes_sent;
+        client_stat.stats.bytes_received += bytes_received;
+        
+        if bytes_sent > 0 {
+            client_stat.stats.packets_sent += 1;
+        }
+        
+        if bytes_received > 0 {
+            client_stat.stats.packets_received += 1;
+        }
+        
+        // Update rates (simple EMA with 0.3 alpha)
+        let alpha = 0.3;
+        let now = Instant::now();
+        let elapsed = now.duration_since(client_stat.stats.timestamp).as_secs_f64();
+        
+        if elapsed > 0.0 {
+            let send_rate = bytes_sent as f64 / elapsed;
+            let receive_rate = bytes_received as f64 / elapsed;
+            
+            client_stat.stats.send_rate = (alpha * send_rate) + ((1.0 - alpha) * client_stat.stats.send_rate);
+            client_stat.stats.receive_rate = (alpha * receive_rate) + ((1.0 - alpha) * client_stat.stats.receive_rate);
+            client_stat.stats.timestamp = now;
+        }
+        
+        true
+    }
+
+    /// Record latency measurement for a client
+    pub async fn record_latency(&self, client_id: &str, latency_ms: f64) -> bool {
+        // Update global latency samples
+        {
+            let mut samples = self.latency_samples.lock().await;
+            samples.push_back(latency_ms);
+            while samples.len() > 20 {
+                samples.pop_front();
+            }
+        }
+        
+        // Update client-specific latency
+        {
+            let mut client_stats_map = self.client_stats.lock().await;
+            
+            if let Some(client_stat) = client_stats_map.get_mut(client_id) {
+                client_stat.stats.latency_ms = latency_ms;
+            }
+        }
+        
+        true
+    }
+    
     
     /// Get current stats
     pub async fn get_stats(&self) -> NetworkStats {
@@ -336,6 +401,8 @@ impl NetworkMonitor {
         let client_stats_map = self.client_stats.lock().await;
         client_stats_map.get(client_id).cloned()
     }
+
+                            
     
     /// Get all client stats
     pub async fn get_all_client_stats(&self) -> HashMap<String, ClientStats> {
