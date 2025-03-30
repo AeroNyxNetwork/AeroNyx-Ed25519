@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["hi@aeronyx.network"]
 description = "A private server using Solana keypairs for authentication and encryption"
-repository = "https://github.com/aeronyx/private-ed25519"
+repository = "https://github.com/AeroNyxNetwork/AeroNyx-Ed25519/"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["vpn", "ed25519", "solana", "privacy", "security"]
@@ -62,8 +62,8 @@ parking_lot = "0.12"
 ipnetwork = "0.20"
 
 # Metrics and monitoring
-metrics = "0.20"
-metrics-exporter-prometheus = "0.11"
+metrics = { version = "0.20", optional = true }
+metrics-exporter-prometheus = { version = "0.11", optional = true }
 
 # Unix-specific
 nix = { version = "0.26", features = ["user"] }
@@ -95,7 +95,7 @@ mockall = "0.11"
 [features]
 default = []
 setup = []
-metrics = ["metrics", "metrics-exporter-prometheus"]
+metrics = ["dep:metrics", "metrics-exporter-prometheus"]
 admin-api = []
 advanced-obfuscation = []
 multi-routing = []
