@@ -141,6 +141,12 @@ impl VpnServer {
         let tun_device = setup_tun_device(&config.tun_name, &config.subnet)
             .map_err(|e| ServerError::TunSetup(format!("Failed to create TUN device: {}", e)))?;
         
+        // Create Arc<Mutex<Device>> for TUN
+        let tun_device_arc = Arc::new(Mutex::new(tun_device));
+        
+        // Initialize global references
+        crate::server::globals::init_globals(tun_device_arc.clone());
+        
         // Parse TLS certificates
         let tls_config = Self::setup_tls(&config)?;
         let tls_acceptor = Arc::new(TlsAcceptor::from(tls_config));
