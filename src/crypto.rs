@@ -4,8 +4,7 @@ use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvI
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use chacha20poly1305::aead::{Aead, NewAead};
 use curve25519_dalek::edwards::CompressedEdwardsY;
-use curve25519_dalek::montgomery::MontgomeryPoint;
-use hmac::{Hmac, Mac, digest::MacError};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::{Digest, Sha256, Sha512};
 use solana_sdk::signature::{Keypair, Signature};
@@ -227,10 +226,10 @@ pub fn ed25519_public_to_x25519(ed25519_public: &[u8]) -> Result<[u8; 32]> {
     let edwards_point = compressed.decompress()
         .ok_or_else(|| VpnError::Crypto("Invalid Ed25519 point".into()))?;
     
-    // Convert to Montgomery form (X25519)
-    let montgomery_point: MontgomeryPoint = edwards_point.into();
+    // Convert to Montgomery form using the correct method
+    let montgomery_bytes = edwards_point.to_montgomery().to_bytes();
     
-    Ok(montgomery_point.to_bytes())
+    Ok(montgomery_bytes)
 }
 
 /// Generate a shared secret using X25519 ECDH with converted Ed25519 keys
