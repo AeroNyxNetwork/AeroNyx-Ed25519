@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -8,24 +8,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
-use rand::Rng;
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
-use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time;
-use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
+use tokio_rustls::rustls::{Certificate, PrivateKey};
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, Result as WsResult};
 use tun::platform::Device;
 
 use crate::auth::AuthManager;
 use crate::config;
 use crate::crypto::{self, SecretKeyCache, SessionKeyManager};
-use crate::network::{self, BandwidthTracker, IpPoolManager, TrafficAnalyzer};
+use crate::network::{self, IpPoolManager, TrafficAnalyzer};
 use crate::obfuscation::{ObfuscationMethod, TrafficShaper};
 use crate::types::{Args, Client, PacketType, Result, ServerConfig as ServerConfigType, Session, VpnError};
 use crate::utils;
@@ -73,7 +71,13 @@ impl VpnServer {
         
         // Initialize authentication manager
         let auth_manager = AuthManager::new(Duration::from_secs(60));
-        auth_manager.load_acl(&args.acl_file).await?;
+        let acl_loaded = auth_manager.load_acl(&args.acl_file).await?;
+        
+        if acl_loaded {
+            tracing::info!("Loaded access control list from {}", args.acl_file);
+        } else {
+            tracing::info!("Created new access control list at {}", args.acl_file);
+        }
         
         // Setup TLS
         let tls_config = Self::setup_tls(&args)?;
@@ -85,13 +89,16 @@ impl VpnServer {
         // Create server config
         let config = ServerConfigType {
             tls_acceptor: Arc::new(TlsAcceptor::from(tls_config)),
-            server_keypair: server_keypair.clone(),
-            access_control: auth_manager.load_acl(&args.acl_file).await?,
+            server_keypair,  // Don't clone here - we'll copy it in a moment
+            access_control: acl_loaded,
             args: args.clone(),
         };
         
+        // Helper to copy the keypair
+        let keypair_for_config = Self::copy_keypair(&server_keypair);
+        
         Ok(Self {
-            server_keypair,
+            server_keypair,   // Original keypair
             clients: Arc::new(Mutex::new(HashMap::new())),
             ip_pool: Arc::new(Mutex::new(ip_pool)),
             tun_device: Arc::new(Mutex::new(tun_device)),
@@ -102,12 +109,23 @@ impl VpnServer {
             traffic_analyzer: Arc::new(Mutex::new(TrafficAnalyzer::new())),
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            config,
+            config: ServerConfigType {
+                tls_acceptor: config.tls_acceptor,
+                server_keypair: keypair_for_config, // Use the copy here
+                access_control: config.access_control,
+                args: config.args,
+            },
         })
     }
     
+    /// Helper function to copy a keypair (since Keypair doesn't implement Clone)
+    fn copy_keypair(keypair: &Keypair) -> Keypair {
+        let keypair_bytes = keypair.to_bytes();
+        Keypair::from_bytes(&keypair_bytes).expect("Failed to copy keypair")
+    }
+    
     /// Setup TLS configuration
-    fn setup_tls(args: &Args) -> Result<Arc<ServerConfig>> {
+    fn setup_tls(args: &Args) -> Result<Arc<tokio_rustls::rustls::ServerConfig>> {
         // Read certificate file
         let cert_file = File::open(&args.cert_file)
             .map_err(|e| VpnError::Tls(format!("Failed to open cert file: {}", e)))?;
@@ -132,7 +150,7 @@ impl VpnServer {
             .ok_or_else(|| VpnError::Tls("No private key found".into()))?;
             
         // Create server config
-        let server_config = ServerConfig::builder()
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(cert_chain, key)
@@ -183,7 +201,7 @@ impl VpnServer {
             let clients = self.clients.clone();
             let ip_pool = self.ip_pool.clone();
             let tun_device = self.tun_device.clone();
-            let server_keypair = self.server_keypair.clone();
+            let server_keypair = Self::copy_keypair(&self.server_keypair);
             let auth_manager = self.auth_manager.clone();
             let secret_cache = self.secret_cache.clone();
             let session_manager = self.session_manager.clone();
@@ -256,7 +274,7 @@ impl VpnServer {
                 interval.tick().await;
                 
                 let now = utils::current_timestamp_millis();
-                let mut to_remove = Vec::new();
+                let mut to_remove = Vec::<String>::new();
                 
                 {
                     let mut sessions_lock = sessions.lock().await;
@@ -275,8 +293,8 @@ impl VpnServer {
                 // Remove disconnected clients
                 let mut clients_lock = clients.lock().await;
                 clients_lock.retain(|_, client| {
-                    let last_activity = client.last_activity.try_lock().unwrap().clone();
-                    (Instant::now() - last_activity) < Duration::from_secs(300) // 5 minutes
+                    let last_activity = client.last_activity.lock().await.clone();
+                    last_activity.elapsed() < Duration::from_secs(300) // 5 minutes
                 });
                 
                 tracing::debug!("Cleaned up {} expired sessions", to_remove.len());
@@ -346,9 +364,14 @@ impl VpnServer {
                 match device.read(&mut buffer) {
                     Ok(n) => n,
                     Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+                            // Non-blocking operation would block, sleep a bit and retry
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                            continue;
+                        }
+                        
                         tracing::error!("Error reading from TUN: {}", e);
-                        drop(device); // Release the lock before sleep
-                        time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 }
@@ -534,7 +557,7 @@ impl VpnServer {
                                 // Send IP assignment
                                 let ip_assign = PacketType::IpAssign {
                                     ip_address: assigned_ip.clone(),
-                                    lease_duration: config::IP_LEASE_DURATION.as_secs(),
+                                    lease_duration: config::IP_LEASE_DURATION_SECS,
                                     session_id: session_id.clone(),
                                     encrypted_session_key: encrypted_key,
                                     key_nonce,
@@ -575,7 +598,7 @@ impl VpnServer {
                                     id: session_id.clone(),
                                     client_key: public_key.to_string(),
                                     created_at: now,
-                                    expires_at: now + config::IP_LEASE_DURATION.as_secs() * 1000,
+                                    expires_at: now + config::IP_LEASE_DURATION_SECS * 1000,
                                     ip_address: assigned_ip.clone(),
                                 };
                                 
@@ -667,7 +690,7 @@ impl VpnServer {
         let session_manager_clone = session_manager.clone();
         let client_public_key_str = client_public_key.to_string();
         let client_stream_clone = client.stream.clone();
-        let server_keypair_clone = server_keypair.clone();
+        let server_keypair_clone = Self::copy_keypair(&server_keypair);
         
         let key_rotation_task = tokio::spawn(async move {
             let mut interval = time::interval(config::KEY_ROTATION_INTERVAL);
@@ -850,7 +873,6 @@ impl VpnServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::runtime::Runtime;
     
     // Helper function to create a keypair for testing
     fn create_test_keypair() -> Keypair {
@@ -858,31 +880,18 @@ mod tests {
     }
     
     #[test]
-    fn test_server_creation() {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            let args = Args {
-                listen: "127.0.0.1:8081".to_string(),
-                tun_name: "tun_test".to_string(),
-                subnet: "10.9.0.0/24".to_string(),
-                log_level: "debug".to_string(),
-                cert_file: "server.crt".to_string(),
-                key_file: "server.key".to_string(),
-                acl_file: "access_control.json".to_string(),
-                enable_obfuscation: false,
-                obfuscation_method: "none".to_string(),
-                enable_padding: false,
-                key_rotation_interval: 3600,
-                session_timeout: 86400,
-                max_connections_per_ip: 5,
-            };
-            
-            // This is a partial test since we can't create a TUN device in tests
-            // Just test that the code path works without panicking
-            if Path::new("server.crt").exists() && Path::new("server.key").exists() {
-                let _server = VpnServer::new(args).await;
-                // We don't assert on the result since it depends on TUN device creation
-            }
-        });
+    fn test_copy_keypair() {
+        let original = create_test_keypair();
+        let copy = VpnServer::copy_keypair(&original);
+        
+        // Both keypairs should have the same public key
+        assert_eq!(original.pubkey(), copy.pubkey());
+        
+        // And they should produce the same signatures
+        let message = b"test message";
+        let sig1 = original.sign_message(message);
+        let sig2 = copy.sign_message(message);
+        
+        assert_eq!(sig1, sig2);
     }
 }
