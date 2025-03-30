@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,7 +16,7 @@ use tokio::sync::Mutex;
 use tokio::time;
 use tokio_rustls::rustls::{Certificate, PrivateKey};
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::tungstenite::{Message, Result as WsResult};
+use tokio_tungstenite::tungstenite::Message;
 use tun::platform::Device;
 
 use crate::auth::AuthManager;
@@ -25,7 +24,7 @@ use crate::config;
 use crate::crypto::{self, SecretKeyCache, SessionKeyManager};
 use crate::network::{self, IpPoolManager, TrafficAnalyzer};
 use crate::obfuscation::{ObfuscationMethod, TrafficShaper};
-use crate::types::{Args, Client, PacketType, Result, ServerConfig as ServerConfigType, Session, VpnError};
+use crate::types::{Args, Client, PacketType, Result, ServerConfigVPN as ServerConfigType, Session, VpnError};
 use crate::utils;
 
 /// VPN Server main structure
@@ -86,19 +85,17 @@ impl VpnServer {
         let obfuscation_method = ObfuscationMethod::from_str(&args.obfuscation_method);
         let traffic_shaper = TrafficShaper::new(obfuscation_method);
         
-        // Create server config
+        // Create server config with a copy of the keypair
+        let keypair_for_config = Self::copy_keypair(&server_keypair);
         let config = ServerConfigType {
             tls_acceptor: Arc::new(TlsAcceptor::from(tls_config)),
-            server_keypair,  // Don't clone here - we'll copy it in a moment
+            server_keypair: keypair_for_config,
             access_control: acl_loaded,
             args: args.clone(),
         };
         
-        // Helper to copy the keypair
-        let keypair_for_config = Self::copy_keypair(&server_keypair);
-        
         Ok(Self {
-            server_keypair,   // Original keypair
+            server_keypair,
             clients: Arc::new(Mutex::new(HashMap::new())),
             ip_pool: Arc::new(Mutex::new(ip_pool)),
             tun_device: Arc::new(Mutex::new(tun_device)),
@@ -109,12 +106,7 @@ impl VpnServer {
             traffic_analyzer: Arc::new(Mutex::new(TrafficAnalyzer::new())),
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            config: ServerConfigType {
-                tls_acceptor: config.tls_acceptor,
-                server_keypair: keypair_for_config, // Use the copy here
-                access_control: config.access_control,
-                args: config.args,
-            },
+            config,
         })
     }
     
@@ -290,12 +282,23 @@ impl VpnServer {
                     }
                 }
                 
-                // Remove disconnected clients
+                // Remove disconnected clients - fixed by using async move closure
                 let mut clients_lock = clients.lock().await;
-                clients_lock.retain(|_, client| {
-                    let last_activity = client.last_activity.lock().await.clone();
-                    last_activity.elapsed() < Duration::from_secs(300) // 5 minutes
-                });
+                
+                // Create a vector of addresses to remove
+                let mut addrs_to_remove = Vec::new();
+                
+                for (addr, client) in clients_lock.iter() {
+                    let activity_lock = client.last_activity.lock().await;
+                    if activity_lock.elapsed() > Duration::from_secs(300) { // 5 minutes
+                        addrs_to_remove.push(*addr);
+                    }
+                }
+                
+                // Now remove the clients
+                for addr in addrs_to_remove {
+                    clients_lock.remove(&addr);
+                }
                 
                 tracing::debug!("Cleaned up {} expired sessions", to_remove.len());
             }
@@ -657,7 +660,6 @@ impl VpnServer {
         
         // Create a heartbeat task
         let client_stream_clone = client.stream.clone();
-        let session_id_clone = session_id.clone();
         let packet_counter = client.packet_counter.clone();
         
         let heartbeat_task = tokio::spawn(async move {
@@ -851,7 +853,7 @@ impl VpnServer {
             clients_lock.remove(&addr);
             
             // Return IP address to pool
-            let mut ip_pool_lock = ip_pool.lock().await;
+            let ip_pool_lock = ip_pool.lock().await;
             if let Err(e) = ip_pool_lock.release_ip(&assigned_ip).await {
                 tracing::error!("Error releasing IP {}: {}", assigned_ip, e);
             }
@@ -874,14 +876,9 @@ impl VpnServer {
 mod tests {
     use super::*;
     
-    // Helper function to create a keypair for testing
-    fn create_test_keypair() -> Keypair {
-        Keypair::new()
-    }
-    
     #[test]
     fn test_copy_keypair() {
-        let original = create_test_keypair();
+        let original = Keypair::new();
         let copy = VpnServer::copy_keypair(&original);
         
         // Both keypairs should have the same public key
