@@ -86,6 +86,7 @@ impl VpnServer {
         let traffic_shaper = TrafficShaper::new(obfuscation_method);
         
         // Create server config with a copy of the keypair
+        // Fix: Create a clone before the move occurs (Create KeyPair Copy)
         let keypair_for_config = Self::copy_keypair(&server_keypair);
         let config = ServerConfigType {
             tls_acceptor: Arc::new(TlsAcceptor::from(tls_config)),
@@ -193,6 +194,7 @@ impl VpnServer {
             let clients = self.clients.clone();
             let ip_pool = self.ip_pool.clone();
             let tun_device = self.tun_device.clone();
+            // Fix: Make a copy of the server keypair instead of moving it
             let server_keypair = Self::copy_keypair(&self.server_keypair);
             let auth_manager = self.auth_manager.clone();
             let secret_cache = self.secret_cache.clone();
@@ -282,7 +284,7 @@ impl VpnServer {
                     }
                 }
                 
-                // Remove disconnected clients - fixed by using async move closure
+                // Fix: Remove disconnected clients without using async in a closure
                 let mut clients_lock = clients.lock().await;
                 
                 // Create a vector of addresses to remove
@@ -292,9 +294,9 @@ impl VpnServer {
                     if let Ok(activity_lock) = client.last_activity.try_lock() {
                         if activity_lock.elapsed() > Duration::from_secs(300) { // 5 minutes
                             addrs_to_remove.push(*addr);
-                }
-                    }
                         }
+                    }
+                }
                 
                 // Now remove the clients
                 for addr in addrs_to_remove {
@@ -471,7 +473,8 @@ impl VpnServer {
                     .map_err(|e| VpnError::AuthenticationFailed(format!("Invalid auth message: {}", e)))?;
                 
                 // Handle authentication
-                if let PacketType::Auth { public_key, version, features, nonce } = auth_message {
+                // Fix: Use underscore to ignore unused nonce variable
+                if let PacketType::Auth { public_key, version, features, nonce: _ } = auth_message {
                     // Parse the client's public key
                     let public_key = Pubkey::from_str(&public_key)
                         .map_err(|e| VpnError::AuthenticationFailed(format!("Invalid public key: {}", e)))?;
