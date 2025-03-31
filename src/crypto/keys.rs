@@ -9,6 +9,9 @@ use hkdf::Hkdf;
 // Removed unused OsRng
 use sha2::{Digest, Sha256, Sha512};
 use solana_sdk::pubkey::Pubkey;
+// Import SecretKey and Keypair from ed25519_dalek
+use ed25519_dalek::{SecretKey, PublicKey, Keypair as DalekKeypair};
+// Import Solana SDK types
 use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
 use std::collections::HashMap;
@@ -19,8 +22,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Mutex;
-// Removed unused debug, error, warn imports
-use tracing::info;
+// Import warn from tracing
+use tracing::{info, warn};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey};
 
 /// Error type for key-related operations
@@ -224,18 +227,25 @@ impl KeyManager {
             Keypair::from_bytes(&bytes)
                 .map_err(|e| KeyError::Format(format!("Invalid keypair bytes (direct): {}", e)))
         } else if bytes.len() == 32 {
-            // Assume it's just a secret key (less secure, but maybe supported?)
-            // Reconstruct the full keypair (public key derivation is deterministic)
-             warn!("Loading keypair from 32-byte secret key file. Public key will be derived.");
-             let secret_key = solana_sdk::signature::SecretKey::from_bytes(&bytes)
+            // Assume it's just a secret key
+            warn!("Loading keypair from 32-byte secret key file. Public key will be derived.");
+            // Use ed25519_dalek::SecretKey::from_bytes
+            let secret = SecretKey::from_bytes(&bytes)
                  .map_err(|e| KeyError::Format(format!("Invalid 32-byte secret key: {}", e)))?;
-            Ok(Keypair::from_secret_key(secret_key))
+            // Derive public key using ed25519_dalek::PublicKey::from
+            let public: PublicKey = (&secret).into();
+            // Construct the ed25519_dalek Keypair
+            let dalek_keypair = DalekKeypair { secret, public };
+            // Convert to Solana Keypair using from_bytes with the full 64 bytes
+            Keypair::from_bytes(&dalek_keypair.to_bytes())
+                .map_err(|e| KeyError::Format(format!("Failed to construct Solana keypair from derived bytes: {}", e)))
         } else {
             Err(KeyError::Format(format!(
                 "Invalid keypair file size: {} bytes (expected 64, or 32 for secret only)", bytes.len()
             )))
         }
     }
+
 
     /// Save a keypair to file (as raw bytes)
     fn save_keypair(keypair: &Keypair, path: &Path) -> Result<(), KeyError> {
@@ -266,6 +276,10 @@ impl KeyManager {
                   drop(file);
             }
         }
+        // If not unix, ensure file is dropped if permissions aren't set
+        #[cfg(not(unix))]
+        drop(file);
+
 
         Ok(())
     }
@@ -364,7 +378,6 @@ fn ed25519_public_to_x25519(ed25519_public: &[u8]) -> Result<[u8; 32], KeyError>
         return Err(KeyError::InvalidData("Invalid Ed25519 public key length".into()));
     }
 
-    // E0599 Fix: Check the result of decompress() which returns Option
     let compressed = CompressedEdwardsY::from_slice(ed25519_public);
     let edwards_point = compressed.decompress()
         .ok_or_else(|| KeyError::InvalidData("Invalid Ed25519 point".into()))?; // Check Option here
