@@ -129,7 +129,7 @@ impl PacketRouter {
         // Send to client
         session.send_packet(&data_packet)
             .await
-            .map_err(|e| RoutingError::WebSocket(e))?;
+            .map_err(|e| RoutingError::Protocol(MessageError::InvalidFormat(e.to_string())))?;
         
         Ok(())
     }
