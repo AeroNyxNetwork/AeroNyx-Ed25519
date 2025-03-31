@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-// Removed unused info
-use tracing::{debug, warn};
+// Removed unused warn, info imports
+use tracing::debug;
 
 use crate::config::constants::SESSION_KEY_SIZE;
 use crate::utils;
