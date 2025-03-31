@@ -5,6 +5,7 @@
 //! the logging system.
 
 use std::io;
+use std::fs::File;
 use std::path::Path;
 use tracing_subscriber::{fmt, EnvFilter, prelude::*};
 use tracing_appender::rolling;
@@ -31,16 +32,23 @@ pub fn init_logging(log_level: &str) -> io::Result<()> {
 pub fn init_file_logging(log_level: &str, log_file: &str) -> io::Result<()> {
     let filter = EnvFilter::new(log_level);
     
-    // Create a file appender that rolls daily
+    // Use built-in rolling file appender
     let file_appender = rolling::daily(
         Path::new(log_file).parent().unwrap_or(Path::new(".")),
         Path::new(log_file).file_name().unwrap_or_default(),
     );
     
-    fmt()
+    // Initialize the subscriber with the file appender
+    let subscriber = fmt()
         .with_env_filter(filter)
         .with_writer(file_appender)
-        .init();
+        .finish();
+        
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|_| io::Error::new(
+            io::ErrorKind::Other, 
+            "Failed to set global default subscriber"
+        ))?;
     
     Ok(())
 }
