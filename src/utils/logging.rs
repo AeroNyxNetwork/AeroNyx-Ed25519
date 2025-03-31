@@ -29,28 +29,19 @@ pub fn init_logging(log_level: &str) -> io::Result<()> {
 
 /// Sets up file-based logging in addition to console output
 pub fn init_file_logging(log_level: &str, log_file: &str) -> io::Result<()> {
-    let filter = match EnvFilter::try_from_default_env() {
-        Ok(filter) => filter,
-        Err(_) => EnvFilter::new(log_level),
-    };
+    let filter = EnvFilter::new(log_level);
     
-    // Create file appender
-    let file_appender = rolling::daily(
-        Path::new(log_file).parent().unwrap_or_else(|| Path::new(".")),
-        Path::new(log_file).file_name().unwrap_or_default(),
-    );
+    // Simple file-based writer
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)?;
+        
+    let file_writer = std::sync::Mutex::new(file);
     
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    
-    // Save the guard in a static location so it's not dropped
-    // This is necessary to keep the file appender working
-    std::mem::forget(_guard);
-    
-    // Create a registry with both console and file logging
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::Layer::new().with_writer(io::stdout))
-        .with(fmt::Layer::new().with_writer(non_blocking))
+    fmt()
+        .with_env_filter(filter)
+        .with_writer(move || std::io::BufWriter::new(file_writer.lock().unwrap()))
         .init();
     
     Ok(())
