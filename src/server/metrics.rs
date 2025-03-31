@@ -372,7 +372,7 @@ async fn get_cpu_usage() -> f64 {
                 // and calculate difference over time
                 return 25.0; // Placeholder value
             }
-            Err(_) => 0.0,
+            Err(_) => return 0.0,
         }
     }
     
