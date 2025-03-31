@@ -13,10 +13,10 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tokio::net::TcpStream;
-// Import the error macro correctly
-use tracing::{debug, error, info, trace, warn};
-// Removed unused Message, WsError imports
-use tokio_tungstenite::tungstenite::{Message};
+// Removed 'error' import
+use tracing::{debug, info, trace, warn};
+// Removed specific 'Message' import if not needed, or ensure it doesn't conflict
+use tokio_tungstenite::tungstenite; // Corrected line 19 (Removed ::{Message})
 
 use crate::auth::AuthManager;
 use crate::crypto::{KeyManager, SessionKeyManager};
@@ -534,8 +534,8 @@ async fn process_client_session(
              }
              Some(Err(e)) => { // WebSocket error
                  debug!("WebSocket error for client {}: {}", client_id, e);
-                 // Correctly handle the error assignment and break
-                 process_result = Err(ServerError::WebSocket(e));
+                 // Assign the original tungstenite::Error directly
+                 process_result = Err(e.into()); // Corrected line 538 (using .into() based on ServerError definition)
                  break;
              }
              None => { // WebSocket stream closed
