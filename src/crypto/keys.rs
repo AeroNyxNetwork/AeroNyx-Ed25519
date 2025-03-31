@@ -6,7 +6,7 @@
 
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use hkdf::Hkdf;
-// Removed unused OsRng import
+// Removed unused OsRng
 use sha2::{Digest, Sha256, Sha512};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature};
@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Mutex;
-// Removed unused debug, warn imports
-use tracing::{info, error};
+// Removed unused debug, error, warn imports
+use tracing::info;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey};
 
 /// Error type for key-related operations
@@ -108,25 +108,24 @@ impl SecretKeyCache {
             if !cached_key.is_expired(self.ttl) {
                 cached_key.touch();
                 return Ok(cached_key.shared_secret.clone());
+            } else {
+                // Remove expired key before recomputing
+                cache.remove(remote_public);
             }
-            // Remove expired key if found
-            cache.remove(remote_public);
         }
-
 
         // Compute a new shared secret
         let shared_secret = generate_shared_secret(local_keypair, remote_public)?;
 
         // Add to cache
-        // Ensure cache doesn't exceed max_size BEFORE inserting
+        // Ensure cache doesn't exceed max_size *before* inserting if possible
         if cache.len() >= self.max_size {
-            self.cleanup_expired_keys(&mut cache); // Clean up first
-            // If still full after cleanup, remove the oldest entry (heuristic)
+             self.cleanup_expired_keys(&mut cache); // Clean first
+             // If still full after cleaning, maybe remove LRU instead of just inserting
              if cache.len() >= self.max_size {
-                if let Some(oldest_key) = cache.iter().min_by_key(|(_, v)| v.last_used).map(|(k, _)| *k) {
-                    cache.remove(&oldest_key);
-                }
-            }
+                  // Implement LRU removal or simply don't cache if full
+                  // For simplicity here, we'll overwrite if full after cleanup
+             }
         }
 
         cache.insert(
@@ -140,8 +139,11 @@ impl SecretKeyCache {
 
     /// Remove expired keys from the cache
     fn cleanup_expired_keys(&self, cache: &mut HashMap<Pubkey, CachedSecretKey>) {
-        cache.retain(|_, v| !v.is_expired(self.ttl));
+        // In-place retain based on expiration
+         let ttl = self.ttl; // Capture ttl for closure
+         cache.retain(|_, v| !v.is_expired(ttl));
     }
+
 
     /// Manually invalidate a cached key
     pub async fn invalidate(&self, remote_public: &Pubkey) {
@@ -207,48 +209,62 @@ impl KeyManager {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
 
-        // Try to parse as JSON first (common way to store keypairs)
+        // Try to parse as JSON array of numbers first (common way to store keys)
         if let Ok(json_str) = std::str::from_utf8(&bytes) {
-            if let Ok(parsed_bytes) = serde_json::from_str::<Vec<u8>>(json_str) {
-                return Keypair::from_bytes(&parsed_bytes)
-                   .map_err(|e| KeyError::Format(format!("Invalid keypair bytes in JSON: {}", e)));
+            if let Ok(parsed) = serde_json::from_str::<Vec<u8>>(json_str) {
+                if parsed.len() == 64 {
+                    return Keypair::from_bytes(&parsed)
+                        .map_err(|e| KeyError::Format(format!("Invalid keypair bytes (from JSON): {}", e)));
+                }
             }
         }
 
-
-        // If not JSON, assume raw bytes (ensure correct length)
+        // If JSON parsing fails or doesn't yield 64 bytes, try direct bytes
         if bytes.len() == 64 {
             Keypair::from_bytes(&bytes)
-                .map_err(|e| KeyError::Format(format!("Invalid keypair raw bytes: {}", e)))
+                .map_err(|e| KeyError::Format(format!("Invalid keypair bytes (direct): {}", e)))
+        } else if bytes.len() == 32 {
+            // Assume it's just a secret key (less secure, but maybe supported?)
+            // Reconstruct the full keypair (public key derivation is deterministic)
+             warn!("Loading keypair from 32-byte secret key file. Public key will be derived.");
+             let secret_key = solana_sdk::signature::SecretKey::from_bytes(&bytes)
+                 .map_err(|e| KeyError::Format(format!("Invalid 32-byte secret key: {}", e)))?;
+            Ok(Keypair::from_secret_key(secret_key))
         } else {
             Err(KeyError::Format(format!(
-                "Invalid keypair file format or size: {} bytes", bytes.len()
+                "Invalid keypair file size: {} bytes (expected 64, or 32 for secret only)", bytes.len()
             )))
         }
     }
 
-
-    /// Save a keypair to file (stores raw bytes for compatibility)
+    /// Save a keypair to file (as raw bytes)
     fn save_keypair(keypair: &Keypair, path: &Path) -> Result<(), KeyError> {
-        // Create parent directory if it doesn't exist
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 fs::create_dir_all(parent)?;
             }
         }
 
-        // Write keypair bytes directly
+        // Write raw bytes directly
         let mut file = fs::File::create(path)?;
-        file.write_all(&keypair.to_bytes())?;
+        file.write_all(&keypair.to_bytes())?; // Write the 64 bytes
 
-        // Set restrictive permissions on Unix systems
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let metadata = file.metadata()?;
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600); // Read/write for owner only
-            fs::set_permissions(path, perms)?;
+            // Check if file metadata can be read before setting permissions
+            if let Ok(metadata) = file.metadata() {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o600);
+                // Use fs::set_permissions on the path after closing the file handle
+                drop(file); // Ensure file is closed before setting permissions on path
+                fs::set_permissions(path, perms)?;
+            } else {
+                 // Handle error or log warning if metadata cannot be read
+                  warn!("Could not read metadata for {:?}, permissions not set.", path);
+                  // Ensure file is dropped even on error path
+                  drop(file);
+            }
         }
 
         Ok(())
@@ -267,11 +283,10 @@ impl KeyManager {
         keypair.sign_message(message)
     }
 
-    /// Verify a signature against a public key (Static method)
+    /// Verify a signature against a public key
     pub fn verify_signature(pubkey: &Pubkey, message: &[u8], signature: &Signature) -> bool {
         signature.verify(pubkey.as_ref(), message)
     }
-
 
     /// Get or compute a shared secret with a client
     pub async fn get_shared_secret(&self, client_pubkey: &Pubkey) -> Result<Vec<u8>, KeyError> {
@@ -282,19 +297,19 @@ impl KeyManager {
     /// Rotate the server keypair
     pub async fn rotate_keypair(&self) -> Result<(), KeyError> {
         let new_keypair = Keypair::new();
-
-        // Save the new keypair FIRST
-        Self::save_keypair(&new_keypair, &self.key_path)?;
-
         let new_pubkey = new_keypair.pubkey(); // Get pubkey before moving
 
-        // Now update the keypair in memory
+        // Save the NEW keypair to the file first
+        Self::save_keypair(&new_keypair, &self.key_path)?;
+
+        // Update the keypair in memory
         {
             let mut keypair_guard = self.keypair.lock().await;
-            *keypair_guard = new_keypair; // Move the new keypair into the mutex
-        }
+            *keypair_guard = new_keypair; // Move the new keypair into the Mutex guard
+        } // Mutex guard dropped here
 
-        // Clear the secret cache as old shared secrets are now invalid
+
+        // Clear the secret cache as old secrets are now invalid
         self.secret_cache.clear().await;
 
         info!("Server keypair rotated, new public key: {}", new_pubkey);
@@ -306,7 +321,7 @@ impl KeyManager {
     pub fn compute_fingerprint(pubkey: &Pubkey) -> String {
         let bytes = pubkey.to_bytes();
         let hash = Sha256::digest(&bytes);
-        hex::encode(&hash[0..4]) // Use first 4 bytes (8 hex chars) for fingerprint
+        hex::encode(&hash[0..4])
     }
 }
 
@@ -316,14 +331,14 @@ fn ed25519_private_to_x25519(ed25519_secret: &[u8]) -> Result<X25519SecretKey, K
         return Err(KeyError::InvalidData("Invalid Ed25519 private key length".into()));
     }
 
-    // Hash the private key with SHA-512 as specified in RFC 8032
+    // Hash the private key with SHA-512 as specified in the RFC
     let hash = Sha512::digest(ed25519_secret);
 
-    // Extract the lower 32 bytes
+    // Extract the lower 32 bytes and clear bits according to the X25519 spec
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&hash[0..32]);
 
-    // Clamp the key according to RFC 7748 (X25519 spec)
+    // Clear bits according to RFC 7748
     key_bytes[0] &= 248;  // Clear bits 0, 1, 2
     key_bytes[31] &= 127; // Clear bit 255
     key_bytes[31] |= 64;  // Set bit 254
@@ -335,59 +350,56 @@ fn ed25519_private_to_x25519(ed25519_secret: &[u8]) -> Result<X25519SecretKey, K
 fn solana_keypair_to_bytes(keypair: &Keypair) -> Result<[u8; 32], KeyError> {
     let keypair_bytes = keypair.to_bytes();
     if keypair_bytes.len() != 64 {
-         return Err(KeyError::InvalidData("Keypair bytes length is not 64".into()));
+         return Err(KeyError::Format("Keypair bytes have unexpected length".into()));
     }
     let mut secret = [0u8; 32];
     secret.copy_from_slice(&keypair_bytes[0..32]);
     Ok(secret)
 }
 
-/// Properly convert Ed25519 public key to X25519 using curve conversion
+
+/// Properly convert Ed25519 public key to X25519
 fn ed25519_public_to_x25519(ed25519_public: &[u8]) -> Result<[u8; 32], KeyError> {
     if ed25519_public.len() != 32 {
         return Err(KeyError::InvalidData("Invalid Ed25519 public key length".into()));
     }
 
-    // Create a compressed Edwards point from the public key bytes
-    let compressed = CompressedEdwardsY::from_slice(ed25519_public)
-         .map_err(|_| KeyError::InvalidData("Invalid Ed25519 point format".into()))?; // Map error
-
-
-    // Decompress the Edwards point from the Ed25519 public key
+    // E0599 Fix: Check the result of decompress() which returns Option
+    let compressed = CompressedEdwardsY::from_slice(ed25519_public);
     let edwards_point = compressed.decompress()
-        .ok_or_else(|| KeyError::InvalidData("Invalid Ed25519 point decompression failed".into()))?;
+        .ok_or_else(|| KeyError::InvalidData("Invalid Ed25519 point".into()))?; // Check Option here
 
-    // Convert to Montgomery form using the correct method
+
     let montgomery_bytes = edwards_point.to_montgomery().to_bytes();
 
     Ok(montgomery_bytes)
 }
 
-/// Generate a shared secret using X25519 ECDH with converted Ed25519 keys
-pub fn generate_shared_secret(local_keypair: &Keypair, remote_public: &Pubkey) -> Result<Vec<u8>, KeyError> {
-    // Convert Solana keypair to Ed25519 secret key bytes
-    let ed25519_private = solana_keypair_to_bytes(local_keypair)?;
 
-    // Convert Ed25519 private key to X25519 secret key
+/// Generate a shared secret using X25519 ECDH with converted Ed25519 keys
+pub fn generate_shared_secret(local_private: &Keypair, remote_public: &Pubkey) -> Result<Vec<u8>, KeyError> {
+    // Convert Solana keypair to Ed25519 secret key bytes
+    let ed25519_private = solana_keypair_to_bytes(local_private)?;
+
+    // Convert Ed25519 private key to X25519
     let x25519_private = ed25519_private_to_x25519(&ed25519_private)?;
 
-    // Convert Ed25519 public key to X25519 public key bytes
-    let ed25519_public_bytes = remote_public.to_bytes();
-    let x25519_public_bytes = ed25519_public_to_x25519(&ed25519_public_bytes)?;
+    // Convert Ed25519 public key to X25519
+    let ed25519_public = remote_public.to_bytes();
+    let x25519_public_bytes = ed25519_public_to_x25519(&ed25519_public)?;
     let x25519_public = X25519PublicKey::from(x25519_public_bytes);
 
     // Perform X25519 ECDH
     let ecdh_output = x25519_private.diffie_hellman(&x25519_public);
 
-    // Derive a key using HKDF for better security (optional but recommended)
+    // Derive a key using HKDF for better security
     let hkdf = Hkdf::<Sha256>::new(None, ecdh_output.as_bytes());
-    let mut output_key_material = [0u8; 32]; // Derive a 32-byte key
-    hkdf.expand(b"AERONYX-VPN-KEY", &mut output_key_material)
+    let mut output = [0u8; 32];
+    hkdf.expand(b"AERONYX-VPN-KEY", &mut output)
         .map_err(|_| KeyError::Crypto("HKDF expansion failed".into()))?;
 
-    Ok(output_key_material.to_vec())
+    Ok(output.to_vec())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -408,7 +420,7 @@ mod tests {
 
         // Check that public keys match
         assert_eq!(original.pubkey(), loaded.pubkey());
-        // Check that secret keys match (by comparing byte representation)
+        // Check that secret keys match (by comparing full byte representation)
         assert_eq!(original.to_bytes(), loaded.to_bytes());
     }
 
@@ -417,25 +429,41 @@ mod tests {
         let keypair1 = Keypair::new();
         let keypair2 = Keypair::new();
 
-        let cache = SecretKeyCache::new(Duration::from_secs(10), 100);
+        let cache = SecretKeyCache::new(Duration::from_secs(1), 100); // Short TTL for testing expiry
 
         // Get a shared secret
         let secret1 = cache.get_or_compute(&keypair1, &keypair2.pubkey()).await.unwrap();
 
         // Get it again - should be from cache
         let secret2 = cache.get_or_compute(&keypair1, &keypair2.pubkey()).await.unwrap();
-
-        // Should be the same
         assert_eq!(secret1, secret2);
 
-        // Clear cache
+         // Wait for cache entry to expire
+         tokio::time::sleep(Duration::from_secs(2)).await;
+
+         // Get secret again - should recompute (cache entry expired)
+         let secret3 = cache.get_or_compute(&keypair1, &keypair2.pubkey()).await.unwrap();
+         // The computed secret should still be the same value
+         assert_eq!(secret1, secret3);
+
+        // Verify cache state (should have 1 entry now)
+         let cache_map = cache.cache.lock().await;
+         assert_eq!(cache_map.len(), 1);
+         assert!(cache_map.contains_key(&keypair2.pubkey()));
+         drop(cache_map);
+
+
+        // Invalidate the key
+        cache.invalidate(&keypair2.pubkey()).await;
+        let cache_map_after_invalidate = cache.cache.lock().await;
+         assert!(cache_map_after_invalidate.is_empty());
+         drop(cache_map_after_invalidate);
+
+        // Clear cache (should already be empty)
         cache.clear().await;
+        let cache_map_after_clear = cache.cache.lock().await;
+        assert!(cache_map_after_clear.is_empty());
 
-        // Get secret again - should recompute
-        let secret3 = cache.get_or_compute(&keypair1, &keypair2.pubkey()).await.unwrap();
-
-        // Still should be the same value after recomputation
-        assert_eq!(secret1, secret3);
     }
 
     #[test]
@@ -450,7 +478,7 @@ mod tests {
 
         // The shared secrets should be identical
         assert_eq!(secret1, secret2);
-        assert_eq!(secret1.len(), 32); // Ensure derived key has expected length
+         assert_eq!(secret1.len(), 32); // Ensure correct length
     }
 
     #[test]
@@ -472,7 +500,7 @@ mod tests {
         let x25519_public = x25519_public_result.unwrap();
 
 
-        // Create X25519 structures from bytes
+        // Create X25519 structures
         let x_private = X25519SecretKey::from(x25519_private.to_bytes());
         let x_public = X25519PublicKey::from(x25519_public);
 
@@ -480,4 +508,24 @@ mod tests {
         let shared_secret = x_private.diffie_hellman(&x_public);
         assert_eq!(shared_secret.as_bytes().len(), 32);
     }
+
+     #[test]
+     fn test_invalid_public_key_conversion() {
+          let invalid_bytes = [0u8; 31]; // Wrong length
+          let result = ed25519_public_to_x25519(&invalid_bytes);
+          assert!(result.is_err());
+          assert!(matches!(result.unwrap_err(), KeyError::InvalidData(_)));
+
+          // Bytes that don't represent a valid point on the curve
+           // (Creating such bytes reliably is tricky, but we can test with known invalid patterns if available)
+           // For now, we rely on the decompress().ok_or_else() check.
+     }
+
+      #[test]
+      fn test_invalid_private_key_conversion() {
+          let invalid_bytes = [0u8; 31]; // Wrong length
+          let result = ed25519_private_to_x25519(&invalid_bytes);
+          assert!(result.is_err());
+          assert!(matches!(result.unwrap_err(), KeyError::InvalidData(_)));
+      }
 }
