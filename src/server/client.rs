@@ -15,8 +15,8 @@ use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tokio::net::TcpStream;
 // Removed 'error' import
 use tracing::{debug, info, trace, warn};
-// Removed specific 'Message' import if not needed, or ensure it doesn't conflict
-use tokio_tungstenite::tungstenite; // Corrected line 19 (Removed ::{Message})
+// Removed unused module import
+// use tokio_tungstenite::tungstenite; // Corrected line 19 (Removed entire import)
 
 use crate::auth::AuthManager;
 use crate::crypto::{KeyManager, SessionKeyManager};
@@ -420,7 +420,8 @@ async fn process_client_session(
 
 
     let mut last_counter: Option<u64> = None;
-    let mut process_result: Result<(), ServerError> = Ok(());
+    // Remove unused process_result initialization // Corrected line 423
+    // let mut process_result: Result<(), ServerError> = Ok(());
 
     // Main message processing loop
      loop {
@@ -429,8 +430,9 @@ async fn process_client_session(
          if current_state != ServerState::Running {
              let disconnect = create_disconnect_packet(2, "Server shutting down");
              let _ = session.send_packet(&disconnect).await; // Attempt to notify client
-             process_result = Err(ServerError::Internal("Server shutting down".to_string()));
-             break;
+             // Directly return error
+             return Err(ServerError::Internal("Server shutting down".to_string()));
+             // break; // No longer needed
          }
 
          match session.next_message().await {
@@ -473,8 +475,9 @@ async fn process_client_session(
                                  };
                                  if session.send_packet(&pong).await.is_err() {
                                      warn!("Failed to send pong to {}: channel closed", client_id);
-                                     process_result = Err(ServerError::Network("Pong send failed".to_string()));
-                                     break;
+                                     // Directly return error
+                                     return Err(ServerError::Network("Pong send failed".to_string()));
+                                     // break; // No longer needed
                                  }
                              }
                              PacketType::Pong { echo_timestamp, server_timestamp: _, sequence: _ } => {
@@ -509,15 +512,16 @@ async fn process_client_session(
                                   };
                                   if session.send_packet(&response).await.is_err() {
                                       warn!("Failed to send failed IP renewal response to {}: channel closed", client_id);
-                                      process_result = Err(ServerError::Network("Failed IP renewal response send failed".to_string()));
-                                      break;
+                                      // Directly return error
+                                      return Err(ServerError::Network("Failed IP renewal response send failed".to_string()));
+                                      // break; // No longer needed
                                   }
 
                              }
                              PacketType::Disconnect { reason, message } => {
                                  info!("Client {} disconnecting: {} (reason {})", client_id, message, reason);
-                                 process_result = Ok(()); // Graceful disconnect
-                                 break;
+                                 // process_result = Ok(()); // Graceful disconnect // No longer needed
+                                 break; // Break loop for graceful disconnect
                              }
                              _ => {
                                  warn!("Received unexpected packet type from {} during session", client_id);
@@ -534,14 +538,14 @@ async fn process_client_session(
              }
              Some(Err(e)) => { // WebSocket error
                  debug!("WebSocket error for client {}: {}", client_id, e);
-                 // Assign the original tungstenite::Error directly
-                 process_result = Err(e.into()); // Corrected line 538 (using .into() based on ServerError definition)
-                 break;
+                 // Correctly handle the error assignment and break
+                 return Err(ServerError::WebSocket(e)); // Directly return error
+                 // break; // No longer needed
              }
              None => { // WebSocket stream closed
                  debug!("WebSocket connection closed for client {}", client_id);
-                 process_result = Ok(()); // Normal closure
-                 break;
+                 // process_result = Ok(()); // Normal closure // No longer needed
+                 break; // Break loop for normal closure
              }
          }
      }
@@ -552,5 +556,6 @@ async fn process_client_session(
     key_rotation_handle.abort();
     session.mark_stream_taken().await; // Mark session as closing
 
-    process_result
+    Ok(()) // Return Ok(()) if loop finishes normally (e.g., disconnect packet or stream close)
+    // process_result // No longer needed
 }
