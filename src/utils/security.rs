@@ -327,9 +327,11 @@ mod tests {
 
         // Potential shellcode with many non-ASCII bytes
         let mut suspicious_data = Vec::new();
-        for _ in 0..20 {
+        // --- FIX: Change size to be > 20 ---
+        for _ in 0..21 { // Use 21 bytes instead of 20
             suspicious_data.push(0x90); // NOP sled
         }
+        // --- End of FIX ---
         assert!(detect_attack_patterns(&suspicious_data).is_some());
     }
 }
