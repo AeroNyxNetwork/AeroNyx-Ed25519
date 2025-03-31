@@ -139,17 +139,18 @@ mod tests {
          let log_file = temp_dir.path().join("test_app.log");
 
          // Initialize file logging and keep the guard
-         let _guard = init_file_logging("trace", log_file.to_str().unwrap()).expect("Failed to init file logging");
+         let guard = init_file_logging("trace", log_file.to_str().unwrap()).expect("Failed to init file logging");
 
          // Log some messages
          tracing::info!(test_id = 1, "Info message to file");
          tracing::warn!(test_id = 2, "Warning message to file");
          tracing::error!(test_id = 3, "Error message to file");
 
-         // Drop the guard explicitly to ensure flush (or let it drop at end of scope)
-         // drop(_guard); // This happens automatically at end of scope
+         // --- FIX: Drop the guard explicitly to ensure flush ---
+         drop(guard);
+         // --- End of FIX ---
 
-         // Give a small amount of time for logs to potentially flush
+         // Give a small amount of time for logs to potentially flush (might still be needed depending on OS/FS)
          tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Use tokio sleep
 
          // Check log file content
