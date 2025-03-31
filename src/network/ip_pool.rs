@@ -79,91 +79,71 @@ impl IpPoolManager {
         })
     }
     
+    /// Check if a client already has an allocation
+    async fn get_existing_allocation(&self, client_id: &str) -> Option<String> {
+        let allocated = self.allocated_ips.lock().await;
+        for (ip, allocation) in allocated.iter() {
+            if allocation.client_id == client_id {
+                return Some(ip.clone());
+            }
+        }
+        None
+    }
+    
+    /// Create a new allocation with specified lease duration
+    async fn create_allocation(&self, client_id: &str, lease_duration_secs: u64) -> Result<String, IpPoolError> {
+        // Allocate from the dynamic pool
+        let mut available = self.available_ips.lock().await;
+        let ip = available.pop_front().ok_or(IpPoolError::PoolExhausted)?;
+        
+        let now = utils::current_timestamp_millis();
+        let expires_at = now + (lease_duration_secs * 1000);
+        
+        let allocation = IpAllocation {
+            ip_address: ip.clone(),
+            client_id: client_id.to_string(),
+            expires_at,
+            is_static: false,
+        };
+        
+        let mut allocated = self.allocated_ips.lock().await;
+        allocated.insert(ip.clone(), allocation);
+        
+        debug!("Allocated IP {} to client {} with lease {}s", ip, client_id, lease_duration_secs);
+        Ok(ip)
+    }
+    
     /// Allocate an IP address
     pub async fn allocate_ip(&self, client_id: &str) -> Result<String, IpPoolError> {
         // First check if this client already has an allocation
-        {
-            let allocated = self.allocated_ips.lock().await;
-            for (ip, allocation) in allocated.iter() {
-                if allocation.client_id == client_id {
-                    return Ok(ip.clone());
-                }
-            }
+        if let Some(ip) = self.get_existing_allocation(client_id).await {
+            return Ok(ip);
         }
         
-        // Check if there's a static allocation for this client
-        // This would need to be implemented based on your static allocation storage method
-        
-        // Allocate from the dynamic pool
-        let mut available = self.available_ips.lock().await;
-        if let Some(ip) = available.pop_front() {
-            let now = utils::current_timestamp_millis();
-            let expires_at = now + (self.default_lease_duration * 1000);
-            
-            let allocation = IpAllocation {
-                ip_address: ip.clone(),
-                client_id: client_id.to_string(),
-                expires_at,
-                is_static: false,
-            };
-            
-            let mut allocated = self.allocated_ips.lock().await;
-            allocated.insert(ip.clone(), allocation);
-            
-            debug!("Allocated IP {} to client {}", ip, client_id);
-            Ok(ip)
-        } else {
-            warn!("IP pool exhausted, cannot allocate IP for client {}", client_id);
-            Err(IpPoolError::PoolExhausted)
-        }
+        // Create a new allocation with the default lease duration
+        self.create_allocation(client_id, self.default_lease_duration).await
     }
     
     /// Allocate an IP address with a specific lease duration
     pub async fn allocate_ip_with_lease(&self, client_id: &str, lease_duration_secs: u64) -> Result<String, IpPoolError> {
         // First check if this client already has an allocation
-        {
-            let allocated = self.allocated_ips.lock().await;
-            for (ip, allocation) in allocated.iter() {
-                if allocation.client_id == client_id {
-                    return Ok(ip.clone());
-                }
-            }
+        if let Some(ip) = self.get_existing_allocation(client_id).await {
+            return Ok(ip);
         }
         
-        // Allocate from the dynamic pool
-        let mut available = self.available_ips.lock().await;
-        if let Some(ip) = available.pop_front() {
-            let now = utils::current_timestamp_millis();
-            let expires_at = now + (lease_duration_secs * 1000);
-            
-            let allocation = IpAllocation {
-                ip_address: ip.clone(),
-                client_id: client_id.to_string(),
-                expires_at,
-                is_static: false,
-            };
-            
-            let mut allocated = self.allocated_ips.lock().await;
-            allocated.insert(ip.clone(), allocation);
-            
-            debug!("Allocated IP {} to client {} with lease {}s", ip, client_id, lease_duration_secs);
-            Ok(ip)
-        } else {
-            warn!("IP pool exhausted, cannot allocate IP for client {}", client_id);
-            Err(IpPoolError::PoolExhausted)
-        }
+        // Create a new allocation with the specified lease duration
+        self.create_allocation(client_id, lease_duration_secs).await
     }
-
     
     /// Get the default lease duration
     pub fn get_default_lease_duration(&self) -> Duration {
         Duration::from_secs(self.default_lease_duration)
     }
-
     
     /// Release an IP address
     pub async fn release_ip(&self, ip: &str) -> Result<(), IpPoolError> {
         let mut allocated = self.allocated_ips.lock().await;
+        
         if let Some(allocation) = allocated.remove(ip) {
             if !allocation.is_static {
                 let mut available = self.available_ips.lock().await;
@@ -171,22 +151,6 @@ impl IpPoolManager {
                 debug!("Released IP {} (previously allocated to {})", ip, allocation.client_id);
             }
             Ok(())
-        } else {
-            Err(IpPoolError::NotAllocated(ip.to_string()))
-        }
-    }
-    
-    /// Renew an IP lease
-    pub async fn renew_ip(&self, ip: &str) -> Result<u64, IpPoolError> {
-        let mut allocated = self.allocated_ips.lock().await;
-        
-        if let Some(allocation) = allocated.get_mut(ip) {
-            let now = utils::current_timestamp_millis();
-            let expires_at = now + (self.default_lease_duration * 1000);
-            allocation.expires_at = expires_at;
-            
-            debug!("Renewed IP {} lease for client {}", ip, allocation.client_id);
-            Ok(expires_at)
         } else {
             Err(IpPoolError::NotAllocated(ip.to_string()))
         }
@@ -209,6 +173,11 @@ impl IpPoolManager {
         }
     }
     
+    /// Renew an IP lease with the default duration
+    pub async fn renew_ip(&self, ip: &str) -> Result<u64, IpPoolError> {
+        self.renew_ip_with_lease(ip, self.default_lease_duration).await
+    }
+    
     /// Assign a static IP
     pub async fn assign_static_ip(&self, ip: &str, client_id: &str) -> Result<(), IpPoolError> {
         // Check if IP is in our subnet
@@ -221,24 +190,27 @@ impl IpPoolManager {
             )));
         }
         
-        let mut allocated = self.allocated_ips.lock().await;
-        
-        // Check if IP is already allocated
-        if let Some(allocation) = allocated.get(ip) {
-            if allocation.client_id != client_id {
-                return Err(IpPoolError::AlreadyAllocated(format!(
-                    "IP {} is already allocated to client {}", 
-                    ip, allocation.client_id
-                )));
+        // First, try to find the IP in the allocated pool
+        {
+            let mut allocated = self.allocated_ips.lock().await;
+            
+            // Check if IP is already allocated
+            if let Some(allocation) = allocated.get(ip) {
+                if allocation.client_id != client_id {
+                    return Err(IpPoolError::AlreadyAllocated(format!(
+                        "IP {} is already allocated to client {}", 
+                        ip, allocation.client_id
+                    )));
+                }
+                
+                // Already allocated to this client, just make it static
+                let mut allocation = allocation.clone();
+                allocation.is_static = true;
+                allocated.insert(ip.to_string(), allocation);
+                
+                debug!("Changed IP {} allocation for client {} to static", ip, client_id);
+                return Ok(());
             }
-            
-            // Already allocated to this client, just make it static
-            let mut allocation = allocation.clone();
-            allocation.is_static = true;
-            allocated.insert(ip.to_string(), allocation);
-            
-            debug!("Changed IP {} allocation for client {} to static", ip, client_id);
-            return Ok(());
         }
         
         // Remove from available pool if present
@@ -258,6 +230,7 @@ impl IpPoolManager {
             is_static: true,
         };
         
+        let mut allocated = self.allocated_ips.lock().await;
         allocated.insert(ip.to_string(), allocation);
         
         info!("Assigned static IP {} to client {}", ip, client_id);
