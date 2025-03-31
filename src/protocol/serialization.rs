@@ -12,14 +12,15 @@ use crate::protocol::types::{MessageError, PacketType};
 use crate::protocol::validation::validate_message;
 
 /// Maximum allowed message size (1MB)
-const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
+pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 
 /// Serialize a packet to a JSON string
 pub fn serialize_packet(packet: &PacketType) -> Result<String, MessageError> {
     // Validate the packet before serializing
     validate_message(packet)?;
     
-    let json = serde_json::to_string(packet)?;
+    let json = serde_json::to_string(packet)
+        .map_err(|e| MessageError::Serialization(e))?;
     
     if json.len() > MAX_MESSAGE_SIZE {
         return Err(MessageError::MessageTooLarge);
@@ -42,7 +43,8 @@ pub fn deserialize_packet(json: &str) -> Result<PacketType, MessageError> {
         return Err(MessageError::MessageTooLarge);
     }
     
-    let packet: PacketType = serde_json::from_str(json)?;
+    let packet: PacketType = serde_json::from_str(json)
+        .map_err(|e| MessageError::Serialization(e))?;
     
     // Validate the deserialized packet
     validate_message(&packet)?;
@@ -58,7 +60,7 @@ pub fn ws_message_to_packet(message: &WsMessage) -> Result<PacketType, MessageEr
         WsMessage::Text(text) => {
             deserialize_packet(text)
         }
-        WsMessage::Binary(data) => {
+        WsMessage::Binary(_) => {
             // We don't handle binary messages, but could implement a binary protocol here
             Err(MessageError::InvalidFormat("Binary messages not supported".into()))
         }
