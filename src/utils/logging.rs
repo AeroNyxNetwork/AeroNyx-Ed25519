@@ -121,6 +121,7 @@ pub fn log_security_event(event_type: &str, details: &str) {
 mod tests {
     use super::*;
      use tempfile::tempdir;
+     use std::fs; // Import fs for reading directory
 
     #[test]
     fn test_init_logging() {
@@ -136,25 +137,53 @@ mod tests {
      #[tokio::test] // Use tokio::test for async
      async fn test_init_file_logging() { // Mark test as async
          let temp_dir = tempdir().unwrap();
-         let log_file = temp_dir.path().join("test_app.log");
+         let log_dir_path = temp_dir.path();
+         let log_filename_prefix = "test_app.log";
+         let expected_log_path = log_dir_path.join(log_filename_prefix); // Base path for comparison
 
          // Initialize file logging and keep the guard
-         let guard = init_file_logging("trace", log_file.to_str().unwrap()).expect("Failed to init file logging");
+         // Pass the directory and prefix to init_file_logging
+         let guard = init_file_logging("trace", expected_log_path.to_str().unwrap()).expect("Failed to init file logging");
 
          // Log some messages
          tracing::info!(test_id = 1, "Info message to file");
          tracing::warn!(test_id = 2, "Warning message to file");
          tracing::error!(test_id = 3, "Error message to file");
 
-         // --- FIX: Drop the guard explicitly to ensure flush ---
+         // Drop the guard explicitly to ensure flush
          drop(guard);
-         // --- End of FIX ---
 
-         // Give a small amount of time for logs to potentially flush (might still be needed depending on OS/FS)
+         // Give a small amount of time for logs to potentially flush
          tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Use tokio sleep
 
+         // --- FIX: Find the actual log file with the date suffix ---
+         let mut found_log_file = None;
+         match fs::read_dir(log_dir_path) {
+            Ok(entries) => {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        if path.is_file() {
+                             // Check if filename starts with the expected prefix
+                             if let Some(name) = path.file_name() {
+                                 if name.to_string_lossy().starts_with(log_filename_prefix) {
+                                     found_log_file = Some(path);
+                                     break; // Found the file
+                                 }
+                             }
+                        }
+                    }
+                }
+            }
+            Err(e) => panic!("Failed to read temporary log directory: {}", e),
+         }
+
+         let actual_log_file = found_log_file.expect("Log file was not found in the temporary directory");
+         println!("Found log file: {:?}", actual_log_file); // Debug print
+         // --- End of FIX ---
+
          // Check log file content
-         match std::fs::read_to_string(&log_file) {
+         match std::fs::read_to_string(&actual_log_file) { // Read the found file
              Ok(content) => {
                  assert!(content.contains("Info message to file"));
                  assert!(content.contains("test_id=1"));
@@ -165,10 +194,11 @@ mod tests {
              }
              Err(e) => {
                  // Fail the test if the file couldn't be read
-                  panic!("Log file content check failed: {}", e);
+                  panic!("Log file content check failed for {:?}: {}", actual_log_file, e);
              }
          }
      }
+
 
      #[test]
      fn test_log_security_event() {
