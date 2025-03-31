@@ -663,21 +663,27 @@ mod tests {
     async fn test_bandwidth_limit() {
         let monitor = NetworkMonitor::new(Duration::from_secs(1), 10);
         let client_id = "limited-client";
-        
+
         // Set a bandwidth limit
         monitor.set_bandwidth_limit(client_id, 1000).await; // 1000 bytes/sec
-        
+
         // Test exceeding the limit
         let exceeded = monitor.check_bandwidth_limit(client_id, 2000, Duration::from_secs(1)).await;
         assert!(exceeded);
-        
+
+        // --- FIX: Check rate limited flag *immediately* after exceeding ---
+        let client_stats_after_exceed = monitor.get_client_stats(client_id).await.unwrap();
+        assert!(client_stats_after_exceed.rate_limited, "Flag should be true after exceeding limit");
+        // --- End of FIX ---
+
         // Test within the limit
         let within_limit = monitor.check_bandwidth_limit(client_id, 500, Duration::from_secs(1)).await;
         assert!(!within_limit);
-        
-        // Check that rate limited flag was set
-        let client_stats = monitor.get_client_stats(client_id).await.unwrap();
-        assert!(client_stats.rate_limited);
+
+        // Check that rate limited flag was set back to false after the within_limit check
+        let client_stats_after_within = monitor.get_client_stats(client_id).await.unwrap();
+        // This assertion should now reflect the state AFTER the within_limit check
+        assert!(!client_stats_after_within.rate_limited, "Flag should be false after a check within the limit");
     }
     
     #[test]
