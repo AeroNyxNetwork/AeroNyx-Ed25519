@@ -8,22 +8,21 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-// Add missing import for error! macro
-use futures::{SinkExt, StreamExt}; // Removed unused channel::mpsc::UnboundedSender
-use tokio::sync::{Mutex, RwLock}; // Added Mutex
+use futures::{SinkExt, StreamExt};
+use tokio::sync::{Mutex, RwLock};
 use tokio::time;
-use tokio_rustls::{server::TlsStream, TlsAcceptor}; // Added server::TlsStream
-use tokio::net::TcpStream; // Added TcpStream
-// Correctly import the error macro
-use tracing::{debug, error, info, trace, warn}; // Added error import back
-use tokio_tungstenite::tungstenite::{Message, Error as WsError}; // Import Message and WsError for clarity
+use tokio_rustls::{server::TlsStream, TlsAcceptor};
+use tokio::net::TcpStream;
+// Import the error macro correctly
+use tracing::{debug, error, info, trace, warn};
+// Removed unused Message, WsError imports
+use tokio_tungstenite::tungstenite::{Message};
 
 use crate::auth::AuthManager;
 use crate::crypto::{KeyManager, SessionKeyManager};
 use crate::network::{IpPoolManager, NetworkMonitor};
-use crate::protocol::types::PacketType; // Corrected path
+use crate::protocol::types::PacketType;
 use crate::protocol::serialization::{packet_to_ws_message, ws_message_to_packet, create_error_packet, create_disconnect_packet, log_packet_info};
-// Removed unused import: SessionError
 use crate::server::session::{ClientSession, SessionManager};
 use crate::server::routing::PacketRouter;
 use crate::server::metrics::ServerMetricsCollector;
@@ -35,7 +34,7 @@ use solana_sdk::pubkey::Pubkey;
 
 /// Handle a client connection
 pub async fn handle_client(
-    stream: TcpStream, // Changed from tokio::net::TcpStream
+    stream: TcpStream,
     addr: SocketAddr,
     tls_acceptor: Arc<TlsAcceptor>,
     key_manager: Arc<KeyManager>,
@@ -170,7 +169,6 @@ pub async fn handle_client(
                                 }
                             }
                         }
-                        // E0408 Fix: Separate the arms or use _e if e is unused
                         Ok(Some(Err(e))) => { // Handle specific websocket error
                             metrics.record_auth_failure().await;
                             return Err(ServerError::WebSocket(e)); // Map error
@@ -199,7 +197,6 @@ pub async fn handle_client(
                  }
              }
         }
-        // E0408 Fix: Separate the arms or use _e if e is unused
         Ok(Some(Err(e))) => { // Handle specific websocket error
             metrics.record_auth_failure().await;
             return Err(ServerError::WebSocket(e)); // Map error
@@ -301,7 +298,6 @@ pub async fn handle_client(
     session_manager.add_session(session.clone()).await;
 
     // Process client messages
-    // E0382 Fix: Clone the Arc before moving it
     let result = process_client_session(
         session,
         key_manager, // Keep original Arc
@@ -351,8 +347,8 @@ async fn process_client_session(
         let mut sequence: u64 = 0;
         loop {
             interval.tick().await;
-            // Check server state
-            if *session_hb.is_stream_taken().await { // Check if session is closing
+            // Check if session is closing - Remove dereference (*)
+            if session_hb.is_stream_taken().await {
                  break;
             }
             let ping = PacketType::Ping {
@@ -376,8 +372,8 @@ async fn process_client_session(
         let mut interval = time::interval(rotation_interval);
         loop {
             interval.tick().await;
-            // Check server state
-            if *session_rot.is_stream_taken().await { // Check if session is closing
+            // Check if session is closing - Remove dereference (*)
+            if session_rot.is_stream_taken().await {
                 break;
             }
 
@@ -536,10 +532,10 @@ async fn process_client_session(
                      }
                  }
              }
-            // E0308 Fix: Map the tungstenite::Error correctly using From
              Some(Err(e)) => { // WebSocket error
                  debug!("WebSocket error for client {}: {}", client_id, e);
-                 process_result = Err(ServerError::WebSocket(e)); // This uses the #[from] attribute
+                 // Correctly handle the error assignment and break
+                 process_result = Err(ServerError::WebSocket(e));
                  break;
              }
              None => { // WebSocket stream closed
