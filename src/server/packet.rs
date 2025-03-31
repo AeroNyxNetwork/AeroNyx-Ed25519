@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 use tun::platform::Device;
 use std::io::{Read, Write};
 use crate::network::NetworkMonitor;
@@ -16,6 +16,28 @@ use crate::crypto::SessionKeyManager;
 use crate::server::routing::PacketRouter;
 use crate::server::session::SessionManager;
 use crate::server::core::ServerState;
+
+/// Error type for TUN packet processing
+#[derive(Debug, thiserror::Error)]
+pub enum TunPacketError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    
+    #[error("Packet processing error: {0}")]
+    Processing(String),
+    
+    #[error("Session not found for IP {0}")]
+    SessionNotFound(String),
+    
+    #[error("TUN device not initialized")]
+    TunNotInitialized,
+    
+    #[error("Routing error: {0}")]
+    Routing(String),
+    
+    #[error("Server shutdown")]
+    Shutdown,
+}
 
 /// Process packets from the TUN device
 pub async fn process_tun_packets(
@@ -25,10 +47,16 @@ pub async fn process_tun_packets(
     packet_router: Arc<PacketRouter>,
     network_monitor: Arc<NetworkMonitor>,
     server_state: Arc<RwLock<ServerState>>,
-) {
+) -> Result<(), TunPacketError> {
     let mut buffer = vec![0u8; 2048];
     
     loop {
+        // Check if we should still be running
+        let current_state = *server_state.read().await;
+        if current_state != ServerState::Running {
+            return Err(TunPacketError::Shutdown);
+        }
+        
         // Read from TUN device
         let bytes_read = {
             let mut device = tun_device.lock().await;
@@ -75,6 +103,8 @@ pub async fn process_tun_packets(
                             ).await {
                                 trace!("Error routing packet to {}: {}", dest_ip, e);
                             }
+                        } else {
+                            warn!("No session key found for client {}", client_id);
                         }
                     }
                     None => {
@@ -82,12 +112,6 @@ pub async fn process_tun_packets(
                     }
                 }
             }
-        }
-        
-        // Check if we should still be running
-        let current_state = *server_state.read().await;
-        if current_state != ServerState::Running {
-            break;
         }
     }
 }
@@ -99,4 +123,33 @@ pub async fn write_to_tun(
 ) -> std::io::Result<usize> {
     let mut device = tun_device.lock().await;
     device.write(packet_data)
+}
+
+/// Start the TUN packet processing task
+pub async fn start_tun_packet_processor(
+    tun_device: Arc<Mutex<Device>>,
+    session_manager: Arc<SessionManager>,
+    session_key_manager: Arc<SessionKeyManager>,
+    packet_router: Arc<PacketRouter>,
+    network_monitor: Arc<NetworkMonitor>,
+    server_state: Arc<RwLock<ServerState>>,
+) -> tokio::task::JoinHandle<Result<(), TunPacketError>> {
+    tokio::spawn(async move {
+        let result = process_tun_packets(
+            tun_device,
+            session_manager,
+            session_key_manager,
+            packet_router,
+            network_monitor,
+            server_state,
+        ).await;
+        
+        match &result {
+            Ok(_) => debug!("TUN packet processor completed successfully"),
+            Err(TunPacketError::Shutdown) => debug!("TUN packet processor shut down gracefully"),
+            Err(e) => error!("TUN packet processor terminated with error: {}", e),
+        }
+        
+        result
+    })
 }
