@@ -527,7 +527,8 @@ mod tests {
           let invalid_bytes = [0u8; 31]; // Wrong length
           let result = ed25519_public_to_x25519(&invalid_bytes);
           assert!(result.is_err());
-          assert!(matches!(result.unwrap_err(), KeyError::InvalidData(_)));
+          // Use .. to ignore inner value for non-Debug types // Corrected E0277 check
+          assert!(matches!(result.unwrap_err(), KeyError::InvalidData(..)));
 
           // Bytes that don't represent a valid point on the curve
            // (Creating such bytes reliably is tricky, but we can test with known invalid patterns if available)
@@ -539,6 +540,7 @@ mod tests {
           let invalid_bytes = [0u8; 31]; // Wrong length
           let result = ed25519_private_to_x25519(&invalid_bytes);
           assert!(result.is_err());
-          assert!(matches!(result.unwrap_err(), KeyError::InvalidData(_)));
+          // Use .. to ignore inner value for non-Debug types // Corrected E0277 check
+          assert!(matches!(result.unwrap_err(), KeyError::InvalidData(..))); // Corrected line 542
       }
 }
