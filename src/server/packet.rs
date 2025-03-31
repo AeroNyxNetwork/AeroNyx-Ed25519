@@ -1,3 +1,5 @@
+// src/server/packet.rs - Updated TUN packet processing code
+
 // src/server/packet.rs
 //! TUN packet processing.
 //!
@@ -133,7 +135,7 @@ pub async fn start_tun_packet_processor(
     packet_router: Arc<PacketRouter>,
     network_monitor: Arc<NetworkMonitor>,
     server_state: Arc<RwLock<ServerState>>,
-) -> tokio::task::JoinHandle<Result<(), TunPacketError>> {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let result = process_tun_packets(
             tun_device,
@@ -149,7 +151,5 @@ pub async fn start_tun_packet_processor(
             Err(TunPacketError::Shutdown) => debug!("TUN packet processor shut down gracefully"),
             Err(e) => error!("TUN packet processor terminated with error: {}", e),
         }
-        
-        result
     })
 }
