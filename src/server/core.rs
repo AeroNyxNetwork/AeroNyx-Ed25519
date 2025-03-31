@@ -368,7 +368,11 @@ impl VpnServer {
         // Add the TUN task to our handles
         {
             let mut handles = self.task_handles.lock().await;
-            handles.push(tun_router_handle);
+            handles.push(tokio::spawn(async {
+                if let Err(e) = tun_router_handle.await {
+                    error!("TUN router error: {:?}", e);
+                }
+            }));
         }
         
         // Get components needed for the main server loop
@@ -480,8 +484,7 @@ impl VpnServer {
         // Add the main server handle to our task handles
         {
             let mut handles = self.task_handles.lock().await;
-            // Store the original handle, avoiding the need to clone it
-            handles.push(tokio::spawn(async move {
+            handles.push(tokio::spawn(async {
                 if let Err(e) = server_handle.await {
                     error!("Server error: {:?}", e);
                 }
@@ -541,10 +544,10 @@ impl VpnServer {
         let session_key_manager = self.session_key_manager.clone();
         let auth_manager = self.auth_manager.clone();
         let metrics = self.metrics.clone();
-        let state = self.state.clone();
         let task_handles = self.task_handles.clone();
         
         // Session cleanup task
+        let state_for_session = self.state.clone();
         let session_cleanup_handle = tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(60));
             
@@ -552,7 +555,7 @@ impl VpnServer {
                 interval.tick().await;
                 
                 // Check server state
-                let current_state = *state.read().await;
+                let current_state = *state_for_session.read().await;
                 if current_state != ServerState::Running {
                     break;
                 }
@@ -566,6 +569,7 @@ impl VpnServer {
         });
         
         // IP pool cleanup task
+        let state_for_ip_pool = self.state.clone();
         let ip_pool_cleanup_handle = tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(300)); // 5 minutes
             
@@ -573,7 +577,7 @@ impl VpnServer {
                 interval.tick().await;
                 
                 // Check server state
-                let current_state = *state.read().await;
+                let current_state = *state_for_ip_pool.read().await;
                 if current_state != ServerState::Running {
                     break;
                 }
@@ -587,6 +591,7 @@ impl VpnServer {
         });
         
         // Session key cleanup task
+        let state_for_session_key = self.state.clone();
         let session_key_cleanup_handle = tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(600)); // 10 minutes
             
@@ -594,7 +599,7 @@ impl VpnServer {
                 interval.tick().await;
                 
                 // Check server state
-                let current_state = *state.read().await;
+                let current_state = *state_for_session_key.read().await;
                 if current_state != ServerState::Running {
                     break;
                 }
@@ -608,6 +613,7 @@ impl VpnServer {
         });
         
         // Authentication challenge cleanup task
+        let state_for_auth = self.state.clone();
         let auth_cleanup_handle = tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(60));
             
@@ -615,7 +621,7 @@ impl VpnServer {
                 interval.tick().await;
                 
                 // Check server state
-                let current_state = *state.read().await;
+                let current_state = *state_for_auth.read().await;
                 if current_state != ServerState::Running {
                     break;
                 }
@@ -629,6 +635,7 @@ impl VpnServer {
         });
         
         // Metrics reporting task
+        let state_for_metrics = self.state.clone();
         let metrics_report_handle = tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(3600)); // 1 hour
             
@@ -636,7 +643,7 @@ impl VpnServer {
                 interval.tick().await;
                 
                 // Check server state
-                let current_state = *state.read().await;
+                let current_state = *state_for_metrics.read().await;
                 if current_state != ServerState::Running {
                     break;
                 }
