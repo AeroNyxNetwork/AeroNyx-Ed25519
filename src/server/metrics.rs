@@ -385,40 +385,43 @@ async fn get_memory_usage() -> f64 {
     // Simplified implementation
     #[cfg(target_os = "linux")]
     {
-        match tokio::fs::read_to_string("/proc/meminfo").await {
-            Ok(content) => {
-                let mut total = None;
-                let mut free = None;
-                let mut buffers = None;
-                let mut cached = None;
-                
-                for line in content.lines() {
-                    if line.starts_with("MemTotal:") {
-                        total = parse_meminfo_line(line);
-                    } else if line.starts_with("MemFree:") {
-                        free = parse_meminfo_line(line);
-                    } else if line.starts_with("Buffers:") {
-                        buffers = parse_meminfo_line(line);
-                    } else if line.starts_with("Cached:") && !line.starts_with("SwapCached:") {
-                        cached = parse_meminfo_line(line);
+            match tokio::fs::read_to_string("/proc/meminfo").await {
+                Ok(content) => {
+                    let mut total = None;
+                    let mut free = None;
+                    let mut buffers = None;
+                    let mut cached = None;
+                    
+                    for line in content.lines() {
+                        if line.starts_with("MemTotal:") {
+                            total = parse_meminfo_line(line);
+                        } else if line.starts_with("MemFree:") {
+                            free = parse_meminfo_line(line);
+                        } else if line.starts_with("Buffers:") {
+                            buffers = parse_meminfo_line(line);
+                        } else if line.starts_with("Cached:") && !line.starts_with("SwapCached:") {
+                            cached = parse_meminfo_line(line);
+                        }
+                        
+                        if total.is_some() && free.is_some() && buffers.is_some() && cached.is_some() {
+                            break;
+                        }
                     }
                     
-                    if total.is_some() && free.is_some() && buffers.is_some() && cached.is_some() {
-                        break;
+                    if let (Some(total), Some(free), Some(buffers), Some(cached)) = (total, free, buffers, cached) {
+                        if total > 0 {
+                            let used = total - free - buffers - cached;
+                            return (used as f64 / total as f64) * 100.0;
+                        }
                     }
+                    
+                    0.0
                 }
-                
-                if let (Some(total), Some(free), Some(buffers), Some(cached)) = (total, free, buffers, cached) {
-                    if total > 0 {
-                        let used = total - free - buffers - cached;
-                        return (used as f64 / total as f64) * 100.0;
-                    }
+                Err(_) => {
+                    // Return 0.0 instead of void value
+                    return 0.0;
                 }
-                
-                return 0.0;
             }
-            Err(_) => 0.0,
-        }
     }
     
     // Default fallback for other platforms
