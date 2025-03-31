@@ -5,13 +5,11 @@
 //! the logging system.
 
 use std::io;
-// Removed unused File import
 use std::path::Path;
-// Use prelude for easier access to traits
 // Import Layer trait explicitly
 use tracing_subscriber::{fmt, EnvFilter, layer::SubscriberExt, util::SubscriberInitExt, Layer as TracingLayer, filter::LevelFilter};
-// Import NonBlocking and rolling
-use tracing_appender::{non_blocking::NonBlocking, rolling};
+// Removed unused NonBlocking import (type name not directly used)
+use tracing_appender::rolling;
 use tracing_subscriber::fmt::writer::MakeWriterExt; // Keep for .with_max_level on layer
 
 
@@ -61,13 +59,10 @@ pub fn init_logging(log_level: &str) -> io::Result<()> {
      let log_dir = log_path.parent().unwrap_or_else(|| Path::new("."));
      // Correctly handle OsStr conversion
      let log_filename_prefix = log_path.file_stem().unwrap_or_else(|| std::ffi::OsStr::new("aeronyx"));
-     // Correctly handle OsStr conversion
-     // let _log_filename_suffix = log_path.extension().unwrap_or_else(||std::ffi::OsStr::new("log")); // Suffix not used by rolling::daily
 
 
      // Use rolling file appender
      let file_appender = rolling::daily(log_dir, log_filename_prefix);
-     // Note: `with_max_level` is not a method on RollingFileAppender directly
 
 
     // --- Create Non-Blocking Writer ---
@@ -77,7 +72,7 @@ pub fn init_logging(log_level: &str) -> io::Result<()> {
 
     // --- Configure File Logging Layer ---
     // Apply max_level here to the layer
-    // E0599/E0277 Fix (MakeWriter): Assumes Cargo.toml versions are aligned.
+    // Assumes Cargo.toml versions are aligned for MakeWriter trait.
     let file_layer = fmt::layer()
         .with_target(true)
         .with_line_number(true)
@@ -95,8 +90,7 @@ pub fn init_logging(log_level: &str) -> io::Result<()> {
 
     // --- Initialize Subscriber ---
     // Combine layers and set the global default subscriber.
-    // E0599 Fix (with_filter): Apply filter to layers using the trait method.
-    // E0599 Fix (clone): Remove clone from filter, apply it to the registry instead.
+    // Assumes compatible tracing crates for with_filter on layer.
     tracing_subscriber::registry()
         .with(filter) // Apply filter globally
         .with(file_layer.with_filter(max_level)) // Filter layer by max level
@@ -126,7 +120,6 @@ pub fn log_security_event(event_type: &str, details: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-     // Removed unused fs import
      use tempfile::tempdir;
 
     #[test]
