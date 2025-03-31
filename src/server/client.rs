@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use futures::SinkExt;
+use futures::{SinkExt, StreamExt};
 use tokio::sync::RwLock;
 use tokio::time;
 use tokio_rustls::TlsAcceptor;
@@ -19,7 +19,7 @@ use crate::crypto::{KeyManager, SessionKeyManager};
 use crate::network::{IpPoolManager, NetworkMonitor};
 use crate::protocol::PacketType;
 use crate::protocol::serialization::{packet_to_ws_message, ws_message_to_packet, create_error_packet, create_disconnect_packet, log_packet_info};
-use crate::server::session::{ClientSession, SessionManager};
+use crate::server::session::{ClientSession, SessionManager, SessionError};
 use crate::server::routing::PacketRouter;
 use crate::server::metrics::ServerMetricsCollector;
 use crate::server::core::{ServerError, ServerState};
@@ -447,8 +447,29 @@ async fn process_client_session(
         }
     });
     
-    // Process client messages
-    let mut stream = session.take_stream()?;
+    // Get stream for processing
+    let mut stream = match session.take_stream().await {
+        Ok(stream) => stream,
+        Err(e) => {
+            // Clean up background tasks
+            heartbeat_handle.abort();
+            key_rotation_handle.abort();
+            
+            // Remove session
+            session_manager.remove_session(&session_id).await;
+            
+            // Release IP
+            if let Err(ip_err) = ip_pool.release_ip(&ip_address).await {
+                warn!("Failed to release IP {}: {}", ip_address, ip_err);
+            }
+            
+            return match e {
+                SessionError::StreamConsumed => Err(ServerError::Internal("Stream already consumed".to_string())),
+                _ => Err(ServerError::Session(e)),
+            };
+        }
+    };
+    
     let mut last_counter: Option<u64> = None;
     
     while let Some(result) = stream.next().await {
@@ -610,4 +631,3 @@ async fn process_client_session(
     session_key_manager.remove_key(&client_id).await;
     
     Ok(())
-}
