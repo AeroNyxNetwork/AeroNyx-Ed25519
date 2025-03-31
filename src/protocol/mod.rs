@@ -10,4 +10,5 @@ pub mod validation;
 
 // Re-export commonly used items
 pub use types::{PacketType, MessageError};
-pub use validation::validate_message;
+// Removed unused validate_message re-export (assuming it's used internally via serialization)
+// pub use validation::validate_message; // Remove if not needed externally
