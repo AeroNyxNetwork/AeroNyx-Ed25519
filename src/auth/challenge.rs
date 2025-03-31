@@ -240,7 +240,7 @@ impl ChallengeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::signer::Signer;
+    use solana_sdk::signer::Signer; // Need Signer trait for keypair methods
 
     #[tokio::test]
     async fn test_challenge_lifecycle() {
@@ -283,7 +283,8 @@ mod tests {
 
 
         // Test expiration cleanup
-        let challenge2 = challenge_manager.generate_challenge(client_addr).await.unwrap();
+        // Prefix unused variable // Corrected unused variable
+        let _challenge2 = challenge_manager.generate_challenge(client_addr).await.unwrap(); // Corrected line 286
         assert_eq!(challenge_manager.challenge_count().await, 1);
 
 
