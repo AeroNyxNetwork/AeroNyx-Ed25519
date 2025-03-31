@@ -414,9 +414,10 @@ async fn get_cpu_usage() -> f64 {
                      if line.starts_with("cpu ") {
                          let parts: Vec<Option<u64>> = line.split_whitespace().skip(1).map(|s| s.parse().ok()).collect();
                          if parts.len() >= 4 {
-                             let user = parts[0].unwrap_or(0);
-                             let nice = parts[1].unwrap_or(0);
-                             let system = parts[2].unwrap_or(0);
+                             // Prefix unused variables with underscore
+                             let _user = parts[0].unwrap_or(0);   // Corrected line 417
+                             let _nice = parts[1].unwrap_or(0);   // Corrected line 418
+                             let _system = parts[2].unwrap_or(0); // Corrected line 419
                              let idle = parts[3].unwrap_or(0);
                              let total: u64 = parts.iter().filter_map(|&x| x).sum();
                               if total > 0 && total > idle {
@@ -429,9 +430,7 @@ async fn get_cpu_usage() -> f64 {
              }
              Err(_) => 0.0, // Return 0.0 on read error
          }
-
-        // Remove the unreachable code warning by removing the line below
-        // 0.0 // This line is now reachable if the match fails
+        // No longer unreachable code here
     }
 
     #[cfg(not(target_os = "linux"))]
