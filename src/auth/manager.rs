@@ -6,11 +6,11 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
+use std::str::FromStr;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -141,25 +141,25 @@ impl AuthManager {
             .map_err(|_| AuthError::InvalidFormat(format!("Invalid address format: {}", client_addr)))?;
         
         // Verify the challenge with the challenge manager
-        let verify_result = self.challenge_manager.verify_challenge(
+        let result = self.challenge_manager.verify_challenge(
             challenge_id,
             socket_addr,
             signature,
             public_key,
         ).await;
         
-        // Handle the result separately from the async operation
-        match verify_result {
-            Err(ChallengeError::SignatureVerificationFailed) => {
-                // Record failed attempt on signature verification failure
-                self.record_failed_attempt(client_addr).await;
-                return Err(AuthError::Challenge(ChallengeError::SignatureVerificationFailed));
-            },
-            Err(e) => {
-                return Err(AuthError::Challenge(e));
-            },
-            Ok(_) => {}
+        // Handle the result
+        if let Err(e) = &result {
+            match e {
+                ChallengeError::Expired | ChallengeError::SignatureVerificationFailed => {
+                    self.record_failed_attempt(client_addr).await;
+                }
+                _ => {}
+            }
         }
+        
+        // Propagate any verification errors
+        result.map_err(AuthError::Challenge)?;
         
         // Reset failed attempts on successful verification
         self.reset_failed_attempts(client_addr).await;
