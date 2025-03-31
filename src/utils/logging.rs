@@ -31,17 +31,15 @@ pub fn init_logging(log_level: &str) -> io::Result<()> {
 pub fn init_file_logging(log_level: &str, log_file: &str) -> io::Result<()> {
     let filter = EnvFilter::new(log_level);
     
-    // Simple file-based writer
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file)?;
-        
-    let file_writer = std::sync::Mutex::new(file);
+    // Create a file appender that rolls daily
+    let file_appender = rolling::daily(
+        Path::new(log_file).parent().unwrap_or(Path::new(".")),
+        Path::new(log_file).file_name().unwrap_or_default(),
+    );
     
     fmt()
         .with_env_filter(filter)
-        .with_writer(move || std::io::BufWriter::new(file_writer.lock().unwrap()))
+        .with_writer(file_appender)
         .init();
     
     Ok(())
