@@ -23,7 +23,7 @@ tun = { version = "0.5", features = ["async"] }
 socket2 = "0.5"
 
 # Use tracing-appender v0.2.x compatible with tracing-subscriber v0.3.x
-tracing-appender = "0.2.2" # <--- UPDATED LINE
+tracing-appender = "0.2.2"
 webpki = "0.22"
 
 # Cryptography
@@ -126,6 +126,7 @@ debug = true
 name = "aeronyx-private-ed25519"
 path = "src/main.rs"
 
-[[example]]
-name = "client_example"
-path = "examples/client_example.rs"
+# Removed the example section that caused the file not found error
+# [[example]]
+# name = "client_example"
+# path = "examples/client_example.rs"
