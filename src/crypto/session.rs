@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-// Removed unused warn import
-use tracing::{debug, info};
+// Removed unused info
+use tracing::{debug, warn};
 
 use crate::config::constants::SESSION_KEY_SIZE;
 use crate::utils;
@@ -48,7 +48,7 @@ impl SessionKeyEntry {
 
     /// Check if the key should be rotated based on age or usage
     fn should_rotate(&self, max_age: Duration, max_usage: u64) -> bool {
-        self.created_at.elapsed() > max_age || (max_usage > 0 && self.usage_count >= max_usage) // Use >= for usage
+        self.created_at.elapsed() > max_age || (max_usage > 0 && self.usage_count > max_usage)
     }
 }
 
@@ -97,6 +97,8 @@ impl SessionKeyManager {
 
             // Check if key needs rotation based on age or usage
             if entry.should_rotate(self.rotation_interval, self.max_key_usages) {
+                // We don't rotate immediately here - return the current key
+                // but log that it needs rotation. The rotation is done separately.
                 debug!("Session key for client {} needs rotation", utils::security::StringValidator::sanitize_log(client_id));
             }
 
@@ -127,7 +129,7 @@ impl SessionKeyManager {
             let entry = SessionKeyEntry::new(new_key.clone());
             keys.insert(client_id.to_string(), entry);
 
-            info!("Rotated session key for client {}", utils::security::StringValidator::sanitize_log(client_id));
+            debug!("Rotated session key for client {}", utils::security::StringValidator::sanitize_log(client_id));
             Some(new_key)
         } else {
             None
@@ -172,7 +174,7 @@ impl SessionKeyManager {
 
         let removed = before_count - keys.len();
         if removed > 0 {
-            info!("Cleaned up {} inactive sessions", removed);
+            debug!("Cleaned up {} inactive sessions", removed);
         }
 
         removed
@@ -223,11 +225,10 @@ mod tests {
         let key = SessionKeyManager::generate_key();
         manager.store_key(client_id, key.clone()).await;
 
-        // Get the key multiple times to increment usage (use >= for check)
-        for _ in 0..5 {
-            let _retrieved_key = manager.get_key(client_id).await.expect("Key should exist");
+        // Get the key multiple times to increment usage
+        for _ in 0..6 {
+            manager.get_key(client_id).await;
         }
-
 
         // Should now need rotation due to usage
         assert!(manager.needs_rotation(client_id).await);
@@ -235,24 +236,21 @@ mod tests {
         // Alternatively, wait for age-based rotation
         let manager2 = SessionKeyManager::new(Duration::from_millis(10), 1000);
         let client_id2 = "test-client2";
-        manager2.store_key(client_id2, SessionKeyManager::generate_key()).await;
+        let key2_orig = SessionKeyManager::generate_key();
+        manager2.store_key(client_id2, key2_orig.clone()).await; // Store key for client2
 
         // Wait for the key to expire
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(manager2.needs_rotation(client_id2).await);
 
         // Test actual rotation
-        let new_key_opt = manager2.rotate_key(client_id2).await;
-        assert!(new_key_opt.is_some());
-        let new_key = new_key_opt.unwrap();
+        let new_key = manager2.rotate_key(client_id2).await.unwrap();
 
-
-        // New key should be different
+        // New key should be different from the original key for client2
         let retrieved = manager2.get_key(client_id2).await.unwrap();
         assert_eq!(retrieved, new_key);
-        assert_ne!(retrieved, key); // Comparing against original key from first test case - likely different
+        assert_ne!(retrieved, key2_orig); // Compare with the key stored for client2
     }
-
 
     #[tokio::test]
     async fn test_cleanup_old_sessions() {
@@ -264,7 +262,7 @@ mod tests {
 
         // Wait a bit and touch only the active client
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let _ = manager.get_key("active-client").await;
+        manager.get_key("active-client").await;
 
         // Cleanup with a very short timeout
         let removed = manager.cleanup_old_sessions(Duration::from_millis(5)).await;
