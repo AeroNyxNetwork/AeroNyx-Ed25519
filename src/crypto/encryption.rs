@@ -13,8 +13,7 @@ use hmac::{Hmac, Mac};
 use rand::{Rng, RngCore};
 use sha2::Sha256;
 use thiserror::Error;
-// Removed unused warn import
-use tracing::debug;
+use tracing::debug; // Removed unused warn
 
 type Aes256CbcEnc = Encryptor<Aes256>;
 type Aes256CbcDec = Decryptor<Aes256>;
@@ -63,26 +62,28 @@ pub fn encrypt_chacha20(data: &[u8], key: &[u8], nonce_bytes: Option<&[u8]>) -> 
     let cipher = ChaCha20Poly1305::new(aead_key);
 
     // Generate a random nonce or use the provided one
-    let nonce_vec = if let Some(nb) = nonce_bytes {
+    let nonce_val = if let Some(nb) = nonce_bytes {
         if nb.len() != 12 {
             return Err(EncryptionError::InvalidFormat(format!(
                 "Invalid nonce length: {} (expected 12)",
                 nb.len()
             )));
         }
-        nb.to_vec() // Convert to Vec<u8>
+        let mut n = [0u8; 12];
+        n.copy_from_slice(nb);
+        n
     } else {
         let mut n = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut n);
-        n.to_vec() // Convert to Vec<u8>
+        n
     };
 
     // Encrypt the data
-    let nonce = Nonce::from_slice(&nonce_vec); // Create Nonce from slice
+    let nonce = Nonce::from_slice(&nonce_val); // Use slice reference
     let ciphertext = cipher.encrypt(nonce, data)
         .map_err(|e| EncryptionError::EncryptionFailed(format!("ChaCha20-Poly1305 encryption failed: {}", e)))?;
 
-    Ok((ciphertext, nonce_vec)) // Return the Vec<u8> nonce
+    Ok((ciphertext, nonce_val.to_vec())) // Return owned Vec<u8> for nonce
 }
 
 /// Decrypt data using ChaCha20-Poly1305 AEAD with authentication verification
@@ -97,11 +98,11 @@ pub fn decrypt_chacha20(ciphertext: &[u8], key: &[u8], nonce: &[u8]) -> Result<V
 
     // Convert the key and nonce
     let aead_key = Key::from_slice(key);
-    let nonce = Nonce::from_slice(nonce);
+    let nonce_aead = Nonce::from_slice(nonce); // Rename to avoid shadowing
     let cipher = ChaCha20Poly1305::new(aead_key);
 
     // Decrypt and verify the data
-    let plaintext = cipher.decrypt(nonce, ciphertext)
+    let plaintext = cipher.decrypt(nonce_aead, ciphertext)
         .map_err(|e| {
             // Log authentication failures as they may indicate tampering
             debug!("ChaCha20-Poly1305 decryption failed: {}", e);
@@ -132,29 +133,29 @@ pub fn encrypt_aes(data: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>, Encrypt
         .map_err(|e| EncryptionError::EncryptionFailed(format!("Encryption setup failed: {}", e)))?;
 
     // Encrypt the data
-    // Allow buffer to be potentially larger than needed for padding
-    let mut buffer = vec![0u8; data.len() + 16]; // data len + one block for padding max
-    let ciphertext = encryptor.encrypt_padded_b2b_mut::<Pkcs7>(data, &mut buffer)
-        .map_err(|e| EncryptionError::EncryptionFailed(format!("Encryption failed: {}", e)))?;
+    // Correctly calculate buffer size: data len + block size (16) for padding
+    let mut buffer = vec![0u8; data.len() + 16];
+    let ciphertext_len = encryptor.encrypt_padded_b2b_mut::<Pkcs7>(data, &mut buffer)
+        .map_err(|e| EncryptionError::EncryptionFailed(format!("Encryption failed: {}", e)))?
+        .len(); // Get actual ciphertext length
 
     // Prepare encrypted data: IV + Encrypted data
-    // Use exact length for HMAC calculation
-    let encrypted_len = ciphertext.len();
-    let mut result = Vec::with_capacity(iv.len() + encrypted_len + 32); // +32 for HMAC
+    let ciphertext = &buffer[..ciphertext_len]; // Use actual ciphertext slice
+    let mut result = Vec::with_capacity(iv.len() + ciphertext.len() + 32); // +32 for HMAC
     result.extend_from_slice(&iv);
     result.extend_from_slice(ciphertext);
-
 
     // Add HMAC for authentication
     let mut mac = HmacSha256::new_from_slice(&key_bytes)
         .map_err(|_| EncryptionError::InvalidKeyLength(key_bytes.len()))?;
-    mac.update(&result); // HMAC over IV + ciphertext
+    mac.update(&result); // HMAC covers IV + Ciphertext
     let hmac_result = mac.finalize();
     let hmac_bytes = hmac_result.into_bytes();
     result.extend_from_slice(hmac_bytes.as_slice());
 
     Ok(result)
 }
+
 
 /// Decrypt data using AES-256-CBC with a shared secret and verify HMAC
 pub fn decrypt_aes(encrypted: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>, EncryptionError> {
@@ -163,7 +164,8 @@ pub fn decrypt_aes(encrypted: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>, En
         return Err(EncryptionError::InvalidKeyLength(shared_secret.len()));
     }
 
-    if encrypted.len() < 16 + 32 { // IV + HMAC minimum size
+    // Check minimum length: 16 (IV) + 1 (min ciphertext block) + 32 (HMAC)
+    if encrypted.len() < 16 + 1 + 32 {
         return Err(EncryptionError::InvalidFormat("Encrypted data too short".into()));
     }
 
@@ -174,17 +176,17 @@ pub fn decrypt_aes(encrypted: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>, En
     // Extract HMAC (last 32 bytes)
     let hmac_offset = encrypted.len() - 32;
     let hmac_received = &encrypted[hmac_offset..];
-    let authenticated_part = &encrypted[..hmac_offset]; // IV + ciphertext
+    let authenticated_part = &encrypted[..hmac_offset]; // Part to authenticate (IV + Ciphertext)
 
     // Verify HMAC
     let mut mac = HmacSha256::new_from_slice(&key_bytes)
         .map_err(|_| EncryptionError::InvalidKeyLength(key_bytes.len()))?;
-    mac.update(authenticated_part);
+    mac.update(authenticated_part); // Update with the correct part
 
-    mac.verify_slice(hmac_received)
+    mac.verify_slice(hmac_received) // Verify against the received HMAC
         .map_err(|_| EncryptionError::AuthenticationFailed)?;
 
-    // Extract IV and encrypted data
+    // Extract IV and encrypted data (ciphertext is between IV and HMAC)
     let iv = &encrypted[0..16];
     let ciphertext = &encrypted[16..hmac_offset];
 
@@ -192,11 +194,10 @@ pub fn decrypt_aes(encrypted: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>, En
     let decryptor = Aes256CbcDec::new_from_slices(&key_bytes, iv)
         .map_err(|e| EncryptionError::DecryptionFailed(format!("Decryption setup failed: {}", e)))?;
 
-    // Decrypt the data
-    // Provide a buffer large enough for the original ciphertext, decryption might shrink it
+    // Decrypt the data - provide buffer large enough for ciphertext
     let mut buffer = vec![0u8; ciphertext.len()];
     let plaintext = decryptor.decrypt_padded_b2b_mut::<Pkcs7>(ciphertext, &mut buffer)
-        .map_err(|e| EncryptionError::DecryptionFailed(format!("Decryption failed (check padding): {}", e)))?;
+        .map_err(|e| EncryptionError::DecryptionFailed(format!("Decryption failed: {}", e)))?;
 
     Ok(plaintext.to_vec())
 }
@@ -256,20 +257,20 @@ pub fn remove_padding(packet: &[u8]) -> Result<Vec<u8>, EncryptionError> {
     let padding_len = u16::from_be_bytes(padding_len_bytes) as usize;
 
     // Validate packet length
-    if packet.len() < 2 + padding_len {
+    let expected_min_len = 2 + padding_len;
+    if packet.len() < expected_min_len {
         return Err(EncryptionError::InvalidPadding(format!(
-             "Invalid padding length: specified {}, available {}",
-             padding_len, packet.len() - 2
-         )));
+            "Invalid padding length {} for packet size {}", padding_len, packet.len()
+        )));
     }
 
-
     // Extract the actual data (between header and padding)
-    let data_len = packet.len() - 2 - padding_len;
+    let data_len = packet.len() - expected_min_len; // Correct calculation
     let data = &packet[2..(2 + data_len)];
 
     Ok(data.to_vec())
 }
+
 
 /// Encrypt a session key for transmission
 pub fn encrypt_session_key(
@@ -342,6 +343,33 @@ mod tests {
         assert_eq!(data.to_vec(), unpadded);
     }
 
+     #[test]
+     fn test_invalid_padding_length() {
+         // Create packet where claimed padding length exceeds actual padding
+         let original_data = b"original";
+         let padding_len: u16 = 50; // Claim 50 bytes of padding
+         let actual_padding = [0u8; 10]; // Provide only 10 bytes
+
+         let mut packet = Vec::new();
+         packet.extend_from_slice(&padding_len.to_be_bytes());
+         packet.extend_from_slice(original_data);
+         packet.extend_from_slice(&actual_padding); // Total length 2 + 8 + 10 = 20
+
+         // Removing padding should fail because packet.len() (20) < 2 + padding_len (52)
+         let result = remove_padding(&packet);
+         assert!(result.is_err());
+         assert!(matches!(result.unwrap_err(), EncryptionError::InvalidPadding(_)));
+     }
+
+      #[test]
+      fn test_padding_packet_too_short() {
+          let packet = vec![0u8; 1]; // Less than 2 bytes needed for length field
+          let result = remove_padding(&packet);
+          assert!(result.is_err());
+          assert!(matches!(result.unwrap_err(), EncryptionError::InvalidFormat(_)));
+      }
+
+
     #[test]
     fn test_derive_session_key() {
         let secret = [3u8; 32];
@@ -395,5 +423,55 @@ mod tests {
         let result = decrypt_chacha20(&tampered, &key, &nonce);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), EncryptionError::AuthenticationFailed));
+
+        // Tamper with nonce
+        let mut bad_nonce = nonce.clone();
+        if !bad_nonce.is_empty() {
+            bad_nonce[0] ^= 1;
+        }
+         let result_bad_nonce = decrypt_chacha20(&encrypted, &key, &bad_nonce);
+         assert!(result_bad_nonce.is_err());
+         assert!(matches!(result_bad_nonce.unwrap_err(), EncryptionError::AuthenticationFailed));
+
+        // Use wrong key
+         let wrong_key = [7u8; 32];
+         let result_wrong_key = decrypt_chacha20(&encrypted, &wrong_key, &nonce);
+         assert!(result_wrong_key.is_err());
+         assert!(matches!(result_wrong_key.unwrap_err(), EncryptionError::AuthenticationFailed));
     }
+
+    #[test]
+     fn test_aes_authentication_failure() {
+         let key = [8u8; 32];
+         let data = b"Test AES authentication";
+
+         // Encrypt
+         let encrypted = encrypt_aes(data, &key).unwrap();
+
+         // Tamper with encrypted data (before HMAC)
+         let mut tampered_data = encrypted.clone();
+         if tampered_data.len() > 33 { // Ensure there's data before HMAC
+             tampered_data[20] ^= 1; // Flip a bit in ciphertext part
+         }
+
+         let result_tamper_data = decrypt_aes(&tampered_data, &key);
+         assert!(result_tamper_data.is_err(), "Decryption should fail with tampered data");
+         assert!(matches!(result_tamper_data.unwrap_err(), EncryptionError::AuthenticationFailed));
+
+         // Tamper with HMAC
+         let mut tampered_hmac = encrypted.clone();
+         let hmac_start = tampered_hmac.len() - 1;
+         tampered_hmac[hmac_start] ^= 1; // Flip last bit of HMAC
+
+         let result_tamper_hmac = decrypt_aes(&tampered_hmac, &key);
+         assert!(result_tamper_hmac.is_err(), "Decryption should fail with tampered HMAC");
+         assert!(matches!(result_tamper_hmac.unwrap_err(), EncryptionError::AuthenticationFailed));
+
+
+        // Use wrong key
+          let wrong_key = [9u8; 32];
+          let result_wrong_key = decrypt_aes(&encrypted, &wrong_key);
+          assert!(result_wrong_key.is_err(), "Decryption should fail with wrong key");
+          assert!(matches!(result_wrong_key.unwrap_err(), EncryptionError::AuthenticationFailed));
+     }
 }
