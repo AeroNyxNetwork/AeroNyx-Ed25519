@@ -9,6 +9,7 @@ pub mod keys;
 pub mod session;
 
 // Re-export commonly used items
-pub use encryption::{encrypt_packet, decrypt_packet, generate_challenge};
+// Removed unused generate_challenge export, assuming it's only used internally or via encryption module
+pub use encryption::{encrypt_packet, decrypt_packet};
 pub use keys::KeyManager;
 pub use session::SessionKeyManager;
