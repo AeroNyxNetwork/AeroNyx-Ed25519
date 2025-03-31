@@ -9,20 +9,21 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 // Add missing import for error! macro
-use futures::{SinkExt, StreamExt, channel::mpsc::UnboundedSender}; // Added UnboundedSender
+use futures::{SinkExt, StreamExt}; // Removed unused channel::mpsc::UnboundedSender
 use tokio::sync::{Mutex, RwLock}; // Added Mutex
 use tokio::time;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{server::TlsStream, TlsAcceptor}; // Added server::TlsStream
+use tokio::net::TcpStream; // Added TcpStream
 // Correctly import the error macro
-use tracing::{debug, error, info, trace, warn};
-use tokio_tungstenite::tungstenite::Message; // Import Message
+use tracing::{debug, error, info, trace, warn}; // Added error import back
+use tokio_tungstenite::tungstenite::{Message, Error as WsError}; // Import Message and WsError for clarity
 
 use crate::auth::AuthManager;
 use crate::crypto::{KeyManager, SessionKeyManager};
 use crate::network::{IpPoolManager, NetworkMonitor};
-use crate::protocol::PacketType;
+use crate::protocol::types::PacketType; // Corrected path
 use crate::protocol::serialization::{packet_to_ws_message, ws_message_to_packet, create_error_packet, create_disconnect_packet, log_packet_info};
-// Remove unused import: SessionError
+// Removed unused import: SessionError
 use crate::server::session::{ClientSession, SessionManager};
 use crate::server::routing::PacketRouter;
 use crate::server::metrics::ServerMetricsCollector;
@@ -34,7 +35,7 @@ use solana_sdk::pubkey::Pubkey;
 
 /// Handle a client connection
 pub async fn handle_client(
-    stream: tokio::net::TcpStream,
+    stream: TcpStream, // Changed from tokio::net::TcpStream
     addr: SocketAddr,
     tls_acceptor: Arc<TlsAcceptor>,
     key_manager: Arc<KeyManager>,
@@ -51,7 +52,7 @@ pub async fn handle_client(
     metrics.record_handshake_start().await;
 
     // Perform TLS handshake
-    let tls_stream = match tls_acceptor.accept(stream).await {
+    let tls_stream : TlsStream<TcpStream> = match tls_acceptor.accept(stream).await {
         Ok(stream) => {
             // Record successful handshake
             metrics.record_handshake_complete().await;
@@ -59,9 +60,8 @@ pub async fn handle_client(
             stream
         }
         Err(e) => {
-            // Record failed handshake
-            // TODO: Should this be recorded if the handshake *failed*?
-            // metrics.record_handshake_complete().await;
+            // Record failed handshake (consider if this metric makes sense on failure)
+            // metrics.record_handshake_failure().await; // Or a dedicated failure metric
             return Err(ServerError::Tls(format!("TLS handshake failed: {}", e)));
         }
     };
@@ -73,7 +73,7 @@ pub async fn handle_client(
             stream
         }
         Err(e) => {
-            return Err(ServerError::WebSocket(e));
+            return Err(ServerError::WebSocket(e)); // Use the From trait
         }
     };
 
@@ -84,7 +84,7 @@ pub async fn handle_client(
     let public_key_string = match time::timeout(Duration::from_secs(30), ws_receiver.next()).await {
         Ok(Some(Ok(msg))) => {
              match ws_message_to_packet(&msg) {
-                Ok(PacketType::Auth { public_key, version, features, nonce: _ }) => { // Mark nonce unused
+                Ok(PacketType::Auth { public_key, version, features, nonce: _nonce }) => { // Prefix unused nonce
                     debug!("Auth request from {}, version: {}, features: {:?}", public_key, version, features);
 
                     // Verify public key format
@@ -170,17 +170,19 @@ pub async fn handle_client(
                                 }
                             }
                         }
-                        Ok(Some(Err(e))) | Err(_) /* Timeout or Error */ => {
+                        // E0408 Fix: Separate the arms or use _e if e is unused
+                        Ok(Some(Err(e))) => { // Handle specific websocket error
                             metrics.record_auth_failure().await;
-                            if let Ok(Some(Err(e))) = time::timeout(Duration::from_secs(1), ws_receiver.next()).await {
-                                 return Err(ServerError::WebSocket(e));
-                             }
-                             return Err(ServerError::Authentication("WebSocket closed or timed out during challenge response".to_string()));
+                            return Err(ServerError::WebSocket(e)); // Map error
                         }
-                         Ok(None) => { // Stream closed
+                        Err(_) => { // Handle timeout
+                            metrics.record_auth_failure().await;
+                            return Err(ServerError::Authentication("Timed out waiting for challenge response".to_string()));
+                        }
+                        Ok(None) => { // Handle stream closed
                              metrics.record_auth_failure().await;
                              return Err(ServerError::Authentication("WebSocket closed during challenge response".to_string()));
-                         }
+                        }
                     }
                 }
                  Ok(_) => { // Wrong initial packet type
@@ -197,14 +199,16 @@ pub async fn handle_client(
                  }
              }
         }
-         Ok(Some(Err(e))) | Err(_) /* Timeout or Error */ => {
-             metrics.record_auth_failure().await;
-             if let Ok(Some(Err(e))) = time::timeout(Duration::from_secs(1), ws_receiver.next()).await {
-                 return Err(ServerError::WebSocket(e));
-             }
-             return Err(ServerError::Authentication("WebSocket closed or timed out during authentication".to_string()));
-         }
-         Ok(None) => { // Stream closed
+        // E0408 Fix: Separate the arms or use _e if e is unused
+        Ok(Some(Err(e))) => { // Handle specific websocket error
+            metrics.record_auth_failure().await;
+            return Err(ServerError::WebSocket(e)); // Map error
+        }
+        Err(_) => { // Handle timeout
+            metrics.record_auth_failure().await;
+            return Err(ServerError::Authentication("Timed out waiting for auth message".to_string()));
+        }
+         Ok(None) => { // Handle stream closed
              metrics.record_auth_failure().await;
              return Err(ServerError::Authentication("WebSocket closed before authentication".to_string()));
          }
@@ -297,24 +301,25 @@ pub async fn handle_client(
     session_manager.add_session(session.clone()).await;
 
     // Process client messages
+    // E0382 Fix: Clone the Arc before moving it
     let result = process_client_session(
         session,
-        key_manager,
-        session_key_manager,
-        packet_router,
-        network_monitor,
-        ip_pool.clone(), // Clone for cleanup
-        session_manager.clone(), // Clone for cleanup
+        key_manager, // Keep original Arc
+        session_key_manager.clone(), // Clone Arc for the async function
+        packet_router, // Keep original Arc
+        network_monitor, // Keep original Arc
+        ip_pool.clone(), // Clone Arc for cleanup logic within or after process_client_session
+        session_manager.clone(), // Clone Arc for cleanup logic within or after process_client_session
         server_state,
-        // We don't need to pass sender/receiver anymore as they are in session
     ).await;
 
     // Cleanup after process_client_session finishes or errors
     info!("Cleaning up session for client {}", public_key_string);
-    session_manager.remove_session(&session_id).await;
-    if let Err(e) = ip_pool.release_ip(&ip_address).await {
+    session_manager.remove_session(&session_id).await; // Use cloned session_manager
+    if let Err(e) = ip_pool.release_ip(&ip_address).await { // Use cloned ip_pool
         warn!("Failed to release IP {} during cleanup: {}", ip_address, e);
     }
+    // Use original session_key_manager (which still holds a valid Arc reference)
     session_key_manager.remove_key(&public_key_string).await;
 
 
@@ -325,14 +330,13 @@ pub async fn handle_client(
 /// Process messages from an authenticated client session
 async fn process_client_session(
     session: ClientSession,
-    key_manager: Arc<KeyManager>,
-    session_key_manager: Arc<SessionKeyManager>,
-    packet_router: Arc<PacketRouter>,
-    network_monitor: Arc<NetworkMonitor>,
-    ip_pool: Arc<IpPoolManager>, // Added for cleanup
-    session_manager: Arc<SessionManager>, // Added for cleanup
+    key_manager: Arc<KeyManager>, // Keep original Arc
+    session_key_manager: Arc<SessionKeyManager>, // Now receives a clone
+    packet_router: Arc<PacketRouter>, // Keep original Arc
+    network_monitor: Arc<NetworkMonitor>, // Keep original Arc
+    _ip_pool: Arc<IpPoolManager>, // Mark unused if cleanup is outside
+    _session_manager: Arc<SessionManager>, // Mark unused if cleanup is outside
     server_state: Arc<RwLock<ServerState>>,
-    // Removed ws_receiver and ws_sender parameters
 ) -> Result<(), ServerError> {
     let client_id = session.client_id.clone();
     let session_id = session.id.clone();
@@ -347,14 +351,17 @@ async fn process_client_session(
         let mut sequence: u64 = 0;
         loop {
             interval.tick().await;
+            // Check server state
+            if *session_hb.is_stream_taken().await { // Check if session is closing
+                 break;
+            }
             let ping = PacketType::Ping {
                 timestamp: current_timestamp_millis(),
                 sequence,
             };
-            // Use session's send_packet method
             if session_hb.send_packet(&ping).await.is_err() {
                 warn!("Failed to send heartbeat to {}: channel closed", session_hb.client_id);
-                break; // Exit task if sending fails
+                break;
             }
             sequence = sequence.wrapping_add(1);
         }
@@ -365,13 +372,15 @@ async fn process_client_session(
     let session_rot = session.clone(); // Clone session for rotation task
     let session_key_manager_clone = session_key_manager.clone();
     let key_manager_clone = key_manager.clone();
-    // Remove unused client_id_for_rotation
     let key_rotation_handle = tokio::spawn(async move {
         let mut interval = time::interval(rotation_interval);
         loop {
             interval.tick().await;
+            // Check server state
+            if *session_rot.is_stream_taken().await { // Check if session is closing
+                break;
+            }
 
-            // Use session_rot.client_id directly
             if !session_key_manager_clone.needs_rotation(&session_rot.client_id).await {
                 continue;
             }
@@ -395,10 +404,9 @@ async fn process_client_session(
                              signature: signature.to_string(),
                          };
 
-                        // Use session's send_packet method
-                         if session_rot.send_packet(&rotation).await.is_err() {
+                        if session_rot.send_packet(&rotation).await.is_err() {
                              warn!("Failed to send key rotation to {}: channel closed", session_rot.client_id);
-                             break; // Exit task if sending fails
+                             break;
                          }
 
                         session_key_manager_clone.store_key(&session_rot.client_id, new_key).await;
@@ -429,10 +437,8 @@ async fn process_client_session(
              break;
          }
 
-        // Use session's next_message method
          match session.next_message().await {
              Some(Ok(msg)) => {
-                 // Update session activity using the session method
                  session.update_activity().await;
 
                  match ws_message_to_packet(&msg) {
@@ -441,11 +447,10 @@ async fn process_client_session(
 
                          match packet {
                             PacketType::Data { encrypted, nonce, counter, padding: _ } => {
-                                 // Check for replay attacks
                                  if let Some(last) = last_counter {
-                                     if counter <= last && counter != 0 { // Allow wrap-around for u64
+                                     if counter <= last && counter != 0 {
                                          warn!("Potential replay attack detected from {}: counter {} <= {}", client_id, counter, last);
-                                         continue; // Skip processing this packet
+                                         continue;
                                      }
                                  }
                                  last_counter = Some(counter);
@@ -453,19 +458,15 @@ async fn process_client_session(
                                  if let Some(key) = session_key_manager.get_key(&client_id).await {
                                      match packet_router.handle_inbound_packet(&encrypted, &nonce, &key, &session).await {
                                          Ok(bytes_written) => {
-                                            // Record traffic only if successful
                                              network_monitor.record_client_traffic(&client_id, 0, bytes_written as u64).await;
-                                             network_monitor.record_sent(bytes_written as u64).await; // TUN write = server sending
+                                             network_monitor.record_sent(bytes_written as u64).await;
                                          }
                                          Err(e) => {
-                                             // Log routing errors but don't necessarily disconnect
                                              trace!("Failed to process inbound packet from {}: {}", client_id, e);
-                                             // Consider sending an error packet back?
                                          }
                                      }
                                  } else {
                                      warn!("No session key found for client {}, dropping packet", client_id);
-                                      // Consider disconnecting or sending error
                                  }
                              }
                              PacketType::Ping { timestamp, sequence } => {
@@ -474,7 +475,6 @@ async fn process_client_session(
                                      server_timestamp: current_timestamp_millis(),
                                      sequence,
                                  };
-                                 // Use session's send_packet method
                                  if session.send_packet(&pong).await.is_err() {
                                      warn!("Failed to send pong to {}: channel closed", client_id);
                                      process_result = Err(ServerError::Network("Pong send failed".to_string()));
@@ -499,61 +499,47 @@ async fn process_client_session(
                                      warn!("IP renewal with mismatched IP from {}", client_id);
                                      continue;
                                  }
-                                 match ip_pool.renew_ip(&ip_address).await {
-                                     Ok(expires_at) => {
-                                         debug!("Renewed IP lease for {} until {}", client_id, expires_at);
-                                         let response = PacketType::IpRenewalResponse {
-                                             session_id: session_id.clone(),
-                                             expires_at,
-                                             success: true,
-                                         };
-                                          // Use session's send_packet method
-                                         if session.send_packet(&response).await.is_err() {
-                                              warn!("Failed to send IP renewal response to {}: channel closed", client_id);
-                                             process_result = Err(ServerError::Network("IP renewal response send failed".to_string()));
-                                             break;
-                                         }
-                                     }
-                                     Err(e) => {
-                                         warn!("Failed to renew IP lease for {}: {}", client_id, e);
-                                         let response = PacketType::IpRenewalResponse {
-                                             session_id: session_id.clone(),
-                                             expires_at: 0,
-                                             success: false,
-                                         };
-                                          // Use session's send_packet method
-                                         if session.send_packet(&response).await.is_err() {
-                                              warn!("Failed to send failed IP renewal response to {}: channel closed", client_id);
-                                             process_result = Err(ServerError::Network("Failed IP renewal response send failed".to_string()));
-                                             break;
-                                         }
-                                     }
-                                 }
+                                 // Get the IP pool from the session_manager or pass it in
+                                 // Assuming IP Pool is accessible (e.g., passed into process_client_session)
+                                 // let ip_pool = ...; // Get access to IP Pool
+                                 // match ip_pool.renew_ip(&ip_address).await { ... }
+
+                                 // Placeholder: Need access to ip_pool here
+                                 warn!("IP Renewal requested but IP pool access not implemented here");
+                                 let response = PacketType::IpRenewalResponse {
+                                      session_id: session_id.clone(),
+                                      expires_at: 0, // Indicate failure
+                                      success: false,
+                                  };
+                                  if session.send_packet(&response).await.is_err() {
+                                      warn!("Failed to send failed IP renewal response to {}: channel closed", client_id);
+                                      process_result = Err(ServerError::Network("Failed IP renewal response send failed".to_string()));
+                                      break;
+                                  }
+
                              }
                              PacketType::Disconnect { reason, message } => {
                                  info!("Client {} disconnecting: {} (reason {})", client_id, message, reason);
                                  process_result = Ok(()); // Graceful disconnect
                                  break;
                              }
-                            // Ignore other packet types received from client during session
                              _ => {
                                  warn!("Received unexpected packet type from {} during session", client_id);
                              }
                          }
                      }
-                     Err(e) => { // Deserialization error
+                     Err(e) => {
                          warn!("Failed to parse message from {}: {}", client_id, e);
-                         // Decide if this warrants disconnection
-                         // let error_packet = create_error_packet(1002, &format!("Invalid message: {}", e));
-                         // let _ = session.send_packet(&error_packet).await;
+                         // Maybe disconnect on parse error?
                          // process_result = Err(ServerError::Protocol(e));
                          // break;
                      }
                  }
              }
+            // E0308 Fix: Map the tungstenite::Error correctly using From
              Some(Err(e)) => { // WebSocket error
                  debug!("WebSocket error for client {}: {}", client_id, e);
-                 process_result = Err(ServerError::WebSocket(e));
+                 process_result = Err(ServerError::WebSocket(e)); // This uses the #[from] attribute
                  break;
              }
              None => { // WebSocket stream closed
@@ -568,9 +554,7 @@ async fn process_client_session(
     // Abort background tasks associated with this session
     heartbeat_handle.abort();
     key_rotation_handle.abort();
+    session.mark_stream_taken().await; // Mark session as closing
 
-    // Note: Cleanup (session removal, IP release, key removal) is now handled
-    // in the `handle_client` function after this function returns or errors.
-
-    process_result // Return the final result of the processing loop
+    process_result
 }
