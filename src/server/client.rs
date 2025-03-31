@@ -631,3 +631,4 @@ async fn process_client_session(
     session_key_manager.remove_key(&client_id).await;
     
     Ok(())
+}
