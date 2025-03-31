@@ -16,7 +16,6 @@ use tokio::net::TcpStream;
 // Removed 'error' import
 use tracing::{debug, info, trace, warn};
 // Removed unused module import
-// use tokio_tungstenite::tungstenite; // Corrected line 19 (Removed entire import)
 
 use crate::auth::AuthManager;
 use crate::crypto::{KeyManager, SessionKeyManager};
@@ -420,8 +419,6 @@ async fn process_client_session(
 
 
     let mut last_counter: Option<u64> = None;
-    // Remove unused process_result initialization // Corrected line 423
-    // let mut process_result: Result<(), ServerError> = Ok(());
 
     // Main message processing loop
      loop {
@@ -430,9 +427,7 @@ async fn process_client_session(
          if current_state != ServerState::Running {
              let disconnect = create_disconnect_packet(2, "Server shutting down");
              let _ = session.send_packet(&disconnect).await; // Attempt to notify client
-             // Directly return error
              return Err(ServerError::Internal("Server shutting down".to_string()));
-             // break; // No longer needed
          }
 
          match session.next_message().await {
@@ -475,9 +470,7 @@ async fn process_client_session(
                                  };
                                  if session.send_packet(&pong).await.is_err() {
                                      warn!("Failed to send pong to {}: channel closed", client_id);
-                                     // Directly return error
                                      return Err(ServerError::Network("Pong send failed".to_string()));
-                                     // break; // No longer needed
                                  }
                              }
                              PacketType::Pong { echo_timestamp, server_timestamp: _, sequence: _ } => {
@@ -512,15 +505,12 @@ async fn process_client_session(
                                   };
                                   if session.send_packet(&response).await.is_err() {
                                       warn!("Failed to send failed IP renewal response to {}: channel closed", client_id);
-                                      // Directly return error
                                       return Err(ServerError::Network("Failed IP renewal response send failed".to_string()));
-                                      // break; // No longer needed
                                   }
 
                              }
                              PacketType::Disconnect { reason, message } => {
                                  info!("Client {} disconnecting: {} (reason {})", client_id, message, reason);
-                                 // process_result = Ok(()); // Graceful disconnect // No longer needed
                                  break; // Break loop for graceful disconnect
                              }
                              _ => {
@@ -531,20 +521,18 @@ async fn process_client_session(
                      Err(e) => {
                          warn!("Failed to parse message from {}: {}", client_id, e);
                          // Maybe disconnect on parse error?
-                         // process_result = Err(ServerError::Protocol(e));
-                         // break;
+                         // return Err(ServerError::Protocol(e));
                      }
                  }
              }
              Some(Err(e)) => { // WebSocket error
                  debug!("WebSocket error for client {}: {}", client_id, e);
-                 // Correctly handle the error assignment and break
-                 return Err(ServerError::WebSocket(e)); // Directly return error
+                 // Use explicit From conversion // Corrected line 542
+                 return Err(ServerError::from(e));
                  // break; // No longer needed
              }
              None => { // WebSocket stream closed
                  debug!("WebSocket connection closed for client {}", client_id);
-                 // process_result = Ok(()); // Normal closure // No longer needed
                  break; // Break loop for normal closure
              }
          }
@@ -556,6 +544,5 @@ async fn process_client_session(
     key_rotation_handle.abort();
     session.mark_stream_taken().await; // Mark session as closing
 
-    Ok(()) // Return Ok(()) if loop finishes normally (e.g., disconnect packet or stream close)
-    // process_result // No longer needed
+    Ok(()) // Return Ok(()) if loop finishes normally
 }
