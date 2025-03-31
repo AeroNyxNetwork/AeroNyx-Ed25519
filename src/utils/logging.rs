@@ -6,11 +6,11 @@
 
 use std::io;
 use std::path::Path;
-// Import Layer trait explicitly
-use tracing_subscriber::{fmt, EnvFilter, layer::SubscriberExt, util::SubscriberInitExt, Layer as TracingLayer, filter::LevelFilter};
+// Import Layer trait explicitly and EnvFilter via filter module
+use tracing_subscriber::{fmt, filter::EnvFilter, layer::SubscriberExt, util::SubscriberInitExt, Layer as TracingLayer, filter::LevelFilter}; // Corrected line 10
 // Removed unused NonBlocking import (type name not directly used)
 use tracing_appender::rolling;
-use tracing_subscriber::fmt::writer::MakeWriterExt; // Keep for .with_max_level on layer
+// Removed unused MakeWriterExt import // Corrected line 13
 
 
 // Keep the _guard return type for file logging to ensure flushing
