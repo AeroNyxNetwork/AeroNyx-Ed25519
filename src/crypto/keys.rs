@@ -276,19 +276,22 @@ impl KeyManager {
     pub async fn rotate_keypair(&self) -> Result<(), KeyError> {
         let new_keypair = Keypair::new();
         
+        // Save to disk before moving the keypair
+        Self::save_keypair(&new_keypair, &self.key_path)?;
+        
+        // Get the new public key for logging before moving the keypair
+        let new_pubkey = new_keypair.pubkey();
+        
         // Update the keypair
         {
             let mut keypair = self.keypair.lock().await;
             *keypair = new_keypair;
         }
         
-        // Save to disk
-        Self::save_keypair(&new_keypair, &self.key_path)?;
-        
         // Clear the secret cache
         self.secret_cache.clear().await;
         
-        info!("Server keypair rotated, new public key: {}", new_keypair.pubkey());
+        info!("Server keypair rotated, new public key: {}", new_pubkey);
         Ok(())
     }
     
