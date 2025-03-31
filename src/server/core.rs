@@ -28,6 +28,7 @@ use crate::server::metrics::ServerMetricsCollector;
 use crate::server::client::handle_client;
 use crate::server::packet::process_tun_packets;
 use crate::utils::security::RateLimiter;
+use crate::auth::challenge::ChallengeError;
 
 /// Error type for VPN server operations
 #[derive(Debug, thiserror::Error)]
