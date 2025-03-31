@@ -679,7 +679,8 @@ impl VpnServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    // Removed unused PathBuf import
+    // use std::path::PathBuf; // Corrected line 682
 
     #[tokio::test]
     #[ignore] // Still requires cert files
