@@ -5,20 +5,19 @@
 //! session setup, and message processing.
 
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use futures::{SinkExt, StreamExt};
+use futures::SinkExt;
 use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::auth::AuthManager;
 use crate::crypto::{KeyManager, SessionKeyManager};
 use crate::network::{IpPoolManager, NetworkMonitor};
-use crate::protocol::{PacketType, MessageError};
+use crate::protocol::PacketType;
 use crate::protocol::serialization::{packet_to_ws_message, ws_message_to_packet, create_error_packet, create_disconnect_packet, log_packet_info};
 use crate::server::session::{ClientSession, SessionManager};
 use crate::server::routing::PacketRouter;
@@ -26,6 +25,7 @@ use crate::server::metrics::ServerMetricsCollector;
 use crate::server::core::{ServerError, ServerState};
 use crate::utils::{current_timestamp_millis, random_string};
 use crate::utils::security::StringValidator;
+use solana_sdk::pubkey::Pubkey;
 
 /// Handle a client connection
 pub async fn handle_client(
@@ -108,10 +108,10 @@ pub async fn handle_client(
                     
                     // Create challenge packet
                     let challenge_packet = PacketType::Challenge {
-                        data: challenge.data.clone(),
+                        data: challenge.1.clone(),
                         server_key: server_pubkey,
                         expires_at: current_timestamp_millis() + 30000, // 30 seconds
-                        id: challenge.id.clone(),
+                        id: challenge.0.clone(),
                     };
                     
                     // Send challenge
@@ -247,7 +247,9 @@ pub async fn handle_client(
     session_key_manager.store_key(&public_key_string, session_key.clone()).await;
     
     // Get shared secret for encrypting session key
-    let shared_secret = match key_manager.get_shared_secret(&public_key_string).await {
+    let pubkey = Pubkey::from_str(&public_key_string)
+        .map_err(|e| ServerError::KeyError(format!("Invalid public key: {}", e)))?;
+    let shared_secret = match key_manager.get_shared_secret(&pubkey).await {
         Ok(secret) => secret,
         Err(e) => {
             let error = create_error_packet(1006, &format!("Failed to derive shared secret: {}", e));
@@ -349,11 +351,12 @@ async fn process_client_session(
     let client_id = session.client_id.clone();
     let session_id = session.id.clone();
     let ip_address = session.ip_address.clone();
-    let address = session.address;
+    let _address = session.address;
     
     // Setup heartbeat task
     let heartbeat_interval = Duration::from_secs(30);
     let session_clone = session.clone();
+    let client_id_for_heartbeat = client_id.clone();
     
     // Start heartbeat task
     let heartbeat_handle = tokio::spawn(async move {
@@ -371,7 +374,7 @@ async fn process_client_session(
             
             // Send ping
             if let Err(e) = session_clone.send_packet(&ping).await {
-                warn!("Failed to send heartbeat to {}: {}", client_id, e);
+                warn!("Failed to send heartbeat to {}: {}", client_id_for_heartbeat, e);
                 break;
             }
             
@@ -384,7 +387,7 @@ async fn process_client_session(
     let session_clone = session.clone();
     let session_key_manager_clone = session_key_manager.clone();
     let key_manager_clone = key_manager.clone();
-    let client_id_clone = client_id.clone();
+    let client_id_for_rotation = client_id.clone();
     
     // Start key rotation task
     let key_rotation_handle = tokio::spawn(async move {
@@ -394,17 +397,17 @@ async fn process_client_session(
             interval.tick().await;
             
             // Skip if not needed
-            if !session_key_manager_clone.needs_rotation(&client_id_clone).await {
+            if !session_key_manager_clone.needs_rotation(&client_id_for_rotation).await {
                 continue;
             }
             
-            debug!("Rotating session key for client {}", client_id_clone);
+            debug!("Rotating session key for client {}", client_id_for_rotation);
             
             // Generate new key
             let new_key = SessionKeyManager::generate_key();
             
             // Get current session key
-            if let Some(current_key) = session_key_manager_clone.get_key(&client_id_clone).await {
+            if let Some(current_key) = session_key_manager_clone.get_key(&client_id_for_rotation).await {
                 // Encrypt the new key with the current key
                 match crate::crypto::encryption::encrypt_chacha20(&new_key, &current_key, None) {
                     Ok((encrypted_key, nonce)) => {
@@ -428,13 +431,13 @@ async fn process_client_session(
                         
                         // Send key rotation
                         if let Err(e) = session_clone.send_packet(&rotation).await {
-                            warn!("Failed to send key rotation to {}: {}", client_id_clone, e);
+                            warn!("Failed to send key rotation to {}: {}", client_id_for_rotation, e);
                             break;
                         }
                         
                         // Update the key
-                        session_key_manager_clone.store_key(&client_id_clone, new_key).await;
-                        debug!("Session key rotated for client {}", client_id_clone);
+                        session_key_manager_clone.store_key(&client_id_for_rotation, new_key).await;
+                        debug!("Session key rotated for client {}", client_id_for_rotation);
                     }
                     Err(e) => {
                         warn!("Failed to encrypt new session key: {}", e);
