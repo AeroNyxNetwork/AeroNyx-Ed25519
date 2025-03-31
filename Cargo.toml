@@ -22,6 +22,9 @@ tokio-tungstenite = { version = "0.19", features = ["rustls-tls-webpki-roots"] }
 tun = { version = "0.5", features = ["async"] }
 socket2 = "0.5"
 
+tracing-appender = "0.1"
+webpki = "0.22"
+
 # Cryptography
 solana-sdk = "=1.14.18"
 ed25519-dalek = "1.0"
