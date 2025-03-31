@@ -230,6 +230,8 @@ impl AuthManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    // Import the Signer trait // Corrected E0599
+    use solana_sdk::signer::Signer;
 
     #[tokio::test]
     async fn test_auth_manager() {
@@ -257,9 +259,11 @@ mod tests {
 
         // Create test client's keypair
         let client_keypair = solana_sdk::signature::Keypair::new();
+        // Use Signer trait method // Corrected E0599
         let client_pubkey = client_keypair.pubkey().to_string();
 
         // Sign the challenge
+        // Use Signer trait method // Corrected E0599
         let signature = client_keypair.sign_message(&challenge_data).to_string();
 
         // Verify challenge
@@ -291,6 +295,7 @@ mod tests {
         let (challenge_id, challenge_data) = auth_manager.generate_challenge(client_addr_str).await.unwrap();
 
         // Sign the new challenge
+        // Use Signer trait method // Corrected E0599
         let signature = client_keypair.sign_message(&challenge_data).to_string();
 
         // Verify challenge again
