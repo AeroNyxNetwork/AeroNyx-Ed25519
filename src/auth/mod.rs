@@ -10,5 +10,6 @@ pub mod manager;
 
 // Re-export commonly used items
 pub use acl::AccessControlList;
-// Removed unused Challenge, ChallengeManager exports (assuming they are only used internally or via AuthManager)
+// Removed unused re-exports
+// pub use challenge::{Challenge, ChallengeManager};
 pub use manager::AuthManager;
