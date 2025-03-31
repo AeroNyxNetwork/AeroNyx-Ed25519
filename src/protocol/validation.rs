@@ -300,16 +300,17 @@ pub fn validate_message(packet: &PacketType) -> Result<(), MessageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_validate_auth() {
         // For test purposes, we'll mock the validation function rather than using real Solana keys
         // This ensures the tests can run without relying on the actual Solana crate behavior
-        
+
         // We'll temporarily override the is_valid_solana_pubkey function for testing
-        let orig_validate = StringValidator::is_valid_solana_pubkey;
+        // Prefix unused variable // Corrected unused variable
+        let _orig_validate = StringValidator::is_valid_solana_pubkey; // Corrected line 310
         let test_key = "AiUYgGCmQxtYbboLnNer8nY3Lnkarn3awthiCgqMkwkp";
-        
+
         // Valid auth message
         let result = validate_auth(
             test_key,
@@ -317,13 +318,13 @@ mod tests {
             &vec!["chacha20poly1305".to_string()],
             "randomnonce123456",
         );
-        
+
         // This might fail if our test key doesn't pass validation
         // In a real test you'd use a known good key
         if result.is_err() {
             println!("Note: Test key validation might have failed, this is expected in test environment");
         }
-        
+
         // Invalid version
         let result = validate_auth(
             test_key,
@@ -332,7 +333,7 @@ mod tests {
             "randomnonce123456",
         );
         assert!(result.is_err());
-        
+
         // Empty features
         let result = validate_auth(
             test_key,
@@ -341,7 +342,7 @@ mod tests {
             "randomnonce123456",
         );
         assert!(result.is_err());
-        
+
         // Invalid nonce (too short)
         let result = validate_auth(
             test_key,
@@ -351,27 +352,27 @@ mod tests {
         );
         assert!(result.is_err());
     }
-    
+
     #[test]
     fn test_validate_data() {
         // Valid data
         let encrypted = vec![1, 2, 3, 4];
         let nonce = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let counter = 1;
-        
+
         let result = validate_data(&encrypted, &nonce, counter);
         assert!(result.is_ok());
-        
+
         // Empty encrypted data
         let result = validate_data(&[], &nonce, counter);
         assert!(result.is_err());
-        
+
         // Invalid nonce length
         let invalid_nonce = vec![1, 2, 3];
         let result = validate_data(&encrypted, &invalid_nonce, counter);
         assert!(result.is_err());
     }
-    
+
     #[test]
     fn test_validate_message() {
         // Test Data message
@@ -381,10 +382,10 @@ mod tests {
             counter: 1,
             padding: None,
         };
-        
+
         let result = validate_message(&data);
         assert!(result.is_ok());
-        
+
         // Test Data message with invalid nonce
         let data = PacketType::Data {
             encrypted: vec![1, 2, 3, 4],
@@ -392,25 +393,25 @@ mod tests {
             counter: 1,
             padding: None,
         };
-        
+
         let result = validate_message(&data);
         assert!(result.is_err());
-        
+
         // Test Ping message with zero timestamp
         let ping = PacketType::Ping {
             timestamp: 0, // Invalid
             sequence: 1,
         };
-        
+
         let result = validate_message(&ping);
         assert!(result.is_err());
-        
+
         // Test valid Ping message
         let ping = PacketType::Ping {
             timestamp: 123456789,
             sequence: 42,
         };
-        
+
         let result = validate_message(&ping);
         assert!(result.is_ok());
     }
