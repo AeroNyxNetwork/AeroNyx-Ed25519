@@ -481,7 +481,7 @@ impl VpnServer {
         {
             let mut handles = self.task_handles.lock().await;
             // Store the original handle, avoiding the need to clone it
-            handles.push(tokio::task::JoinHandle::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 if let Err(e) = server_handle.await {
                     error!("Server error: {:?}", e);
                 }
