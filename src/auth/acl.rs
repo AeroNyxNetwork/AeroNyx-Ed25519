@@ -81,7 +81,10 @@ impl AccessControlList {
         }
 
         // Apply default policy
-        self.default_policy.as_str() == "allow"
+        match self.default_policy.as_str() {
+            "allow" => true,
+            _ => false,
+        }
     }
 
     /// Get an access control entry
@@ -94,15 +97,18 @@ impl AccessControlList {
     /// Add or update an access control entry
     pub fn add_entry(&mut self, entry: AccessControlEntry) {
         // Check if entry already exists
-        if let Some(existing) = self.entries.iter_mut().find(|e| e.public_key == entry.public_key) {
-             *existing = entry;
-        } else {
-            // Add new entry
-            self.entries.push(entry);
+        for existing in &mut self.entries {
+            if existing.public_key == entry.public_key {
+                *existing = entry;
+                self.updated_at = utils::current_timestamp_millis();
+                return;
+            }
         }
+
+        // Add new entry
+        self.entries.push(entry);
         self.updated_at = utils::current_timestamp_millis();
     }
-
 
     /// Remove an access control entry
     pub fn remove_entry(&mut self, public_key: &str) -> Result<(), AclError> {
