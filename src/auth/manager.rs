@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use solana_sdk::pubkey::Pubkey;
@@ -140,24 +141,25 @@ impl AuthManager {
             .map_err(|_| AuthError::InvalidFormat(format!("Invalid address format: {}", client_addr)))?;
         
         // Verify the challenge with the challenge manager
-        self.challenge_manager.verify_challenge(
+        let verify_result = self.challenge_manager.verify_challenge(
             challenge_id,
             socket_addr,
             signature,
             public_key,
-        ).await.map_err(|e| match e {
-            ChallengeError::Expired => {
-                // Record failed attempt on expiration
-                self.record_failed_attempt(client_addr).await;
-                AuthError::Challenge(e)
-            },
-            ChallengeError::SignatureVerificationFailed => {
+        ).await;
+        
+        // Handle the result separately from the async operation
+        match verify_result {
+            Err(ChallengeError::SignatureVerificationFailed) => {
                 // Record failed attempt on signature verification failure
                 self.record_failed_attempt(client_addr).await;
-                AuthError::Challenge(e)
+                return Err(AuthError::Challenge(ChallengeError::SignatureVerificationFailed));
             },
-            _ => AuthError::Challenge(e),
-        })?;
+            Err(e) => {
+                return Err(AuthError::Challenge(e));
+            },
+            Ok(_) => {}
+        }
         
         // Reset failed attempts on successful verification
         self.reset_failed_attempts(client_addr).await;
@@ -221,8 +223,6 @@ impl AuthManager {
         failed_attempts.clear();
     }
 }
-
-use std::str::FromStr; // Add this at the top of the file
 
 #[cfg(test)]
 mod tests {
