@@ -74,12 +74,14 @@ impl PacketRouter {
     pub fn process_packet<'a>(&self, packet: &'a [u8]) -> Option<(String, Vec<u8>)> {
         // Check minimum IPv4 header size
         if packet.len() < 20 {
+            trace!("Packet too small for IPv4: {} bytes", packet.len());
             return None;
         }
         
         // Check if it's an IPv4 packet (version field in the first 4 bits)
         let version = packet[0] >> 4;
         if version != 4 {
+            trace!("Not an IPv4 packet: version {}", version);
             return None;
         }
         
@@ -88,6 +90,8 @@ impl PacketRouter {
             "{}.{}.{}.{}",
             packet[16], packet[17], packet[18], packet[19]
         );
+        
+        trace!("Processed packet for destination IP: {}", dest_ip);
         
         // Return destination IP and the full packet
         Some((dest_ip, packet.to_vec()))
@@ -100,6 +104,14 @@ impl PacketRouter {
         session_key: &[u8],
         session: &ClientSession,
     ) -> Result<(), RoutingError> {
+        // Check packet size
+        if packet.len() > self.max_packet_size {
+            return Err(RoutingError::InvalidPacket(format!(
+                "Packet size {} exceeds maximum {}", 
+                packet.len(), self.max_packet_size
+            )));
+        }
+        
         // Apply padding if enabled
         let packet_data = if self.enable_padding && self.should_add_padding() {
             self.add_padding(packet)
@@ -146,6 +158,14 @@ impl PacketRouter {
         // Decrypt the packet
         let decrypted = decrypt_packet(encrypted, session_key, nonce)
             .map_err(|e| RoutingError::Decryption(e.to_string()))?;
+        
+        // Check packet size
+        if decrypted.len() > self.max_packet_size {
+            return Err(RoutingError::InvalidPacket(format!(
+                "Decrypted packet size {} exceeds maximum {}", 
+                decrypted.len(), self.max_packet_size
+            )));
+        }
         
         // Check for attack patterns
         if let Some(reason) = detect_attack_patterns(&decrypted) {
@@ -219,7 +239,10 @@ impl PacketRouter {
         
         // Validate packet length
         if packet.len() < 2 + padding_len {
-            return Err(RoutingError::InvalidPacket("Invalid padding length".to_string()));
+            return Err(RoutingError::InvalidPacket(format!(
+                "Invalid padding length: {} exceeds packet size {}", 
+                padding_len, packet.len() - 2
+            )));
         }
         
         // Extract the actual data (between header and padding)
@@ -234,16 +257,24 @@ impl PacketRouter {
 mod tests {
     use super::*;
     use tokio_tungstenite::tungstenite::Message;
-    use crate::server::session::ClientSession;
+    use crate::server::session::{ClientSession, SessionError};
+    use std::net::SocketAddr;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_rustls::server::TlsStream;
+    use tokio::net::TcpStream;
+    use std::str::FromStr;
     
-    // Mock implementation of ClientSession for testing
+    // Mock implementation for tests
+    #[derive(Clone)]
     struct MockClientSession {
-        client_id: String,
-        ip_address: String,
+        pub id: String,
+        pub client_id: String,
+        pub ip_address: String,
+        pub address: SocketAddr,
     }
     
     impl MockClientSession {
-        async fn send_packet(&self, _packet: &PacketType) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+        async fn send_packet(&self, _packet: &PacketType) -> Result<(), crate::server::core::ServerError> {
             Ok(())
         }
     }
@@ -310,5 +341,25 @@ mod tests {
         
         // Check that unpadded data matches original
         assert_eq!(data.to_vec(), unpadded);
+    }
+    
+    #[test]
+    fn test_invalid_padding() {
+        let router = PacketRouter::new(2048, true);
+        
+        // Create invalid packet with padding length larger than data
+        let mut invalid_packet = vec![0u8; 10];
+        // Set padding length to 20 (larger than available data)
+        invalid_packet[0] = 0;
+        invalid_packet[1] = 20;
+        
+        let result = router.remove_padding(&invalid_packet);
+        assert!(result.is_err());
+        
+        if let Err(RoutingError::InvalidPacket(msg)) = result {
+            assert!(msg.contains("Invalid padding length"));
+        } else {
+            panic!("Expected InvalidPacket error");
+        }
     }
 }
