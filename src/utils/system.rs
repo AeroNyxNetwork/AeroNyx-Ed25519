@@ -32,7 +32,7 @@ pub fn is_root() -> bool {
     }
 }
 
-/// Get system memory information
+/// Get system memory information with better error handling
 pub fn get_system_memory() -> io::Result<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
@@ -87,14 +87,16 @@ pub fn get_system_memory() -> io::Result<(u64, u64)> {
     
     #[cfg(not(target_os = "linux"))]
     {
-        // For other platforms, just return a placeholder
-        // Real implementation would use platform-specific APIs
+        // For other platforms, return a proper error instead of a placeholder
         warn!("Memory information not available on this platform");
-        Ok((0, 0))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "System memory info not supported on this platform"
+        ))
     }
 }
 
-/// Get CPU load average
+/// Get CPU load average with better error handling
 pub fn get_load_average() -> io::Result<(f64, f64, f64)> {
     #[cfg(target_os = "linux")]
     {
@@ -114,13 +116,16 @@ pub fn get_load_average() -> io::Result<(f64, f64, f64)> {
     
     #[cfg(not(target_os = "linux"))]
     {
-        // For other platforms, just return a placeholder
+        // For other platforms, return a proper error instead of a placeholder
         warn!("Load average information not available on this platform");
-        Ok((0.0, 0.0, 0.0))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Load average info not supported on this platform"
+        ))
     }
 }
 
-/// Set up IP forwarding (for VPN server)
+/// Set up IP forwarding (for VPN server) with improved error handling
 pub fn enable_ip_forwarding() -> io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
@@ -132,18 +137,30 @@ pub fn enable_ip_forwarding() -> io::Result<bool> {
                 debug!("IP forwarding enabled successfully");
                 return Ok(true);
             }
-            _ => {
-                // Try direct file write as fallback
-                let result = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
-                if result.is_ok() {
-                    debug!("IP forwarding enabled via direct write");
-                    return Ok(true);
-                }
+            Ok(status) => {
+                // Command ran but returned error status
+                warn!("sysctl command failed with status {}", status);
+                // Fall through to try the direct file write
+            }
+            Err(e) => {
+                // Command failed to execute
+                warn!("Failed to execute sysctl command: {}", e);
+                // Fall through to try the direct file write
             }
         }
         
-        warn!("Failed to enable IP forwarding. VPN functionality may be limited.");
-        Ok(false)
+        // Try direct file write as fallback
+        match std::fs::write("/proc/sys/net/ipv4/ip_forward", "1") {
+            Ok(_) => {
+                debug!("IP forwarding enabled via direct write");
+                return Ok(true);
+            }
+            Err(e) => {
+                warn!("Failed to enable IP forwarding via direct write: {}", e);
+                warn!("VPN functionality may be limited.");
+                return Ok(false);
+            }
+        }
     }
     
     #[cfg(target_os = "macos")]
@@ -156,8 +173,12 @@ pub fn enable_ip_forwarding() -> io::Result<bool> {
                 debug!("IP forwarding enabled successfully on macOS");
                 return Ok(true);
             }
-            _ => {
-                warn!("Failed to enable IP forwarding on macOS");
+            Ok(status) => {
+                warn!("sysctl command failed with status {} on macOS", status);
+                return Ok(false);
+            }
+            Err(e) => {
+                warn!("Failed to execute sysctl command on macOS: {}", e);
                 return Ok(false);
             }
         }
@@ -166,7 +187,10 @@ pub fn enable_ip_forwarding() -> io::Result<bool> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         warn!("IP forwarding setup not implemented for this platform");
-        Ok(false)
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "IP forwarding not supported on this platform"
+        ))
     }
 }
 
@@ -179,12 +203,13 @@ pub fn interface_exists(name: &str) -> bool {
     
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        // Default implementation for other platforms
+        // Return false for unsupported platforms with a warning
+        warn!("interface_exists not implemented for this platform");
         false
     }
 }
 
-/// Get the main network interface name
+/// Get the main network interface name with improved error handling
 pub fn get_main_interface() -> io::Result<String> {
     #[cfg(target_os = "linux")]
     {
@@ -218,9 +243,11 @@ pub fn get_main_interface() -> io::Result<String> {
     
     #[cfg(not(target_os = "linux"))]
     {
-        // For other platforms, return a placeholder
-        // Real implementation would use platform-specific commands/APIs
-        Ok("eth0".to_string())
+        // For other platforms, return a proper error instead of a placeholder
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Getting main interface not supported on this platform"
+        ))
     }
 }
 
@@ -244,6 +271,7 @@ mod tests {
             }
             Err(e) => {
                 println!("Error getting system memory: {}", e);
+                // Don't fail the test on unsupported platforms
             }
         }
     }
