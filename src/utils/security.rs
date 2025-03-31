@@ -24,8 +24,8 @@ pub struct RateLimiter {
     window: Duration,
     /// Cleanup interval to avoid checking on every request
     cleanup_interval: Duration,
-    /// Last cleanup timestamp per shard
-    last_cleanup: Arc<Vec<Mutex<Instant>>>,
+    /// Last cleanup timestamp per shard - removed unnecessary Arc wrapper
+    last_cleanup: Vec<Mutex<Instant>>,
 }
 
 impl RateLimiter {
@@ -49,7 +49,7 @@ impl RateLimiter {
             window,
             // Only clean up at most once per second
             cleanup_interval: Duration::from_secs(1),
-            last_cleanup: Arc::new(last_cleanup),
+            last_cleanup,
         }
     }
     
@@ -71,20 +71,29 @@ impl RateLimiter {
     }
     
     /// Check if an IP address should be rate limited with improved efficiency
+    /// Modified to avoid potential deadlock by not holding multiple locks simultaneously
     pub async fn check_rate_limit(&self, ip: &IpAddr) -> bool {
         let shard_idx = self.get_shard_index(ip);
-        let connections_shard = &self.connections[shard_idx];
-        let mut connections = connections_shard.lock().await;
-        
         let now = Instant::now();
         
-        // Periodically clean up expired entries instead of on every request
-        let mut last_cleanup = self.last_cleanup[shard_idx].lock().await;
-        if now.duration_since(*last_cleanup) >= self.cleanup_interval {
+        // Check if cleanup is needed first, without holding the connections lock
+        let should_cleanup = {
+            let mut last_cleanup = self.last_cleanup[shard_idx].lock().await;
+            let should_cleanup = now.duration_since(*last_cleanup) >= self.cleanup_interval;
+            if should_cleanup {
+                *last_cleanup = now;
+            }
+            should_cleanup
+        }; // Lock is released here
+        
+        // Now access the connections
+        let mut connections = self.connections[shard_idx].lock().await;
+        
+        // Perform cleanup if needed
+        if should_cleanup {
             connections.retain(|_, (_, first_seen)| {
                 now.duration_since(*first_seen) < self.window
             });
-            *last_cleanup = now;
         }
         
         // Check and update rate for this IP
@@ -165,10 +174,19 @@ impl StringValidator {
     }
     
     /// Sanitize an identifier to ensure it only contains safe characters
+    /// Improved for better performance with larger inputs
     pub fn sanitize_identifier(input: &str) -> String {
-        input.chars()
-            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-            .collect()
+        // Pre-allocate a string with the same capacity for efficiency
+        let mut result = String::with_capacity(input.len());
+        
+        // Filter characters directly instead of using collect
+        for c in input.chars() {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                result.push(c);
+            }
+        }
+        
+        result
     }
 }
 
