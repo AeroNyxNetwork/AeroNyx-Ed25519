@@ -278,6 +278,12 @@ impl KeyManager {
         
         // Save to disk before moving the keypair
         Self::save_keypair(&new_keypair, &self.key_path)?;
+        // Then update in memory by creating a new instance from the same bytes
+        {
+            let mut keypair = self.keypair.lock().await;
+            *keypair = Keypair::from_bytes(&new_keypair.to_bytes())
+                .map_err(|e| KeyError::Format(format!("Failed to create keypair: {}", e)))?;
+        }
         
         // Get the new public key for logging before moving the keypair
         let new_pubkey = new_keypair.pubkey();
