@@ -522,13 +522,17 @@ mod tests {
         assert_eq!(shared_secret.as_bytes().len(), 32);
     }
 
-     #[test]
+    #[test]
      fn test_invalid_public_key_conversion() {
           let invalid_bytes = [0u8; 31]; // Wrong length
           let result = ed25519_public_to_x25519(&invalid_bytes);
+          // Corrected E0277 fix: Check is_err first, then match the error variant
           assert!(result.is_err());
-          // Use .. to ignore inner value for non-Debug types // Corrected E0277 check
-          assert!(matches!(result.unwrap_err(), KeyError::InvalidData(..)));
+          if let Err(err) = result {
+              assert!(matches!(err, KeyError::InvalidData(_)));
+          } else {
+              panic!("Expected an error for invalid public key conversion, but got Ok");
+          }
 
           // Bytes that don't represent a valid point on the curve
            // (Creating such bytes reliably is tricky, but we can test with known invalid patterns if available)
@@ -539,8 +543,12 @@ mod tests {
       fn test_invalid_private_key_conversion() {
           let invalid_bytes = [0u8; 31]; // Wrong length
           let result = ed25519_private_to_x25519(&invalid_bytes);
-          assert!(result.is_err());
-          // Use .. to ignore inner value for non-Debug types // Corrected E0277 check
-          assert!(matches!(result.unwrap_err(), KeyError::InvalidData(..))); // Corrected line 542
+          // Corrected E0277 fix: Check is_err first, then match the error variant
+          assert!(result.is_err()); // Corrected line 544 area
+          if let Err(err) = result {
+              assert!(matches!(err, KeyError::InvalidData(_)));
+          } else {
+               panic!("Expected an error for invalid private key conversion, but got Ok");
+          }
       }
 }
