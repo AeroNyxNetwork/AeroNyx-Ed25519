@@ -18,9 +18,11 @@ use tracing::{debug, error, info, trace, warn};
 use tun::platform::Device;
 
 use crate::auth::AuthManager;
+use crate::auth::challenge::ChallengeError;
 use crate::config::settings::ServerConfig;
 use crate::crypto::{KeyManager, SessionKeyManager};
-use crate::network::{IpPoolManager, NetworkMonitor, setup_tun_device, configure_nat};
+use crate::network::{IpPoolManager, NetworkMonitor, setup_tun_device, configure_nat, get_first_ip_from_subnet};
+use crate::network::tun::TunConfig;
 use crate::protocol::MessageError;
 use crate::server::session::{SessionManager, SessionError};
 use crate::server::routing::PacketRouter;
@@ -28,7 +30,6 @@ use crate::server::metrics::ServerMetricsCollector;
 use crate::server::client::handle_client;
 use crate::server::packet::process_tun_packets;
 use crate::utils::security::RateLimiter;
-use crate::auth::challenge::ChallengeError;
 
 /// Error type for VPN server operations
 #[derive(Debug, thiserror::Error)]
@@ -58,7 +59,7 @@ pub enum ServerError {
     Session(#[from] SessionError),
     
     #[error("Challenge error: {0}")]
-    Challenge(#[from] crate::auth::ChallengeError),
+    Challenge(#[from] ChallengeError),
     
     #[error("Key error: {0}")]
     KeyError(String),
@@ -139,7 +140,16 @@ impl VpnServer {
         // Setup TUN device
         info!("Setting up TUN device: {}", config.tun_name);
         
-        let tun_device = setup_tun_device(&config.tun_name, &config.subnet)
+        // Create a TunConfig struct first
+        let tun_config = TunConfig {
+            name: config.tun_name.clone(),
+            subnet: config.subnet.clone(),
+            server_ip: get_first_ip_from_subnet(&config.subnet),
+            mtu: crate::config::constants::TUN_MTU,
+        };
+        
+        // Now pass the config to setup_tun_device
+        let tun_device = setup_tun_device(&tun_config)
             .map_err(|e| ServerError::TunSetup(format!("Failed to create TUN device: {}", e)))?;
         
         // Create Arc<Mutex<Device>> for TUN
@@ -305,14 +315,12 @@ impl VpnServer {
     
     /// Validate certificate expiration dates
     fn validate_certificate_expiry(certs: &[rustls::Certificate]) -> Result<(), ServerError> {
-        use rustls::internal::pemfile::read_one;
-        
         for cert in certs {
             // Attempt to check expiry - this would require either OpenSSL bindings 
             // or implementing X.509 parsing, as rustls doesn't expose certificate details
             
             // For demonstration, we'll just check if it's parseable by webpki
-            let cert = webpki::EndEntityCert::try_from(&cert.0)
+            let cert = webpki::EndEntityCert::try_from(&cert.0[..])
                 .map_err(|_| ServerError::Tls("Invalid certificate format".to_string()))?;
             
             // For a full implementation, you'd check:
@@ -472,7 +480,12 @@ impl VpnServer {
         // Add the main server handle to our task handles
         {
             let mut handles = self.task_handles.lock().await;
-            handles.push(server_handle.clone());
+            // Store the original handle, avoiding the need to clone it
+            handles.push(tokio::task::JoinHandle::spawn(async move {
+                if let Err(e) = server_handle.await {
+                    error!("Server error: {:?}", e);
+                }
+            }));
         }
         
         // Return the main server handle
@@ -566,15 +579,9 @@ impl VpnServer {
                 }
                 
                 // Clean up expired IP leases
-                match ip_pool.cleanup_expired().await {
-                    Ok(removed) => {
-                        if !removed.is_empty() {
-                            debug!("Released {} expired IP leases", removed.len());
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Error cleaning up IP pool: {}", e);
-                    }
+                let removed = ip_pool.cleanup_expired().await;
+                if !removed.is_empty() {
+                    debug!("Released {} expired IP leases", removed.len());
                 }
             }
         });
