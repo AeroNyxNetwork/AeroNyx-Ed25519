@@ -9,7 +9,6 @@ pub mod challenge;
 pub mod manager;
 
 // Re-export commonly used items
-// Removed unused AccessControlList import (assuming manager is used)
-pub use challenge::{Challenge, ChallengeManager}; // Kept ChallengeManager
-// Removed unused Challenge import if only manager is needed externally
+pub use acl::AccessControlList;
+// Removed unused Challenge, ChallengeManager exports (assuming they are only used internally or via AuthManager)
 pub use manager::AuthManager;
