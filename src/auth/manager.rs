@@ -12,13 +12,12 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::str::FromStr;
 use thiserror::Error;
-// Removed unused debug, info imports
+// Removed unused debug, info
 use tracing::{error, warn};
 
 use crate::auth::acl::{AccessControlEntry, AccessControlManager, AclError};
-// Removed unused Challenge import
 use crate::auth::challenge::{ChallengeError, ChallengeManager};
-// Removed unused AUTH_CHALLENGE_TIMEOUT import
+// Removed unused AUTH_CHALLENGE_TIMEOUT
 use crate::config::constants::MAX_AUTH_ATTEMPTS;
 use crate::crypto::keys::KeyManager;
 use crate::utils::security::StringValidator;
@@ -52,8 +51,8 @@ pub struct AuthManager {
     acl_manager: Arc<AccessControlManager>,
     /// Challenge manager
     challenge_manager: Arc<ChallengeManager>,
-    /// Key manager (kept for potential future use)
-    _key_manager: Arc<KeyManager>,
+    /// Key manager (unused field)
+    _key_manager: Arc<KeyManager>, // Prefix if unused
     /// Failed authentication attempts (client address -> count)
     failed_attempts: Arc<tokio::sync::Mutex<std::collections::HashMap<String, usize>>>,
 }
@@ -70,7 +69,7 @@ impl AuthManager {
             .map_err(AuthError::Acl)?);
 
         let challenge_manager = Arc::new(ChallengeManager::new(
-            key_manager.clone(), // Pass key manager to challenge manager
+            key_manager.clone(),
             challenge_timeout,
             max_challenges,
         ));
@@ -78,7 +77,7 @@ impl AuthManager {
         Ok(Self {
             acl_manager,
             challenge_manager,
-            _key_manager: key_manager, // Store but mark potentially unused
+            _key_manager: key_manager, // Assign to prefixed field
             failed_attempts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
@@ -106,7 +105,7 @@ impl AuthManager {
             return Err(AuthError::TooManyAttempts);
         }
 
-        // Convert string to SocketAddr for challenge manager
+        // Convert string to SocketAddr for challenge manager (if needed)
         let socket_addr = client_addr.parse::<SocketAddr>()
             .map_err(|_| AuthError::InvalidFormat(format!("Invalid address format: {}", client_addr)))?;
 
@@ -131,14 +130,15 @@ impl AuthManager {
             return Err(AuthError::InvalidFormat(format!("Invalid public key format: {}", public_key)));
         }
 
-        // Prefix unused variables _pubkey and _sig if they are not used later
+        // Parse the client's public key (prefix if not used later)
         let _pubkey = Pubkey::from_str(public_key)
             .map_err(|_| AuthError::InvalidFormat(format!("Invalid public key: {}", public_key)))?;
 
+        // Parse signature (prefix if not used later)
         let _sig = Signature::from_str(signature)
             .map_err(|_| AuthError::InvalidFormat(format!("Invalid signature: {}", signature)))?;
 
-        // Convert string to SocketAddr for challenge manager
+        // Convert string to SocketAddr for challenge manager (if needed)
         let socket_addr = client_addr.parse::<SocketAddr>()
             .map_err(|_| AuthError::InvalidFormat(format!("Invalid address format: {}", client_addr)))?;
 
@@ -185,7 +185,6 @@ impl AuthManager {
                 "Client {} reached maximum failed authentication attempts ({})",
                 client_addr, MAX_AUTH_ATTEMPTS
             );
-            // Consider adding client_addr to a temporary blocklist here
         }
     }
 
@@ -220,10 +219,9 @@ impl AuthManager {
         self.challenge_manager.cleanup_expired().await
     }
 
-    /// Clean up failed attempts (e.g., periodically)
+    /// Clean up failed attempts
     pub async fn cleanup_failed_attempts(&self) {
         let mut failed_attempts = self.failed_attempts.lock().await;
-        // Optionally implement time-based cleanup instead of just clearing all
         failed_attempts.clear();
     }
 }
@@ -232,7 +230,6 @@ impl AuthManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use solana_sdk::signer::Signer; // Import Signer trait
 
     #[tokio::test]
     async fn test_auth_manager() {
@@ -275,14 +272,7 @@ mod tests {
 
         // Should fail since client is not in ACL yet
         assert!(result.is_err());
-        if let Err(AuthError::Challenge(ChallengeError::NotFound(_))) = result {
-            // Expected error if challenge was consumed by failed verification
-        } else if let Err(AuthError::AccessDenied(_)) = result {
-            // Expected error if challenge verification succeeded but ACL check failed
-        }
-         else {
-            panic!("Expected ChallengeError::NotFound or AccessDenied, got {:?}", result);
-        }
+        assert!(matches!(result.unwrap_err(), AuthError::AccessDenied(_)));
 
 
         // Add client to ACL
@@ -297,10 +287,10 @@ mod tests {
         };
         auth_manager.add_client(entry).await.unwrap();
 
-        // Regenerate challenge (since previous one might have been consumed or expired)
+        // Regenerate challenge (since previous one was consumed or expired)
         let (challenge_id, challenge_data) = auth_manager.generate_challenge(client_addr_str).await.unwrap();
 
-        // Sign the challenge
+        // Sign the new challenge
         let signature = client_keypair.sign_message(&challenge_data).to_string();
 
         // Verify challenge again
