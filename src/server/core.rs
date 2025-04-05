@@ -118,7 +118,7 @@ pub struct VpnServer {
     pub rate_limiter: Arc<RateLimiter>,
     /// Server state
     pub state: Arc<RwLock<ServerState>>,
-    /// Server task handles (main listener, TUN reader, background tasks)
+    /// Server task handles (background tasks ONLY) <-- MODIFIED COMMENT
     pub task_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -316,6 +316,7 @@ impl VpnServer {
 
 
     /// Start the VPN server
+    /// Returns a JoinHandle for the main listener task.
     pub async fn start(&self) -> Result<JoinHandle<()>, ServerError> {
         // --- State Check ---
         {
@@ -328,10 +329,10 @@ impl VpnServer {
 
         info!("Starting AeroNyx Privacy Network Server on {}", self.config.listen_addr);
 
-        // --- Start Background Tasks ---
+        // --- Start Background Tasks (store handles internally) ---
         self.start_background_tasks().await;
 
-        // --- Start TUN Packet Processor ---
+        // --- Start TUN Packet Processor (store handle internally) ---
          let tun_processor_handle = start_tun_packet_processor(
              self.tun_device.clone(),
              self.session_manager.clone(),
@@ -360,7 +361,7 @@ impl VpnServer {
         let state = self.state.clone();
         let listen_addr = self.config.listen_addr;
 
-        // --- Main Server Loop (Accepting Connections) ---
+        // --- Main Server Loop Task (Accepting Connections) ---
          let main_server_handle = tokio::spawn(async move {
              let listener = match TcpListener::bind(&listen_addr).await {
                  Ok(l) => {
@@ -405,6 +406,7 @@ impl VpnServer {
 
                          metrics.record_new_connection().await;
 
+                         // Clone Arcs for the client handling task
                          let tls_acceptor_clone = tls_acceptor.clone();
                          let key_manager_clone = key_manager.clone();
                          let auth_manager_clone = auth_manager.clone();
@@ -416,7 +418,7 @@ impl VpnServer {
                          let metrics_clone = metrics.clone();
                          let server_state_clone = state.clone();
 
-
+                         // Spawn a task for each client
                           tokio::spawn(async move {
                              let client_metrics = metrics_clone;
                              let result = handle_client(
@@ -434,6 +436,7 @@ impl VpnServer {
                                  server_state_clone,
                              ).await;
 
+                             // Log client disconnection reason
                              if let Err(e) = result {
                                  match e {
                                      ServerError::WebSocket(ws_err) => {
@@ -465,35 +468,21 @@ impl VpnServer {
                          let current_state = *state.read().await;
                          if current_state == ServerState::Running {
                              error!("Error accepting connection: {}", e);
+                             // Avoid busy-looping on accept errors
                              time::sleep(Duration::from_millis(100)).await;
                          } else {
                               info!("Accept loop terminated due to server state change.");
-                             break;
+                             break; // Exit loop if server is stopping/stopped
                          }
                      }
                  }
              }
+             // Accept loop finished
+             info!("Server listener task stopped.");
         });
 
-
-        // Store the main server handle
-        // E0599 Fix: Move the handle directly, no clone needed/possible
-        {
-            let mut handles = self.task_handles.lock().await;
-             // Clone the Arc containing the Vec, not the handle itself
-            handles.push(main_server_handle); // Move the handle
-        }
-
-        // Find a way to return a handle for waiting, maybe the original one?
-        // The original handle is moved into the Arc<Mutex<Vec<...>>>
-        // If the caller needs *a* handle to wait on, returning a clone of the Arc
-        // holding the handles might be an option, but not a specific handle.
-        // Or, restructure so the caller owns the handles Vec.
-        // For now, let's assume the caller doesn't need the handle immediately.
-        // We'll return a placeholder handle (this part needs refinement based on usage)
-         let placeholder_handle = tokio::spawn(async {}); // Placeholder
-
-        Ok(placeholder_handle) // Return placeholder
+        // *** FIX: Return the actual handle for the main server task ***
+        Ok(main_server_handle)
     }
 
     /// Shutdown the server gracefully
@@ -507,26 +496,31 @@ impl VpnServer {
             }
             if *state != ServerState::Running && *state != ServerState::Starting {
                  warn!("Cannot shut down server in state {:?}", *state);
+                 // Still proceed to attempt cleanup
             }
              info!("Shutting down AeroNyx Privacy Network Server (current state: {:?})", *state);
-            *state = ServerState::ShuttingDown;
+            *state = ServerState::ShuttingDown; // Signal all tasks to stop
         }
 
         // --- Gracefully Close Existing Sessions ---
         info!("Closing active client sessions...");
+        // Send disconnect messages and close connections
         self.session_manager.close_all_sessions("Server shutdown").await;
+        // Give some time for messages to be sent
         time::sleep(Duration::from_millis(500)).await;
 
 
-        // --- Abort Background Tasks ---
+        // --- Abort Background Tasks stored in task_handles ---
         info!("Stopping background tasks...");
         {
             let mut handles = self.task_handles.lock().await;
-             info!("Aborting {} tasks.", handles.len());
+             info!("Aborting {} background/TUN tasks.", handles.len());
             for handle in handles.iter() {
-                handle.abort();
+                handle.abort(); // Request task cancellation
             }
-             handles.clear();
+            // Optionally wait for tasks to finish after aborting
+            // futures::future::join_all(handles.drain(..)).await;
+             handles.clear(); // Clear the list
         }
 
 
@@ -559,7 +553,10 @@ impl VpnServer {
              loop {
                  interval.tick().await;
                  let current_state = *state_clone.read().await;
-                 if current_state != ServerState::Running { if current_state != ServerState::Starting { break; } }
+                 // Stop if server is shutting down or stopped
+                 if current_state == ServerState::ShuttingDown || current_state == ServerState::Stopped { break; }
+                 // Continue if running or starting
+                 if current_state != ServerState::Running && current_state != ServerState::Starting { continue; }
 
                  let removed = session_manager_clone.cleanup_expired_sessions().await;
                  if removed > 0 {
@@ -577,7 +574,11 @@ impl VpnServer {
              loop {
                  interval.tick().await;
                  let current_state = *state_clone.read().await;
-                 if current_state != ServerState::Running { if current_state != ServerState::Starting { break; } }
+                 // Stop if server is shutting down or stopped
+                 if current_state == ServerState::ShuttingDown || current_state == ServerState::Stopped { break; }
+                 // Continue if running or starting
+                 if current_state != ServerState::Running && current_state != ServerState::Starting { continue; }
+
 
                  let removed = ip_pool_clone.cleanup_expired().await;
                  if !removed.is_empty() {
@@ -595,8 +596,12 @@ impl VpnServer {
               loop {
                   interval.tick().await;
                   let current_state = *state_clone.read().await;
-                  if current_state != ServerState::Running { if current_state != ServerState::Starting { break; } }
+                  // Stop if server is shutting down or stopped
+                  if current_state == ServerState::ShuttingDown || current_state == ServerState::Stopped { break; }
+                  // Continue if running or starting
+                  if current_state != ServerState::Running && current_state != ServerState::Starting { continue; }
 
+                  // Cleanup keys inactive for an hour
                   let removed = session_key_manager_clone.cleanup_old_sessions(Duration::from_secs(3600)).await;
                   if removed > 0 {
                       debug!("Cleaned up {} unused session keys", removed);
@@ -613,7 +618,11 @@ impl VpnServer {
               loop {
                   interval.tick().await;
                   let current_state = *state_clone.read().await;
-                  if current_state != ServerState::Running { if current_state != ServerState::Starting { break; } }
+                   // Stop if server is shutting down or stopped
+                  if current_state == ServerState::ShuttingDown || current_state == ServerState::Stopped { break; }
+                  // Continue if running or starting
+                  if current_state != ServerState::Running && current_state != ServerState::Starting { continue; }
+
 
                   let removed = auth_manager_clone.cleanup_expired_challenges().await;
                   if removed > 0 {
@@ -628,11 +637,15 @@ impl VpnServer {
           let metrics_clone = self.metrics.clone();
           let state_clone = self.state.clone();
           handles.push(tokio::spawn(async move {
+              // Reporting every hour might be too infrequent for monitoring, adjust if needed
               let mut interval = time::interval(Duration::from_secs(3600));
               loop {
                   interval.tick().await;
                   let current_state = *state_clone.read().await;
+                  // Stop if server is shutting down or stopped
                   if current_state == ServerState::ShuttingDown || current_state == ServerState::Stopped { break; }
+                   // Continue if running or starting
+                  if current_state != ServerState::Running && current_state != ServerState::Starting { continue; }
 
                   let report = metrics_clone.generate_report().await;
                   info!("Server metrics report:\n{}", report);
@@ -641,15 +654,15 @@ impl VpnServer {
           }));
 
 
-        // --- Task: Network Monitor ---
+        // --- Start Monitor and Metrics Collection Tasks ---
          self.network_monitor.start().await;
          self.metrics.start().await;
 
 
-        // --- Store Handles ---
+        // --- Store Background Task Handles ---
          {
-             let mut task_handles = self.task_handles.lock().await;
-             task_handles.extend(handles);
+             let mut task_handles_guard = self.task_handles.lock().await;
+             task_handles_guard.extend(handles); // Add all background handles
          }
          info!("Background tasks started.");
     }
