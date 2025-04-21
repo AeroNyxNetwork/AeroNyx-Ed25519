@@ -11,7 +11,7 @@ use std::sync::Arc;
 use rand::{Rng, thread_rng};
 use tokio::sync::Mutex;
 // Removed unused debug import
-use tracing::{error, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::config::constants::{MIN_PADDING_SIZE, MAX_PADDING_SIZE, PAD_PROBABILITY};
 use crate::crypto::{encrypt_packet, decrypt_packet};
