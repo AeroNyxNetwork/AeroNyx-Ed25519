@@ -131,6 +131,7 @@ pub fn validate_message(packet: &PacketType) -> Result<(), MessageError> {
             version,
             features,
             nonce,
+            encryption_algorithm: _, 
         } => validate_auth(public_key, version, features, nonce),
         
         PacketType::Challenge {
@@ -172,6 +173,7 @@ pub fn validate_message(packet: &PacketType) -> Result<(), MessageError> {
             session_id,
             encrypted_session_key,
             key_nonce,
+            encryption_algorithm: _, 
         } => {
             // Validate IP address format
             if !ip_address.contains('.') || ip_address.split('.').count() != 4 {
@@ -201,7 +203,7 @@ pub fn validate_message(packet: &PacketType) -> Result<(), MessageError> {
             Ok(())
         }
         
-        PacketType::Data { encrypted, nonce, counter, padding: _ } => {
+        PacketType::Data { encrypted, nonce, counter, padding: _, encryption_algorithm: _ } => {
             validate_data(encrypted, nonce, *counter)
         }
         
