@@ -100,79 +100,6 @@ pub fn encrypt_flexible(
     }
 }
 
-
-pub fn decrypt_flexible(
-    encrypted: &[u8],
-    nonce: &[u8],
-    key: &[u8],
-    algorithm: EncryptionAlgorithm,
-    aad: Option<&[u8]>,
-    fallback: bool,
-) -> Result<Vec<u8>, FlexibleEncryptionError> {
-    // Log the decryption attempt
-    info!("Attempting to decrypt with {:?}, fallback={}", algorithm, fallback);
-    debug!("Decryption details: ciphertext={} bytes, nonce={} bytes, key={} bytes",
-         encrypted.len(), nonce.len(), key.len());
-    
-    // First attempt with specified algorithm
-    info!("Primary decryption with {:?}", algorithm);
-    let primary_result = match algorithm {
-        EncryptionAlgorithm::ChaCha20Poly1305 => {
-            debug!("Trying ChaCha20-Poly1305 decryption...");
-            let result = decrypt_chacha20(encrypted, key, nonce);
-            if let Err(ref e) = result {
-                warn!("ChaCha20-Poly1305 decryption failed: {}", e);
-            } else {
-                info!("ChaCha20-Poly1305 decryption succeeded!");
-            }
-            result.map_err(|e| FlexibleEncryptionError::DecryptionFailed(e.to_string()))
-        },
-        EncryptionAlgorithm::Aes256Gcm => {
-            debug!("Trying AES-GCM decryption...");
-            let result = decrypt_aes_gcm(encrypted, key, nonce, aad);
-            if let Err(ref e) = result {
-                warn!("AES-GCM decryption failed: {}", e);
-            } else {
-                info!("AES-GCM decryption succeeded!");
-            }
-            result.map_err(|e| FlexibleEncryptionError::DecryptionFailed(e.to_string()))
-        }
-    };
-    
-    // If primary algorithm succeeded or fallback is disabled, return the result
-    if primary_result.is_ok() || !fallback {
-        return primary_result;
-    }
-    
-    // If the primary algorithm failed and fallback is enabled, try the other algorithm
-    info!("Primary decryption failed, attempting fallback");
-    match algorithm {
-        EncryptionAlgorithm::ChaCha20Poly1305 => {
-            // Fallback to AES-GCM
-            debug!("Fallback to AES-GCM decryption...");
-            let result = decrypt_aes_gcm(encrypted, key, nonce, aad);
-            if let Err(ref e) = result {
-                error!("Fallback AES-GCM decryption also failed: {}", e);
-            } else {
-                info!("Fallback AES-GCM decryption succeeded!");
-            }
-            result.map_err(|e| FlexibleEncryptionError::DecryptionFailed(format!("Both algorithms failed: {}", e)))
-        },
-        EncryptionAlgorithm::Aes256Gcm => {
-            // Fallback to ChaCha20-Poly1305
-            debug!("Fallback to ChaCha20-Poly1305 decryption...");
-            let result = decrypt_chacha20(encrypted, key, nonce);
-            if let Err(ref e) = result {
-                error!("Fallback ChaCha20-Poly1305 decryption also failed: {}", e);
-            } else {
-                info!("Fallback ChaCha20-Poly1305 decryption succeeded!");
-            }
-            result.map_err(|e| FlexibleEncryptionError::DecryptionFailed(format!("Both algorithms failed: {}", e)))
-        }
-    }
-}
-
-/// Decrypt data, attempting the specified algorithm first, then falling back if it fails
 pub fn decrypt_flexible(
     encrypted: &[u8],
     nonce: &[u8],
@@ -212,6 +139,7 @@ pub fn decrypt_flexible(
         }
     }
 }
+
 
 /// Encrypt a network packet with the specified or default algorithm
 pub fn encrypt_packet(
