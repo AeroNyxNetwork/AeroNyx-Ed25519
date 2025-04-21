@@ -7,9 +7,10 @@
 pub mod encryption;
 pub mod keys;
 pub mod session;
+pub mod flexible_encryption; // Add the new module
 
 // Re-export commonly used items
-// Removed unused generate_challenge export, assuming it's only used internally or via encryption module
 pub use encryption::{encrypt_packet, decrypt_packet};
 pub use keys::KeyManager;
 pub use session::SessionKeyManager;
+pub use flexible_encryption::{EncryptionAlgorithm, encrypt_flexible, decrypt_flexible}; // Export flexible encryption
