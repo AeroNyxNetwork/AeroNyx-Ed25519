@@ -279,14 +279,17 @@ pub async fn handle_client(
         }
     };
 
+    let ws_sender_mutex = Arc::new(Mutex::new(ws_sender));
+    let ws_receiver_mutex = Arc::new(Mutex::new(ws_receiver));
+
     // Create the ClientSession with encryption algorithm
     let session = ClientSession::new(
         session_id.clone(),
         public_key_string.clone(),
         ip_address.clone(),
         addr,
-        Arc::new(Mutex::new(ws_sender)),
-        Arc::new(Mutex::new(ws_receiver)),
+        ws_sender_mutex.clone(), // Use a clone of the Arc, not the original ws_sender
+        ws_receiver_mutex.clone(), // Use a clone of the Arc, not the original ws_receiver
         client_encryption_algorithm, // Pass the client's preferred algorithm
     )?;
 
@@ -301,13 +304,12 @@ pub async fn handle_client(
     };
 
     // Send IP assignment
-    if ws_sender.send(packet_to_ws_message(&ip_assign)?).await.is_err() {
+    if session.send_packet(&ip_assign).await.is_err() {
         if let Err(release_err) = ip_pool.release_ip(&ip_address).await {
              warn!("Failed to release IP {}: {}", ip_address, release_err);
         }
         return Err(ServerError::Network("Failed to send IP assignment".to_string()));
     }
-
     // Register the session
     session_manager.add_session(session.clone()).await;
 
