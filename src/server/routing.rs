@@ -167,23 +167,45 @@ impl PacketRouter {
     ) -> Result<usize, RoutingError> {
         // Determine which algorithm to use
         let algorithm = if let Some(algo) = encryption_algorithm {
-            EncryptionAlgorithm::from_str(algo)
-                .unwrap_or_else(|| 
-                    EncryptionAlgorithm::from_str(
+            debug!("Using packet-specified algorithm: {}", algo);
+            crate::crypto::flexible_encryption::EncryptionAlgorithm::from_str(algo)
+                .unwrap_or_else(|| {
+                    debug!("Packet algorithm not recognized, using session algorithm: {}", session.encryption_algorithm);
+                    crate::crypto::flexible_encryption::EncryptionAlgorithm::from_str(
                         &session.encryption_algorithm
                     ).unwrap_or_default()
-                )
+                })
         } else {
-            EncryptionAlgorithm::from_str(
+            debug!("No algorithm specified in packet, using session algorithm: {}", session.encryption_algorithm);
+            crate::crypto::flexible_encryption::EncryptionAlgorithm::from_str(
                 &session.encryption_algorithm
             ).unwrap_or_default()
         };
         
+        debug!("Attempting to decrypt packet (size={} bytes, nonce={} bytes) with {:?} algorithm", 
+               encrypted.len(), nonce.len(), algorithm);
+        
+        // Log session key
+        if !session_key.is_empty() {
+            debug!("Session key prefix: {:02x?}", &session_key[0..std::cmp::min(8, session_key.len())]);
+        }
+        
         // Decrypt using flexible decryption with fallback
-        let decrypted = crate::crypto::flexible_encryption::decrypt_packet(
+        let decrypted = match crate::crypto::flexible_encryption::decrypt_packet(
             encrypted, session_key, nonce, algorithm, session.enable_fallback
-        ).map_err(|e| RoutingError::Decryption(e.to_string()))?;
-
+        ) {
+            Ok(data) => {
+                debug!("Packet decryption successful, received {} bytes", data.len());
+                data
+            },
+            Err(e) => {
+                error!("Packet decryption failed: {}", e);
+                error!("Packet details: algo={:?}, encrypted={} bytes, nonce={:?}, enable_fallback={}", 
+                       algorithm, encrypted.len(), nonce, session.enable_fallback);
+                return Err(RoutingError::Decryption(e.to_string()));
+            }
+        };
+    
         // Check packet size
         if decrypted.len() > self.max_packet_size {
             return Err(RoutingError::InvalidPacket(format!(
@@ -191,17 +213,21 @@ impl PacketRouter {
                 decrypted.len(), self.max_packet_size
             )));
         }
-
+    
         // Check for attack patterns
         if let Some(reason) = detect_attack_patterns(&decrypted) {
             warn!("Security risk in packet from {}: {}", session.client_id, reason);
             return Err(RoutingError::SecurityRisk(reason));
         }
-
+    
         // Remove padding if necessary
         let packet_data = if self.enable_padding {
             match self.remove_padding(&decrypted) {
-                Ok(data) => data,
+                Ok(data) => {
+                    debug!("Padding removed, packet size reduced from {} to {} bytes", 
+                          decrypted.len(), data.len());
+                    data
+                },
                 Err(e) => {
                     warn!("Failed to remove padding from packet: {}", e);
                     decrypted
@@ -210,17 +236,29 @@ impl PacketRouter {
         } else {
             decrypted
         };
-
+    
+        debug!("Processed packet, ready to write {} bytes to TUN device", packet_data.len());
+    
         // Get the TUN device from the global reference
         if let Some(tun_device) = crate::server::globals::SERVER_TUN_DEVICE.get() {
             // Write the packet to the TUN device
             let written = {
                 let mut device = tun_device.lock().await;
-                device.write(&packet_data).map_err(|e| RoutingError::TunWrite(e.to_string()))?
+                match device.write(&packet_data) {
+                    Ok(bytes) => {
+                        debug!("Successfully wrote {} bytes to TUN device", bytes);
+                        bytes
+                    },
+                    Err(e) => {
+                        error!("Failed to write to TUN device: {}", e);
+                        return Err(RoutingError::TunWrite(e.to_string()));
+                    }
+                }
             };
-
+    
             Ok(written)
         } else {
+            error!("TUN device not initialized");
             Err(RoutingError::TunWrite("TUN device not initialized".to_string()))
         }
     }
