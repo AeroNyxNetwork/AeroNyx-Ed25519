@@ -79,11 +79,20 @@ pub async fn handle_client(
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     // --- Authentication Phase ---
-    let public_key_string = match time::timeout(Duration::from_secs(30), ws_receiver.next()).await {
+    let (public_key_string, client_encryption_algorithm) = match time::timeout(Duration::from_secs(30), ws_receiver.next()).await {
         Ok(Some(Ok(msg))) => {
              match ws_message_to_packet(&msg) {
-                Ok(PacketType::Auth { public_key, version, features, nonce: _nonce }) => { // Prefix unused nonce
-                    debug!("Auth request from {}, version: {}, features: {:?}", public_key, version, features);
+                Ok(PacketType::Auth { 
+                    public_key, 
+                    version, 
+                    features, 
+                    encryption_algorithm,
+                    nonce: _nonce 
+                }) => {
+                    debug!(
+                        "Auth request from {}, version: {}, features: {:?}, encryption: {:?}", 
+                        public_key, version, features, encryption_algorithm
+                    );
 
                     // Verify public key format
                     if !StringValidator::is_valid_solana_pubkey(&public_key) {
@@ -92,6 +101,11 @@ pub async fn handle_client(
                         metrics.record_auth_failure().await;
                         return Err(ServerError::Authentication("Invalid public key format".to_string()));
                     }
+
+                    // Verify encryption algorithm is supported (if specified)
+                    let algo = encryption_algorithm.as_ref()
+                        .filter(|a| crate::protocol::types::encryption_algorithms::is_supported(a))
+                        .cloned();
 
                     // Generate challenge
                     let challenge = match auth_manager.generate_challenge(&addr.to_string()).await {
@@ -144,7 +158,7 @@ pub async fn handle_client(
                                             }
                                             metrics.record_auth_success().await;
                                             info!("Client {} authenticated successfully", public_key);
-                                            public_key // Return the verified public key
+                                            (public_key, algo) // Return the verified public key and encryption algorithm
                                         }
                                         Err(e) => {
                                              let error_packet = create_error_packet(1001, &format!("Challenge verification failed: {}", e));
@@ -265,13 +279,25 @@ pub async fn handle_client(
         }
     };
 
-    // Create IP assignment packet
+    // Create the ClientSession with encryption algorithm
+    let session = ClientSession::new(
+        session_id.clone(),
+        public_key_string.clone(),
+        ip_address.clone(),
+        addr,
+        Arc::new(Mutex::new(ws_sender.clone())),
+        Arc::new(Mutex::new(ws_receiver.clone())),
+        client_encryption_algorithm, // Pass the client's preferred algorithm
+    )?;
+
+    // Create IP assignment packet with encryption algorithm info
     let ip_assign = PacketType::IpAssign {
         ip_address: ip_address.clone(),
         lease_duration: ip_pool.get_default_lease_duration().as_secs(),
         session_id: session_id.clone(),
         encrypted_session_key: encrypted_key,
         key_nonce,
+        encryption_algorithm: session.encryption_algorithm.clone(), // Include selected algorithm
     };
 
     // Send IP assignment
@@ -281,17 +307,6 @@ pub async fn handle_client(
         }
         return Err(ServerError::Network("Failed to send IP assignment".to_string()));
     }
-
-
-    // Create the ClientSession instance using Arc<Mutex<>> for sender/receiver
-    let session = ClientSession::new(
-        session_id.clone(),
-        public_key_string.clone(),
-        ip_address.clone(),
-        addr,
-        Arc::new(Mutex::new(ws_sender)), // Pass Arc<Mutex<Sender>>
-        Arc::new(Mutex::new(ws_receiver)), // Pass Arc<Mutex<Receiver>>
-    )?;
 
     // Register the session
     session_manager.add_session(session.clone()).await;
@@ -385,32 +400,43 @@ async fn process_client_session(
             let new_key = SessionKeyManager::generate_key();
 
              if let Some(current_key) = session_key_manager_clone.get_key(&session_rot.client_id).await {
-                 match crate::crypto::encryption::encrypt_chacha20(&new_key, &current_key, None) {
-                     Ok((encrypted_key, nonce)) => {
-                         let key_id = random_string(16);
-                         let mut sign_data = key_id.clone().into_bytes();
-                         sign_data.extend_from_slice(&nonce);
-                         let signature = key_manager_clone.sign_message(&sign_data).await;
+                 // Use the session's encryption algorithm for key rotation
+                 let algorithm = crate::crypto::flexible_encryption::EncryptionAlgorithm::from_str(
+                     &session_rot.encryption_algorithm
+                 ).unwrap_or_default();
 
-                         let rotation = PacketType::KeyRotation {
-                             encrypted_new_key: encrypted_key,
-                             nonce,
-                             key_id,
-                             signature: signature.to_string(),
-                         };
-
-                        if session_rot.send_packet(&rotation).await.is_err() {
-                             warn!("Failed to send key rotation to {}: channel closed", session_rot.client_id);
-                             break;
-                         }
-
-                        session_key_manager_clone.store_key(&session_rot.client_id, new_key).await;
-                         debug!("Session key rotated for client {}", session_rot.client_id);
-                     }
+                 let encrypted_packet = match crate::crypto::flexible_encryption::encrypt_flexible(
+                     &new_key,
+                     &current_key,
+                     algorithm,
+                     None,
+                 ) {
+                     Ok(packet) => packet,
                      Err(e) => {
                          warn!("Failed to encrypt new session key for {}: {}", session_rot.client_id, e);
+                         continue;
                      }
+                 };
+
+                 let key_id = random_string(16);
+                 let mut sign_data = key_id.clone().into_bytes();
+                 sign_data.extend_from_slice(&encrypted_packet.nonce);
+                 let signature = key_manager_clone.sign_message(&sign_data).await;
+
+                 let rotation = PacketType::KeyRotation {
+                     encrypted_new_key: encrypted_packet.data,
+                     nonce: encrypted_packet.nonce,
+                     key_id,
+                     signature: signature.to_string(),
+                 };
+
+                if session_rot.send_packet(&rotation).await.is_err() {
+                     warn!("Failed to send key rotation to {}: channel closed", session_rot.client_id);
+                     break;
                  }
+
+                session_key_manager_clone.store_key(&session_rot.client_id, new_key).await;
+                 debug!("Session key rotated for client {}", session_rot.client_id);
              } else {
                  warn!("Could not get current session key for rotation for client {}", session_rot.client_id);
              }
@@ -439,7 +465,7 @@ async fn process_client_session(
                          log_packet_info(&packet, true);
 
                          match packet {
-                            PacketType::Data { encrypted, nonce, counter, padding: _ } => {
+                            PacketType::Data { encrypted, nonce, counter, padding: _, encryption_algorithm } => {
                                  if let Some(last) = last_counter {
                                      if counter <= last && counter != 0 {
                                          warn!("Potential replay attack detected from {}: counter {} <= {}", client_id, counter, last);
@@ -449,7 +475,10 @@ async fn process_client_session(
                                  last_counter = Some(counter);
 
                                  if let Some(key) = session_key_manager.get_key(&client_id).await {
-                                     match packet_router.handle_inbound_packet(&encrypted, &nonce, &key, &session).await {
+                                     // Pass encryption_algorithm to handle_inbound_packet
+                                     match packet_router.handle_inbound_packet(
+                                         &encrypted, &nonce, &key, &session, encryption_algorithm.as_deref()
+                                     ).await {
                                          Ok(bytes_written) => {
                                              network_monitor.record_client_traffic(&client_id, 0, bytes_written as u64).await;
                                              network_monitor.record_sent(bytes_written as u64).await;
