@@ -191,6 +191,65 @@ pub fn encrypt_aes_gcm(plaintext: &[u8], key: &[u8], aad: Option<&[u8]>) -> Resu
     Ok((ciphertext, nonce_bytes.to_vec()))
 }
 
+
+pub fn decrypt_chacha20(ciphertext: &[u8], key: &[u8], nonce: &[u8]) -> Result<Vec<u8>, EncryptionError> {
+    if key.len() != 32 {
+        error!("ChaCha20 key length invalid: {} (expected 32)", key.len());
+        return Err(EncryptionError::InvalidKeyLength(key.len()));
+    }
+
+    if nonce.len() != 12 {
+        error!("ChaCha20 nonce length invalid: {} (expected 12)", nonce.len());
+        return Err(EncryptionError::InvalidFormat(format!("Invalid nonce length: {} (expected 12)", nonce.len())));
+    }
+
+    // Print detailed debug information
+    info!("ChaCha20-Poly1305 Decryption: ciphertext length={}, key length={}, nonce length={}",
+         ciphertext.len(), key.len(), nonce.len());
+    
+    // Print key prefix (first 8 bytes or fewer)
+    if !key.is_empty() {
+        debug!("ChaCha20 Key prefix: {:02x?}", &key[0..min(8, key.len())]);
+    }
+    
+    // Print full nonce (it's only 12 bytes)
+    debug!("ChaCha20 Nonce: {:02x?}", nonce);
+    
+    // Print ciphertext prefix
+    if !ciphertext.is_empty() {
+        debug!("ChaCha20 Ciphertext prefix: {:02x?}", &ciphertext[0..min(16, ciphertext.len())]);
+    }
+
+    // Convert the key and nonce
+    let aead_key = Key::from_slice(key);
+    let nonce_aead = Nonce::from_slice(nonce);
+    let cipher = ChaCha20Poly1305::new(aead_key);
+
+    debug!("ChaCha20 cipher created, attempting decryption");
+
+    // Decrypt and verify the data
+    let plaintext = match cipher.decrypt(nonce_aead, ciphertext) {
+        Ok(plaintext) => {
+            debug!("ChaCha20 decryption successful: {} bytes", plaintext.len());
+            if !plaintext.is_empty() {
+                debug!("ChaCha20 Plaintext prefix: {:02x?}", &plaintext[0..min(16, plaintext.len())]);
+            }
+            plaintext
+        },
+        Err(e) => {
+            // Log authentication failures as they may indicate tampering
+            error!("ChaCha20-Poly1305 decryption failed: {}", e);
+            
+            // Add more diagnostic info
+            debug!("ChaCha20 Ciphertext full: {:02x?}", ciphertext);
+            
+            return Err(EncryptionError::AuthenticationFailed);
+        }
+    };
+
+    Ok(plaintext)
+}
+
 /// Decrypt data using AES-256-GCM with optional additional authenticated data (AAD)
 /// 
 /// # Parameters
