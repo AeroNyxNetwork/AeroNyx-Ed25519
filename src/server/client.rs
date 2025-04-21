@@ -285,8 +285,8 @@ pub async fn handle_client(
         public_key_string.clone(),
         ip_address.clone(),
         addr,
-        Arc::new(Mutex::new(ws_sender.clone())),
-        Arc::new(Mutex::new(ws_receiver.clone())),
+        Arc::new(Mutex::new(ws_sender)),
+        Arc::new(Mutex::new(ws_receiver)),
         client_encryption_algorithm, // Pass the client's preferred algorithm
     )?;
 
