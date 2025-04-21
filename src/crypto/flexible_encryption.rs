@@ -6,7 +6,7 @@
 
 use crate::crypto::encryption::{encrypt_chacha20, decrypt_chacha20, encrypt_aes_gcm, decrypt_aes_gcm};
 use thiserror::Error;
-
+use tracing::{debug, info, warn, error};
 /// Encryption algorithms supported by the system
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionAlgorithm {
