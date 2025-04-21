@@ -94,31 +94,7 @@ pub fn encrypt_chacha20(data: &[u8], key: &[u8], nonce_bytes: Option<&[u8]>) -> 
     Ok((ciphertext, nonce_val.to_vec()))
 }
 
-/// Decrypt data using ChaCha20-Poly1305 AEAD with authentication verification
-pub fn decrypt_chacha20(ciphertext: &[u8], key: &[u8], nonce: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-    if key.len() != 32 {
-        return Err(EncryptionError::InvalidKeyLength(key.len()));
-    }
 
-    if nonce.len() != 12 {
-        return Err(EncryptionError::InvalidFormat(format!("Invalid nonce length: {} (expected 12)", nonce.len())));
-    }
-
-    // Convert the key and nonce
-    let aead_key = Key::from_slice(key);
-    let nonce_aead = Nonce::from_slice(nonce);
-    let cipher = ChaCha20Poly1305::new(aead_key);
-
-    // Decrypt and verify the data
-    let plaintext = cipher.decrypt(nonce_aead, ciphertext)
-        .map_err(|e| {
-            // Log authentication failures as they may indicate tampering
-            debug!("ChaCha20-Poly1305 decryption failed: {}", e);
-            EncryptionError::AuthenticationFailed
-        })?;
-
-    Ok(plaintext)
-}
 
 /// Encrypt data using AES-256-GCM with optional additional authenticated data (AAD)
 /// 
