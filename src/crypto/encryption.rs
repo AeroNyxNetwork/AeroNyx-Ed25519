@@ -15,6 +15,12 @@ use sha2::Sha256;
 use thiserror::Error;
 use tracing::debug; // Removed unused warn
 
+// Add AES-GCM imports
+use aes_gcm::{
+    aead::{Aead as AesGcmAead, KeyInit},
+    Aes256Gcm, Key as AesGcmKey, Nonce as AesGcmNonce
+};
+
 type Aes256CbcEnc = Encryptor<Aes256>;
 type Aes256CbcDec = Decryptor<Aes256>;
 type HmacSha256 = Hmac<Sha256>;
@@ -112,6 +118,88 @@ pub fn decrypt_chacha20(ciphertext: &[u8], key: &[u8], nonce: &[u8]) -> Result<V
     Ok(plaintext)
 }
 
+/// Encrypt data using AES-256-GCM
+/// 
+/// # Parameters
+/// - `plaintext`: The data to encrypt
+/// - `key`: 32-byte AES-256 key
+/// - `aad`: Optional additional authenticated data
+///
+/// # Returns
+/// - Tuple of (ciphertext, nonce) where:
+///   - ciphertext includes the authentication tag
+///   - nonce is the 12-byte IV used for encryption
+pub fn encrypt_aes_gcm(plaintext: &[u8], key: &[u8], aad: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>), EncryptionError> {
+    // Validate key length
+    if key.len() != 32 {
+        return Err(EncryptionError::InvalidKeyLength(key.len()));
+    }
+
+    // Create AES-GCM key from the provided bytes
+    let aes_key = AesGcmKey::from_slice(key);
+    
+    // Initialize the cipher with the key
+    let cipher = Aes256Gcm::new(aes_key);
+    
+    // Generate a random 12-byte nonce (IV)
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = AesGcmNonce::from_slice(&nonce_bytes);
+    
+    // Encrypt the plaintext with AAD if provided
+    let ciphertext = match aad {
+        Some(aad_data) => cipher.encrypt(nonce, aad_data.chain(plaintext.as_ref()))
+            .map_err(|e| EncryptionError::EncryptionFailed(format!("AES-GCM encryption failed: {}", e)))?,
+        None => cipher.encrypt(nonce, plaintext.as_ref())
+            .map_err(|e| EncryptionError::EncryptionFailed(format!("AES-GCM encryption failed: {}", e)))?,
+    };
+    
+    Ok((ciphertext, nonce_bytes.to_vec()))
+}
+
+/// Decrypt data using AES-256-GCM
+/// 
+/// # Parameters
+/// - `ciphertext`: The encrypted data including authentication tag
+/// - `key`: 32-byte AES-256 key
+/// - `nonce`: 12-byte IV used during encryption
+/// - `aad`: Optional additional authenticated data (must match what was used for encryption)
+///
+/// # Returns
+/// - Decrypted plaintext or error
+pub fn decrypt_aes_gcm(ciphertext: &[u8], key: &[u8], nonce: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>, EncryptionError> {
+    // Validate key length
+    if key.len() != 32 {
+        return Err(EncryptionError::InvalidKeyLength(key.len()));
+    }
+    
+    // Validate nonce length
+    if nonce.len() != 12 {
+        return Err(EncryptionError::InvalidFormat(format!(
+            "Invalid nonce length: {} (expected 12)", nonce.len()
+        )));
+    }
+    
+    // Create AES-GCM key from the provided bytes
+    let aes_key = AesGcmKey::from_slice(key);
+    
+    // Initialize the cipher with the key
+    let cipher = Aes256Gcm::new(aes_key);
+    
+    // Convert nonce to the required format
+    let nonce_array = AesGcmNonce::from_slice(nonce);
+    
+    // Decrypt the ciphertext with AAD if provided
+    let plaintext = match aad {
+        Some(aad_data) => cipher.decrypt(nonce_array, aad_data.chain(ciphertext.as_ref()))
+            .map_err(|_| EncryptionError::AuthenticationFailed)?,
+        None => cipher.decrypt(nonce_array, ciphertext.as_ref())
+            .map_err(|_| EncryptionError::AuthenticationFailed)?,
+    };
+    
+    Ok(plaintext)
+}
+
 /// Encrypt data using AES-256-CBC with a shared secret and HMAC for authentication
 pub fn encrypt_aes(data: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>, EncryptionError> {
     // Check shared_secret length
@@ -155,7 +243,6 @@ pub fn encrypt_aes(data: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>, Encrypt
 
     Ok(result)
 }
-
 
 /// Decrypt data using AES-256-CBC with a shared secret and verify HMAC
 pub fn decrypt_aes(encrypted: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>, EncryptionError> {
@@ -201,7 +288,6 @@ pub fn decrypt_aes(encrypted: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>, En
 
     Ok(plaintext.to_vec())
 }
-
 
 /// Encrypt a network packet with ChaCha20-Poly1305
 pub fn encrypt_packet(packet: &[u8], session_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), EncryptionError> {
@@ -265,12 +351,11 @@ pub fn remove_padding(packet: &[u8]) -> Result<Vec<u8>, EncryptionError> {
     }
 
     // Extract the actual data (between header and padding)
-    let data_len = packet.len() - expected_min_len; // Correct calculation
+    let data_len = packet.len() - 2 - padding_len; // Correct calculation
     let data = &packet[2..(2 + data_len)];
 
     Ok(data.to_vec())
 }
-
 
 /// Encrypt a session key for transmission
 pub fn encrypt_session_key(
@@ -321,6 +406,36 @@ mod tests {
 
         // Check that decrypted data matches original
         assert_eq!(data.to_vec(), decrypted);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_aes_gcm() {
+        let key = [3u8; 32]; // Test key
+        let data = b"Test message for AES-GCM encryption";
+        let aad = b"Additional authenticated data";
+
+        // Test without AAD
+        let (encrypted1, nonce1) = encrypt_aes_gcm(data, &key, None).unwrap();
+        let decrypted1 = decrypt_aes_gcm(&encrypted1, &key, &nonce1, None).unwrap();
+        assert_eq!(data.to_vec(), decrypted1);
+
+        // Test with AAD
+        let (encrypted2, nonce2) = encrypt_aes_gcm(data, &key, Some(aad)).unwrap();
+        let decrypted2 = decrypt_aes_gcm(&encrypted2, &key, &nonce2, Some(aad)).unwrap();
+        assert_eq!(data.to_vec(), decrypted2);
+
+        // Test authentication failure with wrong AAD
+        let wrong_aad = b"Wrong additional data";
+        let result = decrypt_aes_gcm(&encrypted2, &key, &nonce2, Some(wrong_aad));
+        assert!(matches!(result.unwrap_err(), EncryptionError::AuthenticationFailed));
+
+        // Test authentication failure with tampered ciphertext
+        let mut tampered = encrypted2.clone();
+        if !tampered.is_empty() {
+            tampered[0] ^= 1; // Flip one bit
+        }
+        let result = decrypt_aes_gcm(&tampered, &key, &nonce2, Some(aad));
+        assert!(matches!(result.unwrap_err(), EncryptionError::AuthenticationFailed));
     }
 
     #[test]
