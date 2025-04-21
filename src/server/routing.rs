@@ -19,6 +19,7 @@ use crate::protocol::{PacketType, MessageError};
 // Removed unused packet_to_ws_message import
 use crate::server::session::ClientSession;
 use crate::utils::security::detect_attack_patterns;
+use crate::crypto::flexible_encryption::EncryptionAlgorithm;
 
 /// Error type for packet routing operations
 #[derive(Debug, thiserror::Error)]
@@ -120,24 +121,31 @@ impl PacketRouter {
             packet.to_vec()
         };
 
-        // Encrypt the packet
-        let (encrypted, nonce) = encrypt_packet(&packet_data, session_key)
-            .map_err(|e| RoutingError::Encryption(e.to_string()))?;
+        // Get the session's encryption algorithm
+        let algorithm = EncryptionAlgorithm::from_str(
+            &session.encryption_algorithm
+        ).unwrap_or_default();
+        
+        // Use flexible encryption
+        let encrypted_packet = crate::crypto::flexible_encryption::encrypt_packet(
+            &packet_data, session_key, Some(algorithm)
+        ).map_err(|e| RoutingError::Encryption(e.to_string()))?;
 
         // Get next packet counter
         let counter = {
             let mut counter = self.packet_counter.lock().await;
             let value = *counter;
-            *counter = value.wrapping_add(1); // Allow wrap-around
+            *counter = value.wrapping_add(1);
             value
         };
 
-        // Create data packet
+        // Create data packet with algorithm info
         let data_packet = PacketType::Data {
-            encrypted,
-            nonce,
+            encrypted: encrypted_packet.data,
+            nonce: encrypted_packet.nonce,
             counter,
             padding: None,
+            encryption_algorithm: Some(encrypted_packet.algorithm.as_str().to_string()),
         };
 
         // Send to client
@@ -155,10 +163,26 @@ impl PacketRouter {
         nonce: &[u8],
         session_key: &[u8],
         session: &ClientSession,
+        encryption_algorithm: Option<&str>, // New parameter from Data packet
     ) -> Result<usize, RoutingError> {
-        // Decrypt the packet
-        let decrypted = decrypt_packet(encrypted, session_key, nonce)
-            .map_err(|e| RoutingError::Decryption(e.to_string()))?;
+        // Determine which algorithm to use
+        let algorithm = if let Some(algo) = encryption_algorithm {
+            EncryptionAlgorithm::from_str(algo)
+                .unwrap_or_else(|| 
+                    EncryptionAlgorithm::from_str(
+                        &session.encryption_algorithm
+                    ).unwrap_or_default()
+                )
+        } else {
+            EncryptionAlgorithm::from_str(
+                &session.encryption_algorithm
+            ).unwrap_or_default()
+        };
+        
+        // Decrypt using flexible decryption with fallback
+        let decrypted = crate::crypto::flexible_encryption::decrypt_packet(
+            encrypted, session_key, nonce, algorithm, session.enable_fallback
+        ).map_err(|e| RoutingError::Decryption(e.to_string()))?;
 
         // Check packet size
         if decrypted.len() > self.max_packet_size {
@@ -359,5 +383,46 @@ mod tests {
         } else {
             panic!("Expected InvalidPacket error");
         }
+    }
+    
+    #[test]
+    fn test_algorithm_compatibility() {
+        // Test compatibility between different encryption algorithms
+        let key = [1u8; 32];
+        let data = b"Test data for algorithm compatibility";
+        
+        // Test ChaCha20-Poly1305 encryption
+        let chacha_result = crate::crypto::flexible_encryption::encrypt_packet(
+            data, &key, Some(EncryptionAlgorithm::ChaCha20Poly1305)
+        ).unwrap();
+        
+        // Test AES-GCM encryption
+        let aes_result = crate::crypto::flexible_encryption::encrypt_packet(
+            data, &key, Some(EncryptionAlgorithm::Aes256Gcm)
+        ).unwrap();
+        
+        // Verify both algorithms produce different ciphertexts
+        assert_ne!(chacha_result.data, aes_result.data);
+        
+        // Verify ChaCha20-Poly1305 encryption can be decrypted
+        let decrypted1 = crate::crypto::flexible_encryption::decrypt_packet(
+            &chacha_result.data, &key, &chacha_result.nonce,
+            EncryptionAlgorithm::ChaCha20Poly1305, false
+        ).unwrap();
+        assert_eq!(data.to_vec(), decrypted1);
+        
+        // Verify AES-GCM encryption can be decrypted
+        let decrypted2 = crate::crypto::flexible_encryption::decrypt_packet(
+            &aes_result.data, &key, &aes_result.nonce,
+            EncryptionAlgorithm::Aes256Gcm, false
+        ).unwrap();
+        assert_eq!(data.to_vec(), decrypted2);
+        
+        // Test fallback mechanism (decrypt ChaCha20 with AES algorithm + fallback)
+        let decrypted_fallback = crate::crypto::flexible_encryption::decrypt_packet(
+            &chacha_result.data, &key, &chacha_result.nonce,
+            EncryptionAlgorithm::Aes256Gcm, true
+        ).unwrap();
+        assert_eq!(data.to_vec(), decrypted_fallback);
     }
 }
