@@ -21,23 +21,19 @@ use crate::server::core::ServerError;
 /// Client session for connected users
 #[derive(Clone)] // Keep Clone, but be mindful of Arc usage
 pub struct ClientSession {
-    /// Unique session identifier
+    // Existing fields
     pub id: String,
-    /// Client's public key
     pub client_id: String,
-    /// Assigned IP address
     pub ip_address: String,
-    /// Client's address
     pub address: SocketAddr,
-    /// WebSocket stream sender (wrapped for thread safety)
     ws_sender: Arc<Mutex<SplitSink<WebSocketStream<TlsStream<TcpStream>>, Message>>>,
-    /// WebSocket stream receiver (wrapped for thread safety)
     ws_receiver: Arc<Mutex<SplitStream<WebSocketStream<TlsStream<TcpStream>>>>>,
-    /// Last activity timestamp (wrapped for thread safety)
     pub last_activity: Arc<Mutex<Instant>>,
-     /// Indicates if the underlying stream components have been logically "taken"
-     /// (prevents taking them multiple times). This doesn't actually take ownership.
     stream_taken: Arc<Mutex<bool>>,
+    
+    // New fields
+    pub encryption_algorithm: String,
+    pub enable_fallback: bool,
 }
 
 
@@ -50,16 +46,24 @@ impl ClientSession {
         address: SocketAddr,
         ws_sender: Arc<Mutex<SplitSink<WebSocketStream<TlsStream<TcpStream>>, Message>>>,
         ws_receiver: Arc<Mutex<SplitStream<WebSocketStream<TlsStream<TcpStream>>>>>,
-    ) -> Result<Self, ServerError> { // Return ServerError for consistency
+        encryption_algorithm: Option<String>,
+    ) -> Result<Self, ServerError> {
+        // Set default encryption algorithm or use client's preferred algorithm
+        let algo = encryption_algorithm.unwrap_or_else(|| 
+            crate::protocol::types::encryption_algorithms::default().to_string()
+        );
+        
         Ok(Self {
             id,
             client_id,
             ip_address,
             address,
-            ws_sender, // Assign the provided Arc<Mutex<>> directly
-            ws_receiver, // Assign the provided Arc<Mutex<>> directly
+            ws_sender,
+            ws_receiver,
             last_activity: Arc::new(Mutex::new(Instant::now())),
             stream_taken: Arc::new(Mutex::new(false)),
+            encryption_algorithm: algo,
+            enable_fallback: true, // Default to enabling fallback
         })
     }
 
