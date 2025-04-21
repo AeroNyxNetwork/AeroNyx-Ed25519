@@ -41,12 +41,14 @@ pub enum MessageError {
 pub enum PacketType {
     /// Authentication request
     Auth {
-        /// Client public key
+    /// Client public key
         public_key: String,
         /// Client version
         version: String,
         /// Supported features
         features: Vec<String>,
+        /// Preferred encryption algorithm
+        encryption_algorithm: Option<String>,
         /// Nonce for security
         nonce: String,
     },
@@ -85,11 +87,14 @@ pub enum PacketType {
         encrypted_session_key: Vec<u8>,
         /// Nonce for key encryption
         key_nonce: Vec<u8>,
+        /// Selected encryption algorithm
+        encryption_algorithm: String,
     },
+
     
     /// Encrypted data packet
     Data {
-        /// Encrypted packet data
+    /// Encrypted packet data
         encrypted: Vec<u8>,
         /// Encryption nonce
         nonce: Vec<u8>,
@@ -97,6 +102,8 @@ pub enum PacketType {
         counter: u64,
         /// Optional padding data
         padding: Option<Vec<u8>>,
+        /// Encryption algorithm used (optional for backward compatibility)
+        encryption_algorithm: Option<String>,
     },
     
     /// Ping message for latency measurement and keepalive
@@ -162,6 +169,24 @@ pub enum PacketType {
         /// Human-readable message
         message: String,
     },
+}
+
+pub mod encryption_algorithms {
+    pub const CHACHA20_POLY1305: &str = "chacha20poly1305";
+    pub const AES_256_GCM: &str = "aes256gcm";
+    
+    // Check if algorithm is supported
+    pub fn is_supported(algorithm: &str) -> bool {
+        match algorithm {
+            CHACHA20_POLY1305 | AES_256_GCM => true,
+            _ => false,
+        }
+    }
+    
+    // Get default algorithm
+    pub fn default() -> &'static str {
+        CHACHA20_POLY1305
+    }
 }
 
 /// Disconnect reason codes
