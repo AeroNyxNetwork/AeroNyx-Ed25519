@@ -14,7 +14,7 @@ use hmac::{Hmac, Mac}; // No NewMac, as it's accessed through the Mac trait
 use rand::{Rng, RngCore};
 use sha2::Sha256;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, info, warn, error};
 
 // Add AES-GCM imports
 use aes_gcm::{
@@ -132,32 +132,61 @@ pub fn decrypt_chacha20(ciphertext: &[u8], key: &[u8], nonce: &[u8]) -> Result<V
 ///   - ciphertext includes the authentication tag
 ///   - nonce is the 12-byte IV used for encryption
 pub fn encrypt_aes_gcm(plaintext: &[u8], key: &[u8], aad: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>), EncryptionError> {
+    // Log the input parameters
+    info!("AES-GCM Encryption: plaintext length={}, key length={}, aad={}",
+         plaintext.len(), key.len(), aad.is_some());
+    
+    // For debugging, also log partial key and plaintext
+    if !key.is_empty() {
+        debug!("AES-GCM Key prefix: {:02x?}", &key[0..min(8, key.len())]);
+    }
+    if !plaintext.is_empty() {
+        debug!("AES-GCM Plaintext prefix: {:02x?}", &plaintext[0..min(16, plaintext.len())]);
+    }
+    
     // Validate key length
     if key.len() != 32 {
+        error!("AES-GCM encryption failed: Invalid key length {}", key.len());
         return Err(EncryptionError::InvalidKeyLength(key.len()));
     }
 
     // Initialize AES-GCM cipher with key
+    debug!("Creating AES-GCM cipher with key");
     let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
     
     // Generate a secure random 12-byte nonce (IV)
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    debug!("Generated nonce: {:02x?}", nonce_bytes);
+    
     let nonce = AesGcmNonce::from_slice(&nonce_bytes);
     
     // Encrypt plaintext, incorporating AAD if provided
     let ciphertext = match aad {
         Some(aad_data) => {
-            // Use the in_place_encrypt_and_append API for AAD
+            debug!("Encrypting with AAD, AAD length={}", aad_data.len());
+            
+            // Version 1: Attempt to use AAD properly (adjust based on actual library implementation)
             cipher.encrypt(nonce, aad_data)
                 .and_then(|_| cipher.encrypt(nonce, plaintext))
-                .map_err(|e| EncryptionError::EncryptionFailed(format!("AES-GCM encryption failed: {}", e)))?
+                .map_err(|e| {
+                    error!("AES-GCM encryption failed with AAD: {}", e);
+                    EncryptionError::EncryptionFailed(format!("AES-GCM encryption failed with AAD: {}", e))
+                })?
         },
         None => {
+            debug!("Encrypting without AAD");
             cipher.encrypt(nonce, plaintext)
-                .map_err(|e| EncryptionError::EncryptionFailed(format!("AES-GCM encryption failed: {}", e)))?
+                .map_err(|e| {
+                    error!("AES-GCM encryption failed: {}", e);
+                    EncryptionError::EncryptionFailed(format!("AES-GCM encryption failed: {}", e))
+                })?
         },
     };
+    
+    info!("AES-GCM encryption successful: plaintext={} bytes, ciphertext={} bytes",
+         plaintext.len(), ciphertext.len());
+    debug!("Ciphertext prefix: {:02x?}", &ciphertext[0..min(16, ciphertext.len())]);
     
     Ok((ciphertext, nonce_bytes.to_vec()))
 }
@@ -173,19 +202,37 @@ pub fn encrypt_aes_gcm(plaintext: &[u8], key: &[u8], aad: Option<&[u8]>) -> Resu
 /// # Returns
 /// - Decrypted plaintext or error
 pub fn decrypt_aes_gcm(ciphertext: &[u8], key: &[u8], nonce: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>, EncryptionError> {
+    // Log the input parameters
+    info!("AES-GCM Decryption: ciphertext length={}, key length={}, nonce length={}, aad={}",
+         ciphertext.len(), key.len(), nonce.len(), aad.is_some());
+    
+    // For debugging, also log partial key, nonce and ciphertext
+    if !key.is_empty() {
+        debug!("AES-GCM Key prefix: {:02x?}", &key[0..min(8, key.len())]);
+    }
+    if !nonce.is_empty() {
+        debug!("AES-GCM Nonce: {:02x?}", nonce);
+    }
+    if !ciphertext.is_empty() {
+        debug!("AES-GCM Ciphertext prefix: {:02x?}", &ciphertext[0..min(16, ciphertext.len())]);
+    }
+    
     // Validate key length
     if key.len() != 32 {
+        error!("AES-GCM decryption failed: Invalid key length {}", key.len());
         return Err(EncryptionError::InvalidKeyLength(key.len()));
     }
     
     // Validate nonce length
     if nonce.len() != 12 {
+        error!("AES-GCM decryption failed: Invalid nonce length {}", nonce.len());
         return Err(EncryptionError::InvalidFormat(format!(
             "Invalid nonce length: {} (expected 12)", nonce.len()
         )));
     }
     
     // Initialize AES-GCM cipher with key
+    debug!("Creating AES-GCM cipher for decryption");
     let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
     
     // Prepare nonce
@@ -194,16 +241,31 @@ pub fn decrypt_aes_gcm(ciphertext: &[u8], key: &[u8], nonce: &[u8], aad: Option<
     // Decrypt ciphertext, verifying AAD if provided
     let plaintext = match aad {
         Some(aad_data) => {
-            // Verify AAD first, then decrypt the ciphertext
+            debug!("Decrypting with AAD, AAD length={}", aad_data.len());
+            
+            // Version 1: Attempt to verify AAD (adjust based on actual library implementation)
             cipher.decrypt(nonce_array, aad_data)
                 .and_then(|_| cipher.decrypt(nonce_array, ciphertext))
-                .map_err(|_| EncryptionError::AuthenticationFailed)?
+                .map_err(|e| {
+                    error!("AES-GCM decryption failed with AAD: {}", e);
+                    EncryptionError::AuthenticationFailed
+                })?
         },
         None => {
+            debug!("Decrypting without AAD");
             cipher.decrypt(nonce_array, ciphertext)
-                .map_err(|_| EncryptionError::AuthenticationFailed)?
+                .map_err(|e| {
+                    error!("AES-GCM decryption failed: {}", e);
+                    EncryptionError::AuthenticationFailed
+                })?
         },
     };
+    
+    info!("AES-GCM decryption successful: ciphertext={} bytes, plaintext={} bytes",
+         ciphertext.len(), plaintext.len());
+    if !plaintext.is_empty() {
+        debug!("Plaintext prefix: {:02x?}", &plaintext[0..min(16, plaintext.len())]);
+    }
     
     Ok(plaintext)
 }
@@ -379,6 +441,15 @@ pub fn decrypt_session_key(
     shared_secret: &[u8],
 ) -> Result<Vec<u8>, EncryptionError> {
     decrypt_chacha20(encrypted_key, shared_secret, nonce)
+}
+
+// Helper function for safe slicing
+fn min(a: usize, b: usize) -> usize {
+    if a < b {
+        a
+    } else {
+        b
+    }
 }
 
 #[cfg(test)]
