@@ -183,16 +183,19 @@ impl PacketRouter {
         };
         
         debug!("Attempting to decrypt packet (size={} bytes, nonce={} bytes) with {:?} algorithm", 
-               encrypted.len(), nonce.len(), algorithm);
+                encrypted.len(), nonce.len(), algorithm);
         
         // Log session key
         if !session_key.is_empty() {
             debug!("Session key prefix: {:02x?}", &session_key[0..std::cmp::min(8, session_key.len())]);
         }
         
+        // 获取enable_fallback布尔值
+        let enable_fallback = session.is_fallback_enabled().await;
+        
         // Decrypt using flexible decryption with fallback
         let decrypted = match crate::crypto::flexible_encryption::decrypt_packet(
-            encrypted, session_key, nonce, algorithm, session.enable_fallback
+            encrypted, session_key, nonce, algorithm, enable_fallback // 传递布尔值
         ) {
             Ok(data) => {
                 debug!("Packet decryption successful, received {} bytes", data.len());
@@ -201,7 +204,7 @@ impl PacketRouter {
             Err(e) => {
                 error!("Packet decryption failed: {}", e);
                 error!("Packet details: algo={:?}, encrypted={} bytes, nonce={:?}, enable_fallback={}", 
-                       algorithm, encrypted.len(), nonce, session.enable_fallback);
+                       algorithm, encrypted.len(), nonce, enable_fallback); // 使用布尔值进行日志记录
                 return Err(RoutingError::Decryption(e.to_string()));
             }
         };
