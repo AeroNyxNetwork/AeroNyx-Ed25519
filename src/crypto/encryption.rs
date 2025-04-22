@@ -16,6 +16,12 @@ use sha2::Sha256;
 use thiserror::Error;
 use tracing::{debug, info, warn, error};
 
+// Import types from flexible_encryption module
+use crate::crypto::flexible_encryption::{
+    EncryptionAlgorithm, FlexibleEncryptionError, EncryptedPacket, 
+    encrypt_flexible, decrypt_flexible
+};
+
 // Add AES-GCM imports
 use aes_gcm::{
     aead::{Aead as AesGcmAead, KeyInit},
@@ -93,8 +99,6 @@ pub fn encrypt_chacha20(data: &[u8], key: &[u8], nonce_bytes: Option<&[u8]>) -> 
 
     Ok((ciphertext, nonce_val.to_vec()))
 }
-
-
 
 /// Encrypt data using AES-256-GCM with optional additional authenticated data (AAD)
 /// 
@@ -478,6 +482,57 @@ pub fn decrypt_session_key(
     decrypt_chacha20(encrypted_key, shared_secret, nonce)
 }
 
+/// Encrypt a session key for transmission using a specified algorithm preference.
+///
+/// # Parameters
+/// - `session_key`: The session key to encrypt
+/// - `shared_secret`: The shared secret used as the encryption key
+/// - `preferred_algorithm`: The encryption algorithm to use
+///
+/// # Returns
+/// - An `EncryptedPacket` containing the encrypted data, nonce, and algorithm used
+pub fn encrypt_session_key_flexible(
+    session_key: &[u8],
+    shared_secret: &[u8], // This shared_secret acts as the 'key' for this encryption step
+    preferred_algorithm: EncryptionAlgorithm,
+) -> Result<EncryptedPacket, FlexibleEncryptionError> {
+    // We don't use AAD for session key encryption
+    let aad = None;
+    
+    // Use the flexible encryption function directly
+    // Note: We use the shared_secret as the key for encrypting the session_key
+    encrypt_flexible(session_key, shared_secret, preferred_algorithm, aad)
+}
+
+/// Decrypt a session key received from peer using a specified algorithm.
+/// 
+/// # Parameters
+/// - `encrypted_key_packet`: The `EncryptedPacket` containing encrypted session key data
+/// - `shared_secret`: The shared secret used as the decryption key
+///
+/// # Returns
+/// - The decrypted session key or an error
+/// 
+/// Note: This function assumes the client *also* uses the correct algorithm.
+/// The server typically doesn't decrypt session keys *from* the client in this flow.
+pub fn decrypt_session_key_flexible(
+    encrypted_key_packet: &EncryptedPacket, // Expect EncryptedPacket struct
+    shared_secret: &[u8],    // Shared secret acts as the key
+) -> Result<Vec<u8>, FlexibleEncryptionError> {
+    // We didn't use AAD during encryption
+    let aad = None;
+    
+    // Trust the algorithm specified in the packet, disable fallback for this specific case usually
+    decrypt_flexible(
+        &encrypted_key_packet.data,
+        &encrypted_key_packet.nonce,
+        shared_secret,
+        encrypted_key_packet.algorithm,
+        aad,
+        false // Disable fallback when decrypting session key - it should match exactly
+    )
+}
+
 // Helper function for safe slicing
 fn min(a: usize, b: usize) -> usize {
     if a < b {
@@ -711,5 +766,50 @@ mod tests {
         let result_wrong_key = decrypt_aes(&encrypted, &wrong_key);
         assert!(result_wrong_key.is_err(), "Decryption should fail with wrong key");
         assert!(matches!(result_wrong_key.unwrap_err(), EncryptionError::AuthenticationFailed));
+    }
+    
+    #[test]
+    fn test_encrypt_decrypt_session_key_flexible() {
+        // This test requires the flexible_encryption module to be in scope
+        use crate::crypto::flexible_encryption::EncryptionAlgorithm;
+        
+        let session_key = [10u8; 32]; // Test session key
+        let shared_secret = [11u8; 32]; // Test shared secret
+        
+        // Test with ChaCha20-Poly1305
+        let encrypted_chacha = encrypt_session_key_flexible(
+            &session_key,
+            &shared_secret,
+            EncryptionAlgorithm::ChaCha20Poly1305
+        ).unwrap();
+        
+        // Verify algorithm was set correctly
+        assert_eq!(encrypted_chacha.algorithm, EncryptionAlgorithm::ChaCha20Poly1305);
+        
+        // Decrypt and verify
+        let decrypted_chacha = decrypt_session_key_flexible(
+            &encrypted_chacha,
+            &shared_secret
+        ).unwrap();
+        
+        assert_eq!(session_key.to_vec(), decrypted_chacha);
+        
+        // Test with AES-GCM
+        let encrypted_aes = encrypt_session_key_flexible(
+            &session_key,
+            &shared_secret,
+            EncryptionAlgorithm::AesGcm
+        ).unwrap();
+        
+        // Verify algorithm was set correctly
+        assert_eq!(encrypted_aes.algorithm, EncryptionAlgorithm::AesGcm);
+        
+        // Decrypt and verify
+        let decrypted_aes = decrypt_session_key_flexible(
+            &encrypted_aes,
+            &shared_secret
+        ).unwrap();
+        
+        assert_eq!(session_key.to_vec(), decrypted_aes);
     }
 }
