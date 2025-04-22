@@ -13,12 +13,12 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tokio::net::TcpStream;
-// Removed 'error' import
 use tracing::{debug, info, trace, warn};
-// Removed unused module import
 
 use crate::auth::AuthManager;
 use crate::crypto::{KeyManager, SessionKeyManager};
+use crate::crypto::flexible_encryption::EncryptionAlgorithm; // Add this import
+use crate::crypto::encryption::encrypt_session_key_flexible; // Add this import
 use crate::network::{IpPoolManager, NetworkMonitor};
 use crate::protocol::types::PacketType;
 use crate::protocol::serialization::{packet_to_ws_message, ws_message_to_packet, create_error_packet, create_disconnect_packet, log_packet_info};
@@ -79,7 +79,7 @@ pub async fn handle_client(
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     // --- Authentication Phase ---
-    let (public_key_string, client_encryption_algorithm) = match time::timeout(Duration::from_secs(30), ws_receiver.next()).await {
+    let (public_key_string, client_encryption_preference) = match time::timeout(Duration::from_secs(30), ws_receiver.next()).await {
         Ok(Some(Ok(msg))) => {
              match ws_message_to_packet(&msg) {
                 Ok(PacketType::Auth { 
@@ -102,10 +102,8 @@ pub async fn handle_client(
                         return Err(ServerError::Authentication("Invalid public key format".to_string()));
                     }
 
-                    // Verify encryption algorithm is supported (if specified)
-                    let algo = encryption_algorithm.as_ref()
-                        .filter(|a| crate::protocol::types::encryption_algorithms::is_supported(a))
-                        .cloned();
+                    // Store the client's algorithm preference string for later parsing
+                    let client_algo_pref_str = encryption_algorithm;
 
                     // Generate challenge
                     let challenge = match auth_manager.generate_challenge(&addr.to_string()).await {
@@ -158,7 +156,22 @@ pub async fn handle_client(
                                             }
                                             metrics.record_auth_success().await;
                                             info!("Client {} authenticated successfully", public_key);
-                                            (public_key, algo) // Return the verified public key and encryption algorithm
+                                            
+                                            // Parse client's preferred algorithm, if invalid/unsupported use default
+                                            let client_preferred_algo = client_algo_pref_str
+                                                .as_deref() // Option<String> -> Option<&str>
+                                                .and_then(EncryptionAlgorithm::from_str) // Option<&str> -> Option<EncryptionAlgorithm>
+                                                .unwrap_or_else(|| {
+                                                    if client_algo_pref_str.is_some() {
+                                                        warn!(
+                                                            "Client {} provided unsupported/invalid algorithm {:?}, using default.", 
+                                                            public_key, client_algo_pref_str
+                                                        );
+                                                    }
+                                                    EncryptionAlgorithm::default() // Use server default algorithm
+                                                });
+                                            
+                                            (public_key, client_preferred_algo) // Return the verified public key and parsed algorithm
                                         }
                                         Err(e) => {
                                              let error_packet = create_error_packet(1001, &format!("Challenge verification failed: {}", e));
@@ -225,7 +238,6 @@ pub async fn handle_client(
     };
     // --- Authentication Phase End ---
 
-
     // Assign IP address
     let ip_address = match ip_pool.allocate_ip(&public_key_string).await {
         Ok(ip) => {
@@ -263,16 +275,17 @@ pub async fn handle_client(
         }
     };
 
-    // Encrypt session key
-    let (encrypted_key, key_nonce) = match crate::crypto::encryption::encrypt_session_key(
+    // Encrypt session key using the flexible encryption method with negotiated algorithm
+    let encrypted_key_packet = match encrypt_session_key_flexible(
         &session_key,
         &shared_secret,
+        client_encryption_preference, // Use negotiated algorithm
     ) {
-        Ok((encrypted, nonce)) => (encrypted, nonce),
+        Ok(packet) => packet,
         Err(e) => {
             let error_packet = create_error_packet(1006, &format!("Encryption failed: {}", e));
             let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
-             if let Err(release_err) = ip_pool.release_ip(&ip_address).await {
+            if let Err(release_err) = ip_pool.release_ip(&ip_address).await {
                 warn!("Failed to release IP {}: {}", ip_address, release_err);
             }
             return Err(ServerError::Internal(format!("Failed to encrypt session key: {}", e)));
@@ -282,15 +295,15 @@ pub async fn handle_client(
     let ws_sender_mutex = Arc::new(Mutex::new(ws_sender));
     let ws_receiver_mutex = Arc::new(Mutex::new(ws_receiver));
 
-    // Create the ClientSession with encryption algorithm
+    // Create the ClientSession with encryption algorithm from the encrypted packet
     let session = ClientSession::new(
         session_id.clone(),
         public_key_string.clone(),
         ip_address.clone(),
         addr,
-        ws_sender_mutex.clone(), // Use a clone of the Arc, not the original ws_sender
-        ws_receiver_mutex.clone(), // Use a clone of the Arc, not the original ws_receiver
-        client_encryption_algorithm, // Pass the client's preferred algorithm
+        ws_sender_mutex.clone(),
+        ws_receiver_mutex.clone(),
+        encrypted_key_packet.algorithm.as_str().to_string(), // Use algorithm string from the packet
     )?;
 
     // Create IP assignment packet with encryption algorithm info
@@ -298,9 +311,9 @@ pub async fn handle_client(
         ip_address: ip_address.clone(),
         lease_duration: ip_pool.get_default_lease_duration().as_secs(),
         session_id: session_id.clone(),
-        encrypted_session_key: encrypted_key,
-        key_nonce,
-        encryption_algorithm: session.encryption_algorithm.clone(), // Include selected algorithm
+        encrypted_session_key: encrypted_key_packet.data,
+        key_nonce: encrypted_key_packet.nonce,
+        encryption_algorithm: encrypted_key_packet.algorithm.as_str().to_string(),
     };
 
     // Send IP assignment
@@ -310,6 +323,7 @@ pub async fn handle_client(
         }
         return Err(ServerError::Network("Failed to send IP assignment".to_string()));
     }
+    
     // Register the session
     session_manager.add_session(session.clone()).await;
 
@@ -333,7 +347,6 @@ pub async fn handle_client(
     }
     // Use original session_key_manager (which still holds a valid Arc reference)
     session_key_manager.remove_key(&public_key_string).await;
-
 
     result // Return the result from process_client_session
 }
@@ -403,7 +416,7 @@ async fn process_client_session(
 
              if let Some(current_key) = session_key_manager_clone.get_key(&session_rot.client_id).await {
                  // Use the session's encryption algorithm for key rotation
-                 let algorithm = crate::crypto::flexible_encryption::EncryptionAlgorithm::from_str(
+                 let algorithm = EncryptionAlgorithm::from_str(
                      &session_rot.encryption_algorithm
                  ).unwrap_or_default();
 
@@ -558,9 +571,8 @@ async fn process_client_session(
              }
              Some(Err(e)) => { // WebSocket error
                  debug!("WebSocket error for client {}: {}", client_id, e);
-                 // Use explicit From conversion // Corrected line 542
+                 // Use explicit From conversion
                  return Err(ServerError::from(e));
-                 // break; // No longer needed
              }
              None => { // WebSocket stream closed
                  debug!("WebSocket connection closed for client {}", client_id);
@@ -568,7 +580,6 @@ async fn process_client_session(
              }
          }
      }
-
 
     // Abort background tasks associated with this session
     heartbeat_handle.abort();
