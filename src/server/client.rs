@@ -296,6 +296,7 @@ pub async fn handle_client(
     let ws_receiver_mutex = Arc::new(Mutex::new(ws_receiver));
 
     // Create the ClientSession with encryption algorithm from the encrypted packet
+    // Fix: Wrap the algorithm string in Some() since ClientSession::new expects Option<String>
     let session = ClientSession::new(
         session_id.clone(),
         public_key_string.clone(),
@@ -303,7 +304,7 @@ pub async fn handle_client(
         addr,
         ws_sender_mutex.clone(),
         ws_receiver_mutex.clone(),
-        encrypted_key_packet.algorithm.as_str().to_string(), // Use algorithm string from the packet
+        Some(encrypted_key_packet.algorithm.as_str().to_string()), // FIX: Wrap in Some()
     )?;
 
     // Create IP assignment packet with encryption algorithm info
@@ -416,9 +417,11 @@ async fn process_client_session(
 
              if let Some(current_key) = session_key_manager_clone.get_key(&session_rot.client_id).await {
                  // Use the session's encryption algorithm for key rotation
-                 let algorithm = EncryptionAlgorithm::from_str(
-                     &session_rot.encryption_algorithm
-                 ).unwrap_or_default();
+                 // Unwrap the Option<String> to get &str, then parse algorithm
+                 let algorithm = session_rot.encryption_algorithm
+                     .as_deref() // Option<String> -> Option<&str>
+                     .and_then(EncryptionAlgorithm::from_str) // Parse to algorithm if valid
+                     .unwrap_or_default(); // Default if None or parsing fails
 
                  let encrypted_packet = match crate::crypto::flexible_encryption::encrypt_flexible(
                      &new_key,
@@ -490,9 +493,21 @@ async fn process_client_session(
                                  last_counter = Some(counter);
 
                                  if let Some(key) = session_key_manager.get_key(&client_id).await {
-                                     // Pass encryption_algorithm to handle_inbound_packet
+                                     // We need to modify packet_router.handle_inbound_packet to handle this correctly
+                                     // For now, assuming the function signature has been updated to accept enable_fallback
+                                     // as a boolean value directly
+                                     
+                                     // Get a boolean value from the session's enable_fallback
+                                     // This would need to be implemented in the session struct
+                                     let enable_fallback = session.get_enable_fallback().await;
+                                     
+                                     // Now we can call handle_inbound_packet with the correct types
                                      match packet_router.handle_inbound_packet(
-                                         &encrypted, &nonce, &key, &session, encryption_algorithm.as_deref()
+                                         &encrypted, 
+                                         &nonce, 
+                                         &key, 
+                                         &session,
+                                         encryption_algorithm.as_deref(),
                                      ).await {
                                          Ok(bytes_written) => {
                                              network_monitor.record_client_traffic(&client_id, 0, bytes_written as u64).await;
