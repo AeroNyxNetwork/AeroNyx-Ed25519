@@ -493,15 +493,7 @@ async fn process_client_session(
                                  last_counter = Some(counter);
 
                                  if let Some(key) = session_key_manager.get_key(&client_id).await {
-                                     // We need to modify packet_router.handle_inbound_packet to handle this correctly
-                                     // For now, assuming the function signature has been updated to accept enable_fallback
-                                     // as a boolean value directly
-                                     
-                                     // Get a boolean value from the session's enable_fallback
-                                     // This would need to be implemented in the session struct
-                                     let enable_fallback = session.get_enable_fallback().await;
-                                     
-                                     // Now we can call handle_inbound_packet with the correct types
+                                     // session对象直接传递给handle_inbound_packet，由函数内部正确处理
                                      match packet_router.handle_inbound_packet(
                                          &encrypted, 
                                          &nonce, 
