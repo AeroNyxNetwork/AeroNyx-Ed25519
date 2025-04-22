@@ -8,15 +8,14 @@ use futures::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
 use tokio_tungstenite::tungstenite::Message;
 use std::time::{Duration, Instant};
 // Remove unused imports: debug, info
-use tracing::warn;
+use tracing::{warn, info};
 use tokio_rustls::server::TlsStream;
 use tokio::net::TcpStream;
-
 
 use crate::protocol::PacketType;
 use crate::protocol::serialization::packet_to_ws_message;
 use crate::server::core::ServerError;
-
+use crate::crypto::flexible_encryption::EncryptionAlgorithm; // Add import for encryption enums
 
 /// Client session for connected users
 #[derive(Clone)] // Keep Clone, but be mindful of Arc usage
@@ -31,11 +30,10 @@ pub struct ClientSession {
     pub last_activity: Arc<Mutex<Instant>>,
     stream_taken: Arc<Mutex<bool>>,
     
-    // New fields
-    pub encryption_algorithm: String,
-    pub enable_fallback: bool,
+    // New fields for encryption support
+    pub encryption_algorithm: String,     // String representation of algorithm (for logs/debugging)
+    pub enable_fallback: Arc<Mutex<bool>>, // Whether to try fallback algorithm if primary fails
 }
-
 
 impl ClientSession {
     /// Create a new client session with split WebSocket components wrapped in Arc<Mutex<>>
@@ -52,6 +50,9 @@ impl ClientSession {
         let algo = encryption_algorithm.unwrap_or_else(|| 
             crate::protocol::types::encryption_algorithms::default().to_string()
         );
+
+        // Log the encryption algorithm being used for this session
+        info!("Creating client session with encryption algorithm: {}", algo);
         
         Ok(Self {
             id,
@@ -63,8 +64,24 @@ impl ClientSession {
             last_activity: Arc::new(Mutex::new(Instant::now())),
             stream_taken: Arc::new(Mutex::new(false)),
             encryption_algorithm: algo,
-            enable_fallback: true, // Default to enabling fallback
+            enable_fallback: Arc::new(Mutex::new(true)), // Default to enabling fallback
         })
+    }
+
+    /// Set whether fallback to alternative encryption algorithm is allowed
+    pub async fn set_fallback_enabled(&self, enabled: bool) {
+        let mut fallback_guard = self.enable_fallback.lock().await;
+        *fallback_guard = enabled;
+    }
+
+    /// Check if fallback encryption is enabled for this session
+    pub async fn is_fallback_enabled(&self) -> bool {
+        *self.enable_fallback.lock().await
+    }
+
+    /// Get the EncryptionAlgorithm enum from the string representation
+    pub fn get_encryption_algorithm(&self) -> Option<EncryptionAlgorithm> {
+        EncryptionAlgorithm::from_str(&self.encryption_algorithm)
     }
 
     /// Send a packet to the client (acquires lock on sender)
@@ -88,37 +105,36 @@ impl ClientSession {
     }
 
     /// Receive the next message from the client (acquires lock on receiver)
-     /// Returns Option<Result<Message, ServerError>> to handle stream end and errors.
+    /// Returns Option<Result<Message, ServerError>> to handle stream end and errors.
     pub async fn next_message(&self) -> Option<Result<Message, ServerError>> {
-         let mut receiver_guard = self.ws_receiver.lock().await;
-         receiver_guard.next().await.map(|res| res.map_err(ServerError::WebSocket))
+        let mut receiver_guard = self.ws_receiver.lock().await;
+        receiver_guard.next().await.map(|res| res.map_err(ServerError::WebSocket))
     }
 
     /// Attempt to logically take the stream components.
-     /// This marks the session as consumed but doesn't return the raw streams.
-     /// Returns true if successfully marked as taken, false otherwise.
-     pub async fn mark_stream_taken(&self) -> bool {
-         let mut taken_guard = self.stream_taken.lock().await;
-         if *taken_guard {
-             false // Already taken
-         } else {
-             *taken_guard = true;
-             true // Successfully marked as taken
-         }
-     }
+    /// This marks the session as consumed but doesn't return the raw streams.
+    /// Returns true if successfully marked as taken, false otherwise.
+    pub async fn mark_stream_taken(&self) -> bool {
+        let mut taken_guard = self.stream_taken.lock().await;
+        if *taken_guard {
+            false // Already taken
+        } else {
+            *taken_guard = true;
+            true // Successfully marked as taken
+        }
+    }
 
-     /// Check if the stream has been marked as taken.
-     pub async fn is_stream_taken(&self) -> bool {
-         *self.stream_taken.lock().await
-     }
+    /// Check if the stream has been marked as taken.
+    pub async fn is_stream_taken(&self) -> bool {
+        *self.stream_taken.lock().await
+    }
 
-     // Close the underlying connection (best effort)
-      pub async fn close(&self) {
-          let mut sender_guard = self.ws_sender.lock().await;
-          let _ = sender_guard.close().await; // Ignore errors on close
-      }
+    // Close the underlying connection (best effort)
+    pub async fn close(&self) {
+        let mut sender_guard = self.ws_sender.lock().await;
+        let _ = sender_guard.close().await; // Ignore errors on close
+    }
 }
-
 
 /// Session manager for handling multiple client sessions
 pub struct SessionManager {
@@ -168,11 +184,10 @@ impl SessionManager {
             // Remove from IP mapping as well
             let mut ip_sessions_guard = self.ip_sessions.lock().await;
             ip_sessions_guard.remove(&removed_session.ip_address);
-             // Optionally close the session's connection
-             // tokio::spawn(async move { removed_session.close().await; });
+            // Optionally close the session's connection
+            // tokio::spawn(async move { removed_session.close().await; });
         }
     }
-
 
     /// Update session activity timestamp
     pub async fn touch_session(&self, session_id: &str) -> Result<(), SessionError> { // Return SessionError
@@ -233,27 +248,26 @@ impl SessionManager {
     /// Close all sessions gracefully (sends disconnect message)
     pub async fn close_all_sessions(&self, reason: &str) {
         let sessions_to_close = { // Scope to release lock quickly
-             let sessions_guard = self.sessions.lock().await;
-             sessions_guard.values().cloned().collect::<Vec<_>>()
+            let sessions_guard = self.sessions.lock().await;
+            sessions_guard.values().cloned().collect::<Vec<_>>()
         }; // sessions_guard lock released here
 
         let disconnect_packet = crate::protocol::serialization::create_disconnect_packet(
             crate::protocol::types::disconnect_reason::SERVER_SHUTDOWN,
-             reason
+            reason
         );
 
         // Send disconnect notifications concurrently
         let close_futures = sessions_to_close.iter().map(|session| {
             let packet = disconnect_packet.clone();
-             async move {
-                 if let Err(e) = session.send_packet(&packet).await {
-                     warn!("Failed to send disconnect to {}: {}", session.client_id, e);
-                 }
-                 session.close().await; // Also explicitly close the connection
-             }
+            async move {
+                if let Err(e) = session.send_packet(&packet).await {
+                    warn!("Failed to send disconnect to {}: {}", session.client_id, e);
+                }
+                session.close().await; // Also explicitly close the connection
+            }
         });
-         futures::future::join_all(close_futures).await;
-
+        futures::future::join_all(close_futures).await;
 
         // Clear all session tracking data AFTER attempting notifications
         {
@@ -264,43 +278,50 @@ impl SessionManager {
             let mut ip_sessions_guard = self.ip_sessions.lock().await;
             ip_sessions_guard.clear();
         }
-         tracing::info!("Cleared all active sessions.");
+        info!("Cleared all active sessions.");
     }
-
 
     /// Clean up expired sessions based on idle time
     pub async fn cleanup_expired_sessions(&self) -> usize {
-         let timeout = self.session_timeout;
-         let mut expired_ids = Vec::new();
+        let timeout = self.session_timeout;
+        let mut expired_ids = Vec::new();
 
         // --- Identify expired sessions ---
-         { // Scope for read lock
-             let sessions_guard = self.sessions.lock().await;
-             for (id, session) in sessions_guard.iter() {
-                 if session.idle_time().await > timeout {
-                     expired_ids.push(id.clone());
-                 }
-             }
-         } // sessions_guard lock released
+        { // Scope for read lock
+            let sessions_guard = self.sessions.lock().await;
+            for (id, session) in sessions_guard.iter() {
+                if session.idle_time().await > timeout {
+                    expired_ids.push(id.clone());
+                }
+            }
+        } // sessions_guard lock released
 
         // --- Remove expired sessions ---
-         if !expired_ids.is_empty() {
-             let mut sessions_guard = self.sessions.lock().await;
-             let mut ip_sessions_guard = self.ip_sessions.lock().await;
+        if !expired_ids.is_empty() {
+            let mut sessions_guard = self.sessions.lock().await;
+            let mut ip_sessions_guard = self.ip_sessions.lock().await;
 
-             for id in &expired_ids {
-                 if let Some(removed_session) = sessions_guard.remove(id) {
-                     ip_sessions_guard.remove(&removed_session.ip_address);
-                     // Optionally close the session's connection
-                      tokio::spawn(async move { removed_session.close().await; });
-                 }
-             }
-         }
+            for id in &expired_ids {
+                if let Some(removed_session) = sessions_guard.remove(id) {
+                    ip_sessions_guard.remove(&removed_session.ip_address);
+                    // Optionally close the session's connection
+                    tokio::spawn(async move { removed_session.close().await; });
+                }
+            }
+        }
 
-         expired_ids.len() // Return the count of removed sessions
+        expired_ids.len() // Return the count of removed sessions
+    }
+
+    /// Get all sessions using a specific encryption algorithm
+    pub async fn get_sessions_by_algorithm(&self, algorithm: &str) -> Vec<ClientSession> {
+        let sessions_guard = self.sessions.lock().await;
+        sessions_guard.values()
+            .filter(|s| s.encryption_algorithm == algorithm)
+            .cloned()
+            .collect()
     }
 }
-
 
 // Session error type - Add StreamConsumed variant
 #[derive(Debug, thiserror::Error)]
