@@ -36,47 +36,47 @@ pub struct ClientSession {
 }
 
     impl ClientSession {
-        /// Create a new client session with split WebSocket components wrapped in Arc<Mutex<>>
-        pub fn new(
-            id: String,
-            client_id: String,
-            ip_address: String,
-            address: SocketAddr,
-            ws_sender: Arc<Mutex<SplitSink<WebSocketStream<TlsStream<TcpStream>>, Message>>>,
-            ws_receiver: Arc<Mutex<SplitStream<WebSocketStream<TlsStream<TcpStream>>>>>,
-            encryption_algorithm: Option<String>,
-        ) -> Result<Self, ServerError> {
-            // Set default encryption algorithm or use client's preferred algorithm
-            let algo = encryption_algorithm.unwrap_or_else(|| 
-                crate::protocol::types::encryption_algorithms::default().to_string()
-            );
-            // Log the encryption algorithm being used for this session
-            info!("Creating client session with encryption algorithm: {}", algo);
-            
-            Ok(Self {
-                id,
-                client_id,
-                ip_address,
-                address,
-                ws_sender,
-                ws_receiver,
-                last_activity: Arc::new(Mutex::new(Instant::now())),
-                stream_taken: Arc::new(Mutex::new(false)),
-                encryption_algorithm: algo,
-                enable_fallback: Arc::new(Mutex::new(true)), // Default to enabling fallback
-            })
-        }
+    /// Create a new client session with split WebSocket components wrapped in Arc<Mutex<>>
+    pub fn new(
+        id: String,
+        client_id: String,
+        ip_address: String,
+        address: SocketAddr,
+        ws_sender: Arc<Mutex<SplitSink<WebSocketStream<TlsStream<TcpStream>>, Message>>>,
+        ws_receiver: Arc<Mutex<SplitStream<WebSocketStream<TlsStream<TcpStream>>>>>,
+        encryption_algorithm: Option<String>,
+    ) -> Result<Self, ServerError> {
+        // Set default encryption algorithm or use client's preferred algorithm
+        let algo = encryption_algorithm.unwrap_or_else(|| 
+            crate::protocol::types::encryption_algorithms::default().to_string()
+        );
+        // Log the encryption algorithm being used for this session
+        info!("Creating client session with encryption algorithm: {}", algo);
+        
+        Ok(Self {
+            id,
+            client_id,
+            ip_address,
+            address,
+            ws_sender,
+            ws_receiver,
+            last_activity: Arc::new(Mutex::new(Instant::now())),
+            stream_taken: Arc::new(Mutex::new(false)),
+            encryption_algorithm: algo,
+            enable_fallback: Arc::new(Mutex::new(true)), // Default to enabling fallback
+        })
     }
-
+    
     /// Set whether fallback to alternative encryption algorithm is allowed
     pub async fn set_fallback_enabled(&self, enabled: bool) {
         let mut fallback_guard = self.enable_fallback.lock().await;
         *fallback_guard = enabled;
     }
-
-    /// Check if fallback encryption is enabled for this session
+    
+    /// Get current fallback enabled status as boolean value
     pub async fn is_fallback_enabled(&self) -> bool {
-        *self.enable_fallback.lock().await
+        let fallback_guard = self.enable_fallback.lock().await;
+        *fallback_guard
     }
 
     /// Get the EncryptionAlgorithm enum from the string representation
