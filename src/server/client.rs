@@ -418,10 +418,8 @@ async fn process_client_session(
              if let Some(current_key) = session_key_manager_clone.get_key(&session_rot.client_id).await {
                  // Use the session's encryption algorithm for key rotation
                  // Unwrap the Option<String> to get &str, then parse algorithm
-                 let algorithm = session_rot.encryption_algorithm
-                     .as_deref() // Option<String> -> Option<&str>
-                     .and_then(EncryptionAlgorithm::from_str) // Parse to algorithm if valid
-                     .unwrap_or_default(); // Default if None or parsing fails
+                 let algorithm = EncryptionAlgorithm::from_str(&session_rot.encryption_algorithm)
+                .unwrap_or_default(); // Default if None or parsing fails
 
                  let encrypted_packet = match crate::crypto::flexible_encryption::encrypt_flexible(
                      &new_key,
