@@ -218,56 +218,69 @@ impl PacketRouter {
                 return Err(RoutingError::Decryption(e.to_string()));
             }
         };
-
+    
         // Try to parse as a DataEnvelope
         match serde_json::from_slice::<DataEnvelope>(&decrypted) {
             Ok(envelope) => {
                 match envelope.payload_type {
                     PayloadDataType::Json => {
-                        // Route JSON payload to application logic
-                        debug!("Routing JSON payload to application logic.");
-                        match self.process_json_message(envelope.payload, session).await {
-                            Ok(_) => {
-                                // JSON processing successful (e.g., message forwarded)
-                                Ok(decrypted.len()) // Return original decrypted data length
-                            }
-                            Err(e) => {
-                                // Application layer processing error
-                                warn!("Error processing JSON message: {}", e);
-                                Err(e)
-                            }
-                        }
+                        // Handle JSON payload (application messages)
+                        debug!("Processing JSON payload from client {}", session.client_id);
+                        self.process_json_payload(envelope.payload, session).await
                     },
                     PayloadDataType::Ip => {
-                        // Route IP payload to TUN device
-                        debug!("Routing IP payload to TUN device.");
-                        // Extract Base64 string from the payload Value
-                        if let Some(base64_payload) = envelope.payload.as_str() {
-                            // Base64 decode
-                            match base64::decode(base64_payload) {
-                                Ok(ip_packet_bytes) => {
-                                    // Write to TUN device
-                                    return self.write_to_tun_device(&ip_packet_bytes).await;
-                                },
-                                Err(e) => {
-                                    warn!("Failed to decode Base64 IP payload: {}", e);
-                                    return Err(RoutingError::InvalidPacket(format!("Invalid Base64 IP payload: {}", e)));
-                                }
-                            }
-                        } else {
-                            warn!("Received IP payloadType but payload was not a string.");
-                            return Err(RoutingError::InvalidPacket("IP payload not a string".to_string()));
-                        }
+                        // Handle IP payload (VPN packets)
+                        debug!("Processing IP packet payload from client {}", session.client_id);
+                        self.process_ip_payload(envelope.payload, session).await
                     }
                 }
             },
             Err(e) => {
-                // Not a DataEnvelope, try legacy mode (direct IP packet)
-                warn!("Failed to parse as DataEnvelope: {}. Assuming legacy IP packet.", e);
+                // Legacy mode: Try direct IP packet (without envelope)
+                debug!("Failed to parse as DataEnvelope: {}. Trying legacy mode as direct IP packet.", e);
                 return self.write_to_tun_device(&decrypted).await;
             }
         }
     }
+
+    async fn process_json_payload(
+        &self,
+        payload: serde_json::Value,
+        session: &ClientSession,
+    ) -> Result<usize, RoutingError> {
+        // Extract message type from the JSON payload
+        let msg_type = payload.get("type")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| RoutingError::InvalidPacket("Missing 'type' field in JSON payload".to_string()))?;
+        
+        match msg_type {
+            "message" => self.handle_chat_message(payload, session).await,
+            "participants_request" => self.handle_participants_request(session).await,
+            "webrtc_signal" => self.handle_webrtc_signal(payload, session).await,
+            _ => {
+                warn!("Unknown JSON message type: {}", msg_type);
+                Err(RoutingError::InvalidPacket(format!("Unknown message type: {}", msg_type)))
+            }
+        }
+    }
+
+    async fn process_ip_payload(
+        &self,
+        payload: serde_json::Value,
+        _session: &ClientSession,
+    ) -> Result<usize, RoutingError> {
+        // Extract Base64 string from the payload
+        let base64_ip = payload.as_str()
+            .ok_or_else(|| RoutingError::InvalidPacket("IP payload is not a string".to_string()))?;
+        
+        // Decode Base64 to get IP packet bytes
+        let ip_packet_bytes = base64::decode(base64_ip)
+            .map_err(|e| RoutingError::InvalidPacket(format!("Invalid Base64 IP payload: {}", e)))?;
+        
+        // Write the IP packet to the TUN device
+        self.write_to_tun_device(&ip_packet_bytes).await
+    }
+
     
     /// Helper method to write data to the TUN device
     async fn write_to_tun_device(&self, data: &[u8]) -> Result<usize, RoutingError> {
@@ -411,7 +424,7 @@ impl PacketRouter {
     ) -> Result<(), RoutingError> {
         // Serialize the envelope
         let envelope_data = serde_json::to_vec(envelope)
-            .map_err(|e| RoutingError::Processing(format!("Failed to serialize envelope: {}", e)))?;
+            .map_err(|e| RoutingError::Protocol(MessageError::InvalidFormat(e.to_string())))?;
         
         // Get target's encryption algorithm
         let algorithm = crate::crypto::flexible_encryption::EncryptionAlgorithm::from_str(
