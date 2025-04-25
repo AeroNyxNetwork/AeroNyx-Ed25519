@@ -35,6 +35,23 @@ pub enum MessageError {
     VersionMismatch(String, String),
 }
 
+/// Data payload types for mixed mode
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum PayloadDataType {
+    Json,
+    Ip,
+}
+
+/// Envelope structure for encapsulating different payload types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataEnvelope {
+    pub payload_type: PayloadDataType,
+    // Use Value for flexibility, or define a specific enum for payload types
+    pub payload: Value,
+}
+
 /// Packet types for client-server communication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
