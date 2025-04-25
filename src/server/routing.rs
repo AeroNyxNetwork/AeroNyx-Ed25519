@@ -444,7 +444,7 @@ impl PacketRouter {
         
         // Send to target client
         target_session.send_packet(&data_packet).await
-            .map_err(|e| RoutingError::Protocol(e))?;
+            .map_err(|e| RoutingError::Protocol(MessageError::InvalidFormat(e.to_string())))?;
         
         Ok(())
     }
