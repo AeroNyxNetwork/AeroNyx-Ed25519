@@ -16,7 +16,7 @@ use serde::{Serialize, Deserialize};
 use tracing::{debug, error, trace, warn};
 
 use crate::config::constants::{MIN_PADDING_SIZE, MAX_PADDING_SIZE, PAD_PROBABILITY};
-use crate::crypto::{encrypt_packet, decrypt_packet};
+// Removed: use crate::crypto::{encrypt_packet, decrypt_packet};
 use crate::protocol::{PacketType, MessageError};
 // Removed unused packet_to_ws_message import
 use crate::server::session::ClientSession;
@@ -122,7 +122,7 @@ impl PacketRouter {
         &self,
         packet: &[u8],
         session_key: &[u8],
-        _session: &ClientSession,,
+        session: &ClientSession,
     ) -> Result<(), RoutingError> {
         // Check packet size
         if packet.len() > self.max_packet_size {
@@ -218,7 +218,7 @@ impl PacketRouter {
                 return Err(RoutingError::Decryption(e.to_string()));
             }
         };
-    
+
         // Try to parse as a DataEnvelope
         match serde_json::from_slice::<DataEnvelope>(&decrypted) {
             Ok(envelope) => {
@@ -243,11 +243,48 @@ impl PacketRouter {
         }
     }
 
+    /// Process JSON payload from client
+    async fn process_json_payload(
+        &self,
+        payload: serde_json::Value,
+        session: &ClientSession,
+    ) -> Result<usize, RoutingError> {
+        // Extract message type from the JSON payload
+        let msg_type = payload.get("type")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| RoutingError::InvalidPacket("Missing 'type' field in JSON payload".to_string()))?;
+        
+        match msg_type {
+            "message" => {
+                // Handle the message and return the processed size
+                self.handle_chat_message(payload, session).await?;
+                // Return the size of the processed JSON (or estimated size)
+                Ok(payload.to_string().len())
+            },
+            "participants_request" => {
+                // Handle the request and return the processed size
+                self.handle_participants_request(session).await?;
+                // Return the size of the processed JSON (or estimated size)
+                Ok(payload.to_string().len())
+            },
+            "webrtc_signal" => {
+                // Handle the signal and return the processed size
+                self.handle_webrtc_signal(payload, session).await?;
+                // Return the size of the processed JSON (or estimated size)
+                Ok(payload.to_string().len())
+            },
+            _ => {
+                warn!("Unknown JSON message type: {}", msg_type);
+                Err(RoutingError::InvalidPacket(format!("Unknown message type: {}", msg_type)))
+            }
+        }
+    }
 
+    /// Process IP payload from client
     async fn process_ip_payload(
         &self,
         payload: serde_json::Value,
-        _session: &ClientSession, // Note the underscore prefix
+        session: &ClientSession,
     ) -> Result<usize, RoutingError> {
         // Extract Base64 string from the payload
         let base64_ip = payload.as_str()
@@ -260,24 +297,6 @@ impl PacketRouter {
         // Write the IP packet to the TUN device
         self.write_to_tun_device(&ip_packet_bytes).await
     }
-
-    async fn process_ip_payload(
-        &self,
-        payload: serde_json::Value,
-        __session: &ClientSession,,
-    ) -> Result<usize, RoutingError> {
-        // Extract Base64 string from the payload
-        let base64_ip = payload.as_str()
-            .ok_or_else(|| RoutingError::InvalidPacket("IP payload is not a string".to_string()))?;
-        
-        // Decode Base64 to get IP packet bytes
-        let ip_packet_bytes = base64::decode(base64_ip)
-            .map_err(|e| RoutingError::InvalidPacket(format!("Invalid Base64 IP payload: {}", e)))?;
-        
-        // Write the IP packet to the TUN device
-        self.write_to_tun_device(&ip_packet_bytes).await
-    }
-
     
     /// Helper method to write data to the TUN device
     async fn write_to_tun_device(&self, data: &[u8]) -> Result<usize, RoutingError> {
@@ -336,34 +355,11 @@ impl PacketRouter {
         }
     }
 
-    /// Process a JSON message from a client
-    async fn process_json_message(
-        &self,
-        payload: serde_json::Value,
-        _session: &ClientSession,,
-    ) -> Result<(), RoutingError> {
-        // Extract message type
-        let msg_type = payload.get("type")
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| RoutingError::InvalidPacket("Missing 'type' field in JSON payload".to_string()))?;
-        
-        match msg_type {
-            "message" => self.handle_chat_message(payload, session).await,
-            "participants_request" => self.handle_participants_request(session).await,
-            "webrtc_signal" => self.handle_webrtc_signal(payload, session).await,
-            // Add more message types as needed
-            _ => {
-                warn!("Unknown JSON message type: {}", msg_type);
-                Err(RoutingError::InvalidPacket(format!("Unknown message type: {}", msg_type)))
-            }
-        }
-    }
-
     /// Handle a chat message
     async fn handle_chat_message(
         &self,
         payload: serde_json::Value,
-        _session: &ClientSession,,
+        session: &ClientSession,
     ) -> Result<(), RoutingError> {
         // Extract required fields
         let chat_id = payload.get("chatId")
@@ -417,11 +413,11 @@ impl PacketRouter {
         &self,
         envelope: &DataEnvelope,
         target_key: &[u8],
-        target__session: &ClientSession,,
+        target_session: &ClientSession,
     ) -> Result<(), RoutingError> {
         // Serialize the envelope
         let envelope_data = serde_json::to_vec(envelope)
-            .map_err(|e| RoutingError::Protocol(MessageError::InvalidFormat(e.to_string())))?;
+            .map_err(|e| RoutingError::Processing(format!("Failed to serialize envelope: {}", e)))?;
         
         // Get target's encryption algorithm
         let algorithm = crate::crypto::flexible_encryption::EncryptionAlgorithm::from_str(
@@ -462,7 +458,7 @@ impl PacketRouter {
     /// Handle request for participants in a room
     async fn handle_participants_request(
         &self,
-        _session: &ClientSession,,
+        session: &ClientSession,
     ) -> Result<(), RoutingError> {
         // Get current room
         let room_id = session.get_current_room().await
@@ -518,7 +514,7 @@ impl PacketRouter {
     async fn handle_webrtc_signal(
         &self,
         payload: serde_json::Value,
-        _session: &ClientSession,,
+        session: &ClientSession,
     ) -> Result<(), RoutingError> {
         // Extract required fields
         let peer_id = payload.get("peerId")
