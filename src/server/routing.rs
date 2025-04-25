@@ -122,7 +122,7 @@ impl PacketRouter {
         &self,
         packet: &[u8],
         session_key: &[u8],
-        session: &ClientSession,
+        _session: &ClientSession,,
     ) -> Result<(), RoutingError> {
         // Check packet size
         if packet.len() > self.max_packet_size {
@@ -243,31 +243,28 @@ impl PacketRouter {
         }
     }
 
-    async fn process_json_payload(
+
+    async fn process_ip_payload(
         &self,
         payload: serde_json::Value,
-        session: &ClientSession,
+        _session: &ClientSession, // Note the underscore prefix
     ) -> Result<usize, RoutingError> {
-        // Extract message type from the JSON payload
-        let msg_type = payload.get("type")
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| RoutingError::InvalidPacket("Missing 'type' field in JSON payload".to_string()))?;
+        // Extract Base64 string from the payload
+        let base64_ip = payload.as_str()
+            .ok_or_else(|| RoutingError::InvalidPacket("IP payload is not a string".to_string()))?;
         
-        match msg_type {
-            "message" => self.handle_chat_message(payload, session).await,
-            "participants_request" => self.handle_participants_request(session).await,
-            "webrtc_signal" => self.handle_webrtc_signal(payload, session).await,
-            _ => {
-                warn!("Unknown JSON message type: {}", msg_type);
-                Err(RoutingError::InvalidPacket(format!("Unknown message type: {}", msg_type)))
-            }
-        }
+        // Decode Base64 to get IP packet bytes
+        let ip_packet_bytes = base64::decode(base64_ip)
+            .map_err(|e| RoutingError::InvalidPacket(format!("Invalid Base64 IP payload: {}", e)))?;
+        
+        // Write the IP packet to the TUN device
+        self.write_to_tun_device(&ip_packet_bytes).await
     }
 
     async fn process_ip_payload(
         &self,
         payload: serde_json::Value,
-        _session: &ClientSession,
+        __session: &ClientSession,,
     ) -> Result<usize, RoutingError> {
         // Extract Base64 string from the payload
         let base64_ip = payload.as_str()
@@ -343,7 +340,7 @@ impl PacketRouter {
     async fn process_json_message(
         &self,
         payload: serde_json::Value,
-        session: &ClientSession,
+        _session: &ClientSession,,
     ) -> Result<(), RoutingError> {
         // Extract message type
         let msg_type = payload.get("type")
@@ -366,7 +363,7 @@ impl PacketRouter {
     async fn handle_chat_message(
         &self,
         payload: serde_json::Value,
-        session: &ClientSession,
+        _session: &ClientSession,,
     ) -> Result<(), RoutingError> {
         // Extract required fields
         let chat_id = payload.get("chatId")
@@ -420,7 +417,7 @@ impl PacketRouter {
         &self,
         envelope: &DataEnvelope,
         target_key: &[u8],
-        target_session: &ClientSession,
+        target__session: &ClientSession,,
     ) -> Result<(), RoutingError> {
         // Serialize the envelope
         let envelope_data = serde_json::to_vec(envelope)
@@ -465,7 +462,7 @@ impl PacketRouter {
     /// Handle request for participants in a room
     async fn handle_participants_request(
         &self,
-        session: &ClientSession,
+        _session: &ClientSession,,
     ) -> Result<(), RoutingError> {
         // Get current room
         let room_id = session.get_current_room().await
@@ -521,7 +518,7 @@ impl PacketRouter {
     async fn handle_webrtc_signal(
         &self,
         payload: serde_json::Value,
-        session: &ClientSession,
+        _session: &ClientSession,,
     ) -> Result<(), RoutingError> {
         // Extract required fields
         let peer_id = payload.get("peerId")
