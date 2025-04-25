@@ -254,24 +254,27 @@ impl PacketRouter {
             .and_then(|t| t.as_str())
             .ok_or_else(|| RoutingError::InvalidPacket("Missing 'type' field in JSON payload".to_string()))?;
         
+        // Store payload size for return value
+        let payload_size = payload.to_string().len();
+        
         match msg_type {
             "message" => {
                 // Handle the message and return the processed size
-                self.handle_chat_message(payload, session).await?;
-                // Return the size of the processed JSON (or estimated size)
-                Ok(payload.to_string().len())
+                self.handle_chat_message(payload.clone(), session).await?;
+                // Return the size of the processed JSON
+                Ok(payload_size)
             },
             "participants_request" => {
                 // Handle the request and return the processed size
                 self.handle_participants_request(session).await?;
-                // Return the size of the processed JSON (or estimated size)
-                Ok(payload.to_string().len())
+                // Return the size of the processed JSON
+                Ok(payload_size)
             },
             "webrtc_signal" => {
                 // Handle the signal and return the processed size
-                self.handle_webrtc_signal(payload, session).await?;
-                // Return the size of the processed JSON (or estimated size)
-                Ok(payload.to_string().len())
+                self.handle_webrtc_signal(payload.clone(), session).await?;
+                // Return the size of the processed JSON
+                Ok(payload_size)
             },
             _ => {
                 warn!("Unknown JSON message type: {}", msg_type);
