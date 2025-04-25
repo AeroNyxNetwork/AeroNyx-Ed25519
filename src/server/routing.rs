@@ -52,6 +52,24 @@ pub enum RoutingError {
     SecurityRisk(String),
 }
 
+/// Data envelope for mixed-mode packet handling
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DataEnvelope {
+    /// Type of the payload data
+    pub payload_type: PayloadDataType,
+    /// Actual payload data
+    pub payload: serde_json::Value,
+}
+
+/// Payload data types supported in envelopes
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PayloadDataType {
+    /// JSON data (application messages)
+    Json,
+    /// IP packet data (encoded as Base64 string)
+    Ip,
+}
+
 /// Handles routing of packets between clients and the TUN device
 pub struct PacketRouter {
     /// Maximum packet size
@@ -156,14 +174,14 @@ impl PacketRouter {
         Ok(())
     }
 
-    /// Handle an inbound packet from a client
+    /// Handle an inbound packet from a client with mixed mode support
     pub async fn handle_inbound_packet(
         &self,
         encrypted: &[u8],
         nonce: &[u8],
         session_key: &[u8],
         session: &ClientSession,
-        encryption_algorithm: Option<&str>, // New parameter from Data packet
+        encryption_algorithm: Option<&str>,
     ) -> Result<usize, RoutingError> {
         // Determine which algorithm to use
         let algorithm = if let Some(algo) = encryption_algorithm {
@@ -182,20 +200,12 @@ impl PacketRouter {
             ).unwrap_or_default()
         };
         
-        debug!("Attempting to decrypt packet (size={} bytes, nonce={} bytes) with {:?} algorithm", 
-                encrypted.len(), nonce.len(), algorithm);
-        
-        // Log session key
-        if !session_key.is_empty() {
-            debug!("Session key prefix: {:02x?}", &session_key[0..std::cmp::min(8, session_key.len())]);
-        }
-        
-        // 获取enable_fallback布尔值
+        // Get enable_fallback boolean
         let enable_fallback = session.is_fallback_enabled().await;
         
         // Decrypt using flexible decryption with fallback
         let decrypted = match crate::crypto::flexible_encryption::decrypt_packet(
-            encrypted, session_key, nonce, algorithm, enable_fallback // 传递布尔值
+            encrypted, session_key, nonce, algorithm, enable_fallback
         ) {
             Ok(data) => {
                 debug!("Packet decryption successful, received {} bytes", data.len());
@@ -204,46 +214,96 @@ impl PacketRouter {
             Err(e) => {
                 error!("Packet decryption failed: {}", e);
                 error!("Packet details: algo={:?}, encrypted={} bytes, nonce={:?}, enable_fallback={}", 
-                       algorithm, encrypted.len(), nonce, enable_fallback); // 使用布尔值进行日志记录
+                       algorithm, encrypted.len(), nonce, enable_fallback);
                 return Err(RoutingError::Decryption(e.to_string()));
             }
         };
+
+        // Try to parse as a DataEnvelope
+        match serde_json::from_slice::<DataEnvelope>(&decrypted) {
+            Ok(envelope) => {
+                match envelope.payload_type {
+                    PayloadDataType::Json => {
+                        // Route JSON payload to application logic
+                        debug!("Routing JSON payload to application logic.");
+                        match self.process_json_message(envelope.payload, session).await {
+                            Ok(_) => {
+                                // JSON processing successful (e.g., message forwarded)
+                                Ok(decrypted.len()) // Return original decrypted data length
+                            }
+                            Err(e) => {
+                                // Application layer processing error
+                                warn!("Error processing JSON message: {}", e);
+                                Err(e)
+                            }
+                        }
+                    },
+                    PayloadDataType::Ip => {
+                        // Route IP payload to TUN device
+                        debug!("Routing IP payload to TUN device.");
+                        // Extract Base64 string from the payload Value
+                        if let Some(base64_payload) = envelope.payload.as_str() {
+                            // Base64 decode
+                            match base64::decode(base64_payload) {
+                                Ok(ip_packet_bytes) => {
+                                    // Write to TUN device
+                                    return self.write_to_tun_device(&ip_packet_bytes).await;
+                                },
+                                Err(e) => {
+                                    warn!("Failed to decode Base64 IP payload: {}", e);
+                                    return Err(RoutingError::InvalidPacket(format!("Invalid Base64 IP payload: {}", e)));
+                                }
+                            }
+                        } else {
+                            warn!("Received IP payloadType but payload was not a string.");
+                            return Err(RoutingError::InvalidPacket("IP payload not a string".to_string()));
+                        }
+                    }
+                }
+            },
+            Err(e) => {
+                // Not a DataEnvelope, try legacy mode (direct IP packet)
+                warn!("Failed to parse as DataEnvelope: {}. Assuming legacy IP packet.", e);
+                return self.write_to_tun_device(&decrypted).await;
+            }
+        }
+    }
     
+    /// Helper method to write data to the TUN device
+    async fn write_to_tun_device(&self, data: &[u8]) -> Result<usize, RoutingError> {
         // Check packet size
-        if decrypted.len() > self.max_packet_size {
+        if data.len() > self.max_packet_size {
             return Err(RoutingError::InvalidPacket(format!(
-                "Decrypted packet size {} exceeds maximum {}",
-                decrypted.len(), self.max_packet_size
+                "Packet size {} exceeds maximum {}",
+                data.len(), self.max_packet_size
             )));
         }
     
         // Check for attack patterns
-        if let Some(reason) = detect_attack_patterns(&decrypted) {
-            warn!("Security risk in packet from {}: {}", session.client_id, reason);
+        if let Some(reason) = detect_attack_patterns(data) {
+            warn!("Security risk in packet: {}", reason);
             return Err(RoutingError::SecurityRisk(reason));
         }
     
         // Remove padding if necessary
         let packet_data = if self.enable_padding {
-            match self.remove_padding(&decrypted) {
-                Ok(data) => {
+            match self.remove_padding(data) {
+                Ok(clean_data) => {
                     debug!("Padding removed, packet size reduced from {} to {} bytes", 
-                          decrypted.len(), data.len());
-                    data
+                          data.len(), clean_data.len());
+                    clean_data
                 },
                 Err(e) => {
                     warn!("Failed to remove padding from packet: {}", e);
-                    decrypted
+                    data.to_vec()
                 }
             }
         } else {
-            decrypted
+            data.to_vec()
         };
-    
-        debug!("Processed packet, ready to write {} bytes to TUN device", packet_data.len());
-    
-        // Get the TUN device from the global reference
-        if let Some(tun_device) = crate::server::globals::SERVER_TUN_DEVICE.get() {
+        
+        // Get the TUN device
+        if let Some(tun_device) = crate::server::globals::get_tun_device() {
             // Write the packet to the TUN device
             let written = {
                 let mut device = tun_device.lock().await;
@@ -258,12 +318,231 @@ impl PacketRouter {
                     }
                 }
             };
-    
+            
             Ok(written)
         } else {
             error!("TUN device not initialized");
             Err(RoutingError::TunWrite("TUN device not initialized".to_string()))
         }
+    }
+
+    /// Process a JSON message from a client
+    async fn process_json_message(
+        &self,
+        payload: serde_json::Value,
+        session: &ClientSession,
+    ) -> Result<(), RoutingError> {
+        // Extract message type
+        let msg_type = payload.get("type")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| RoutingError::InvalidPacket("Missing 'type' field in JSON payload".to_string()))?;
+        
+        match msg_type {
+            "message" => self.handle_chat_message(payload, session).await,
+            "participants_request" => self.handle_participants_request(session).await,
+            "webrtc_signal" => self.handle_webrtc_signal(payload, session).await,
+            // Add more message types as needed
+            _ => {
+                warn!("Unknown JSON message type: {}", msg_type);
+                Err(RoutingError::InvalidPacket(format!("Unknown message type: {}", msg_type)))
+            }
+        }
+    }
+
+    /// Handle a chat message
+    async fn handle_chat_message(
+        &self,
+        payload: serde_json::Value,
+        session: &ClientSession,
+    ) -> Result<(), RoutingError> {
+        // Extract required fields
+        let chat_id = payload.get("chatId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RoutingError::InvalidPacket("Missing chatId in message".to_string()))?;
+
+        // Get session manager
+        let session_manager = crate::server::globals::get_session_manager()
+            .ok_or_else(|| RoutingError::Processing("Session manager not available".to_string()))?;
+        
+        // Update session's current room if changed
+        let current_room = session.get_current_room().await;
+        if current_room.as_deref() != Some(chat_id) {
+            session.set_current_room(Some(chat_id.to_string())).await;
+        }
+        
+        // Get all sessions in the same chat room
+        let sessions = session_manager.get_sessions_by_room(chat_id).await;
+        
+        // Forward message to all other sessions in the room
+        for target_session in sessions {
+            if target_session.id != session.id {
+                // Create envelope for the target session
+                let envelope = DataEnvelope {
+                    payload_type: PayloadDataType::Json,
+                    payload: payload.clone(),
+                };
+                
+                // Try to get target session's encryption key
+                if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
+                    if let Some(target_key) = session_key_manager.get_key(&target_session.client_id).await {
+                        // Create encrypted message packet
+                        if let Err(e) = self.forward_envelope_to_session(&envelope, &target_key, &target_session).await {
+                            warn!("Failed to forward message to {}: {}", target_session.client_id, e);
+                            // Continue with other sessions - don't fail entire operation for one recipient
+                        }
+                    } else {
+                        warn!("No session key found for {}", target_session.client_id);
+                    }
+                } else {
+                    warn!("Session key manager not available");
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Forward an envelope to a session
+    async fn forward_envelope_to_session(
+        &self,
+        envelope: &DataEnvelope,
+        target_key: &[u8],
+        target_session: &ClientSession,
+    ) -> Result<(), RoutingError> {
+        // Serialize the envelope
+        let envelope_data = serde_json::to_vec(envelope)
+            .map_err(|e| RoutingError::Processing(format!("Failed to serialize envelope: {}", e)))?;
+        
+        // Get target's encryption algorithm
+        let algorithm = crate::crypto::flexible_encryption::EncryptionAlgorithm::from_str(
+            &target_session.encryption_algorithm
+        ).unwrap_or_default();
+        
+        // Encrypt the envelope
+        let encrypted_packet = crate::crypto::flexible_encryption::encrypt_packet(
+            &envelope_data,
+            target_key,
+            Some(algorithm),
+        ).map_err(|e| RoutingError::Encryption(e.to_string()))?;
+        
+        // Get next packet counter (should be atomic)
+        let counter = {
+            let mut counter = self.packet_counter.lock().await;
+            let value = *counter;
+            *counter = value.wrapping_add(1);
+            value
+        };
+        
+        // Create Data packet
+        let data_packet = crate::protocol::types::PacketType::Data {
+            encrypted: encrypted_packet.data,
+            nonce: encrypted_packet.nonce,
+            counter,
+            padding: None,
+            encryption_algorithm: Some(encrypted_packet.algorithm.as_str().to_string()),
+        };
+        
+        // Send to target client
+        target_session.send_packet(&data_packet).await
+            .map_err(|e| RoutingError::Protocol(e))?;
+        
+        Ok(())
+    }
+
+    /// Handle request for participants in a room
+    async fn handle_participants_request(
+        &self,
+        session: &ClientSession,
+    ) -> Result<(), RoutingError> {
+        // Get current room
+        let room_id = session.get_current_room().await
+            .ok_or_else(|| RoutingError::InvalidPacket("Client not in a room".to_string()))?;
+        
+        // Get session manager
+        let session_manager = crate::server::globals::get_session_manager()
+            .ok_or_else(|| RoutingError::Processing("Session manager not available".to_string()))?;
+        
+        // Get all sessions in the room
+        let sessions = session_manager.get_sessions_by_room(&room_id).await;
+        
+        // Create participants list
+        let participants: Vec<serde_json::Value> = sessions.iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.client_id,
+                    "name": s.get_display_name().unwrap_or_else(|| s.client_id.clone()),
+                    "online": true
+                })
+            })
+            .collect();
+        
+        // Create response
+        let response = serde_json::json!({
+            "type": "participants_response",
+            "roomId": room_id,
+            "participants": participants
+        });
+        
+        // Create envelope
+        let envelope = DataEnvelope {
+            payload_type: PayloadDataType::Json,
+            payload: response,
+        };
+        
+        // Get session key
+        if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
+            if let Some(session_key) = session_key_manager.get_key(&session.client_id).await {
+                // Forward to requesting client
+                self.forward_envelope_to_session(&envelope, &session_key, session).await?;
+            } else {
+                return Err(RoutingError::Processing(format!("No session key found for {}", session.client_id)));
+            }
+        } else {
+            return Err(RoutingError::Processing("Session key manager not available".to_string()));
+        }
+        
+        Ok(())
+    }
+
+    /// Handle WebRTC signaling message
+    async fn handle_webrtc_signal(
+        &self,
+        payload: serde_json::Value,
+        session: &ClientSession,
+    ) -> Result<(), RoutingError> {
+        // Extract required fields
+        let peer_id = payload.get("peerId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RoutingError::InvalidPacket("Missing peerId in WebRTC signal".to_string()))?;
+        
+        // Get session manager
+        let session_manager = crate::server::globals::get_session_manager()
+            .ok_or_else(|| RoutingError::Processing("Session manager not available".to_string()))?;
+        
+        // Find target session
+        let target_session = session_manager.get_session_by_client_id(peer_id).await
+            .ok_or_else(|| RoutingError::Processing(format!("Peer {} not found", peer_id)))?;
+        
+        // Create envelope
+        let envelope = DataEnvelope {
+            payload_type: PayloadDataType::Json,
+            payload: payload.clone(),
+        };
+        
+        // Get session key manager
+        if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
+            // Get target session key
+            if let Some(target_key) = session_key_manager.get_key(&target_session.client_id).await {
+                // Forward signal
+                self.forward_envelope_to_session(&envelope, &target_key, &target_session).await?;
+            } else {
+                return Err(RoutingError::Processing(format!("No session key found for {}", target_session.client_id)));
+            }
+        } else {
+            return Err(RoutingError::Processing("Session key manager not available".to_string()));
+        }
+        
+        Ok(())
     }
 
     /// Check if padding should be added based on probability
@@ -465,5 +744,65 @@ mod tests {
             EncryptionAlgorithm::Aes256Gcm, true
         ).unwrap();
         assert_eq!(data.to_vec(), decrypted_fallback);
+    }
+    
+    #[test]
+    fn test_data_envelope_serialization() {
+        // Test creation and serialization of data envelopes
+        let json_envelope = DataEnvelope {
+            payload_type: PayloadDataType::Json,
+            payload: serde_json::json!({ "type": "message", "text": "Hello" }),
+        };
+        
+        // Serialize
+        let serialized = serde_json::to_string(&json_envelope).unwrap();
+        
+        // Deserialize
+        let deserialized: DataEnvelope = serde_json::from_str(&serialized).unwrap();
+        
+        // Verify payload type
+        assert_eq!(deserialized.payload_type, PayloadDataType::Json);
+        
+        // Verify payload data
+        assert_eq!(
+            deserialized.payload.get("type").and_then(|v| v.as_str()),
+            Some("message")
+        );
+        assert_eq!(
+            deserialized.payload.get("text").and_then(|v| v.as_str()),
+            Some("Hello")
+        );
+    }
+
+    #[test]
+    fn test_base64_ip_envelope() {
+        // Create mock IP packet
+        let ip_data = vec![0x45, 0x00, 0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 
+                           0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+                           0x0A, 0x07, 0x00, 0x05];
+        
+        // Create Base64 representation
+        let base64_ip = base64::encode(&ip_data);
+        
+        // Create envelope
+        let ip_envelope = DataEnvelope {
+            payload_type: PayloadDataType::Ip,
+            payload: serde_json::Value::String(base64_ip.clone()),
+        };
+        
+        // Serialize and deserialize
+        let serialized = serde_json::to_string(&ip_envelope).unwrap();
+        let deserialized: DataEnvelope = serde_json::from_str(&serialized).unwrap();
+        
+        // Verify payload type
+        assert_eq!(deserialized.payload_type, PayloadDataType::Ip);
+        
+        // Verify we can extract the base64 string
+        let extracted_base64 = deserialized.payload.as_str().unwrap();
+        assert_eq!(extracted_base64, base64_ip);
+        
+        // Verify we can decode back to original data
+        let decoded = base64::decode(extracted_base64).unwrap();
+        assert_eq!(decoded, ip_data);
     }
 }
