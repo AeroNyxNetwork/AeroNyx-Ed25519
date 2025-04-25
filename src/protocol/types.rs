@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use serde_json::Value;
 
 /// Error type for protocol message handling
 #[derive(Debug, Error)]
