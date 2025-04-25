@@ -30,6 +30,15 @@ static SESSION_KEY_MANAGER: OnceCell<Arc<SessionKeyManager>> = OnceCell::new();
 ///
 /// # Returns
 ///
+
+pub fn init_globals(tun_device: Arc<Mutex<tun::platform::Device>>) {
+    // Set the TUN device
+    match set_tun_device(tun_device) {
+        true => debug!("Global TUN device initialized successfully"),
+        false => warn!("Failed to initialize global TUN device - already set")
+    }
+}
+
 /// * `bool` - true if the device was set, false if already initialized
 pub fn set_tun_device(device: Arc<Mutex<tun::platform::Device>>) -> bool {
     match TUN_DEVICE.set(device) {
