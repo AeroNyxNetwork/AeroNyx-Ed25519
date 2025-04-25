@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::WebSocketStream;
 use futures::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
 use tokio_tungstenite::tungstenite::Message;
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tracing::{warn, info};
 use tokio_rustls::server::TlsStream;
 use tokio::net::TcpStream;
+use std::sync::atomic::AtomicBool;
 
 use crate::protocol::PacketType;
 use crate::protocol::serialization::packet_to_ws_message;
@@ -28,14 +29,20 @@ pub struct ClientSession {
     ws_sender: Arc<Mutex<SplitSink<WebSocketStream<TlsStream<TcpStream>>, Message>>>,
     ws_receiver: Arc<Mutex<SplitStream<WebSocketStream<TlsStream<TcpStream>>>>>,
     pub last_activity: Arc<Mutex<Instant>>,
-    stream_taken: Arc<Mutex<bool>>,
+    stream_taken: Arc<AtomicBool>,
     
     // New fields for encryption support
     pub encryption_algorithm: String,     // String representation of algorithm (for logs/debugging)
-    pub enable_fallback: Arc<Mutex<bool>>, // Whether to try fallback algorithm if primary fails
+    
+    /// Current room ID
+    current_room: Arc<RwLock<Option<String>>>,
+    /// User display name
+    display_name: Arc<RwLock<Option<String>>>,
+    /// Fallback encryption enabled
+    fallback_enabled: Arc<RwLock<bool>>,
 }
 
-    impl ClientSession {
+impl ClientSession {
     /// Create a new client session with split WebSocket components wrapped in Arc<Mutex<>>
     pub fn new(
         id: String,
@@ -46,12 +53,11 @@ pub struct ClientSession {
         ws_receiver: Arc<Mutex<SplitStream<WebSocketStream<TlsStream<TcpStream>>>>>,
         encryption_algorithm: Option<String>,
     ) -> Result<Self, ServerError> {
-        // Set default encryption algorithm or use client's preferred algorithm
-        let algo = encryption_algorithm.unwrap_or_else(|| 
-            crate::protocol::types::encryption_algorithms::default().to_string()
-        );
+        // Default to ChaCha20Poly1305 if not specified
+        let algorithm = encryption_algorithm.unwrap_or_else(|| "chacha20poly1305".to_string());
+        
         // Log the encryption algorithm being used for this session
-        info!("Creating client session with encryption algorithm: {}", algo);
+        info!("Creating client session with encryption algorithm: {}", algorithm);
         
         Ok(Self {
             id,
@@ -61,22 +67,24 @@ pub struct ClientSession {
             ws_sender,
             ws_receiver,
             last_activity: Arc::new(Mutex::new(Instant::now())),
-            stream_taken: Arc::new(Mutex::new(false)),
-            encryption_algorithm: algo,
-            enable_fallback: Arc::new(Mutex::new(true)), // Default to enabling fallback
+            stream_taken: Arc::new(AtomicBool::new(false)),
+            encryption_algorithm: algorithm,
+            current_room: Arc::new(RwLock::new(None)),
+            display_name: Arc::new(RwLock::new(None)),
+            fallback_enabled: Arc::new(RwLock::new(true)), // Enable fallback by default
         })
     }
     
     /// Set whether fallback to alternative encryption algorithm is allowed
     pub async fn set_fallback_enabled(&self, enabled: bool) {
-        let mut fallback_guard = self.enable_fallback.lock().await;
-        *fallback_guard = enabled;
+        let mut fallback = self.fallback_enabled.write().await;
+        *fallback = enabled;
     }
     
     /// Get current fallback enabled status as boolean value
     pub async fn is_fallback_enabled(&self) -> bool {
-        let fallback_guard = self.enable_fallback.lock().await;
-        *fallback_guard
+        let fallback = self.fallback_enabled.read().await;
+        *fallback
     }
 
     /// Get the EncryptionAlgorithm enum from the string representation
@@ -115,24 +123,45 @@ pub struct ClientSession {
     /// This marks the session as consumed but doesn't return the raw streams.
     /// Returns true if successfully marked as taken, false otherwise.
     pub async fn mark_stream_taken(&self) -> bool {
-        let mut taken_guard = self.stream_taken.lock().await;
-        if *taken_guard {
-            false // Already taken
-        } else {
-            *taken_guard = true;
-            true // Successfully marked as taken
-        }
+        use std::sync::atomic::Ordering;
+        !self.stream_taken.swap(true, Ordering::SeqCst)
     }
 
     /// Check if the stream has been marked as taken.
     pub async fn is_stream_taken(&self) -> bool {
-        *self.stream_taken.lock().await
+        use std::sync::atomic::Ordering;
+        self.stream_taken.load(Ordering::SeqCst)
     }
 
     // Close the underlying connection (best effort)
     pub async fn close(&self) {
         let mut sender_guard = self.ws_sender.lock().await;
         let _ = sender_guard.close().await; // Ignore errors on close
+    }
+    
+    /// Get the current room ID
+    pub async fn get_current_room(&self) -> Option<String> {
+        let room = self.current_room.read().await;
+        room.clone()
+    }
+    
+    /// Set the current room ID
+    pub async fn set_current_room(&self, room_id: Option<String>) {
+        let mut room = self.current_room.write().await;
+        *room = room_id;
+    }
+    
+    /// Get display name
+    pub fn get_display_name(&self) -> Option<String> {
+        // This is a blocking operation, but it's quick and used rarely
+        let display_name = futures::executor::block_on(self.display_name.read());
+        display_name.clone()
+    }
+    
+    /// Set display name
+    pub async fn set_display_name(&self, name: Option<String>) {
+        let mut display_name = self.display_name.write().await;
+        *display_name = name;
     }
 }
 
@@ -184,8 +213,9 @@ impl SessionManager {
             // Remove from IP mapping as well
             let mut ip_sessions_guard = self.ip_sessions.lock().await;
             ip_sessions_guard.remove(&removed_session.ip_address);
+            
             // Optionally close the session's connection
-            // tokio::spawn(async move { removed_session.close().await; });
+            tokio::spawn(async move { removed_session.close().await; });
         }
     }
 
@@ -320,6 +350,29 @@ impl SessionManager {
             .filter(|s| s.encryption_algorithm == algorithm)
             .cloned()
             .collect()
+    }
+    
+    /// Get all sessions in a specific room
+    pub async fn get_sessions_by_room(&self, room_id: &str) -> Vec<ClientSession> {
+        let sessions = self.sessions.lock().await;
+        sessions.values()
+            .filter(|session| {
+                let current_room = futures::executor::block_on(session.get_current_room());
+                current_room.as_deref() == Some(room_id)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Get a session by client ID
+    pub async fn get_session_by_client_id(&self, client_id: &str) -> Option<ClientSession> {
+        let sessions = self.sessions.lock().await;
+        for session in sessions.values() {
+            if session.client_id == client_id {
+                return Some(session.clone());
+            }
+        }
+        None
     }
 }
 
