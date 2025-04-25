@@ -10,6 +10,8 @@ use std::io::Write;
 use std::sync::Arc;
 use rand::{Rng, thread_rng};
 use tokio::sync::Mutex;
+
+use serde::{Serialize, Deserialize};
 // Removed unused debug import
 use tracing::{debug, error, trace, warn};
 
@@ -55,9 +57,7 @@ pub enum RoutingError {
 /// Data envelope for mixed-mode packet handling
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DataEnvelope {
-    /// Type of the payload data
     pub payload_type: PayloadDataType,
-    /// Actual payload data
     pub payload: serde_json::Value,
 }
 
