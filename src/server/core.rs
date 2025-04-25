@@ -5,11 +5,8 @@
 //! client connections, authentication, and network routing.
 
 use std::io;
-// Removed unused imports
 use std::sync::Arc;
 use std::time::Duration;
-// Removed unused SinkExt and StreamExt
-// use futures::StreamExt; // Corrected line 12 (removed)
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -18,7 +15,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, trace, warn};
 use tun::platform::Device;
 // Import rustls types explicitly
-use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig}; // Added imports
+use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig}; 
 
 use crate::auth::AuthManager;
 use crate::auth::challenge::ChallengeError;
@@ -50,7 +47,7 @@ pub enum ServerError {
     Tls(String),
 
     #[error("WebSocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error), // Ensure this is the correct Error type
+    WebSocket(#[from] tokio_tungstenite::tungstenite::Error), 
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -118,7 +115,7 @@ pub struct VpnServer {
     pub rate_limiter: Arc<RateLimiter>,
     /// Server state
     pub state: Arc<RwLock<ServerState>>,
-    /// Server task handles (background tasks ONLY) <-- MODIFIED COMMENT
+    /// Server task handles (background tasks ONLY)
     pub task_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -157,7 +154,7 @@ impl VpnServer {
             .map_err(|e| ServerError::TunSetup(format!("Failed to create TUN device: {}", e)))?;
         let tun_device_arc = Arc::new(Mutex::new(tun_device));
 
-        // Initialize global references
+        // Initialize global TUN device reference
         crate::server::globals::init_globals(tun_device_arc.clone());
 
         // Parse TLS certificates
@@ -183,12 +180,18 @@ impl VpnServer {
             config.max_connections_per_ip,
             config.session_timeout,
         ));
+        
+        // Set global session manager reference
+        crate::server::globals::set_session_manager(session_manager.clone());
 
         // Initialize session key manager
         let session_key_manager = Arc::new(SessionKeyManager::new(
             config.key_rotation_interval,
             1_000_000,
         ));
+        
+        // Set global session key manager reference
+        crate::server::globals::set_session_key_manager(session_key_manager.clone());
 
         // Initialize network monitor
         let network_monitor = Arc::new(NetworkMonitor::new(
@@ -238,7 +241,7 @@ impl VpnServer {
     }
 
     /// Set up TLS configuration
-     fn setup_tls(config: &ServerConfig) -> Result<Arc<RustlsServerConfig>, ServerError> { // Return RustlsServerConfig
+     fn setup_tls(config: &ServerConfig) -> Result<Arc<RustlsServerConfig>, ServerError> {
         debug!("Setting up TLS with cert: {:?}, key: {:?}", config.cert_file, config.key_file);
 
         if !config.cert_file.exists() {
@@ -273,7 +276,7 @@ impl VpnServer {
          let mut key_reader = std::io::BufReader::new(key_file);
 
         // Try parsing PKCS#8 first, then RSA
-        let key: PrivateKey = rustls_pemfile::read_one(&mut key_reader) // Use PrivateKey type
+        let key: PrivateKey = rustls_pemfile::read_one(&mut key_reader)
              .map_err(|e| ServerError::Tls(format!("Failed to read key file: {}", e)))?
              .and_then(|item| match item {
                  rustls_pemfile::Item::PKCS8Key(key) => Some(PrivateKey(key)),
@@ -284,11 +287,10 @@ impl VpnServer {
 
 
         // Use rustls safe defaults, TLS 1.3 only
-        // E0308 Fix: Pass the `Vec<Certificate>` directly
-        let mut tls_config = RustlsServerConfig::builder() // Use RustlsServerConfig
+        let mut tls_config = RustlsServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
-            .with_single_cert(rustls_certs, key) // This now receives the correct Vec type
+            .with_single_cert(rustls_certs, key)
             .map_err(|e| ServerError::Tls(format!("TLS config error: {}", e)))?;
 
         // Enable session resumption
@@ -299,13 +301,13 @@ impl VpnServer {
 
 
     /// Validate certificate expiration dates (basic check)
-    fn validate_certificate_expiry(certs: &[Certificate]) -> Result<(), ServerError> { // Use Certificate type
+    fn validate_certificate_expiry(certs: &[Certificate]) -> Result<(), ServerError> {
          if certs.is_empty() {
              return Err(ServerError::Tls("No certificates provided for validation".to_string()));
          }
         // We'll check the first certificate (leaf)
          let first_cert = &certs[0];
-         match webpki::EndEntityCert::try_from(first_cert.as_ref()) { // Use as_ref()
+         match webpki::EndEntityCert::try_from(first_cert.as_ref()) {
              Ok(_cert) => {
                  debug!("Certificate basic parsing successful.");
                  Ok(())
@@ -328,6 +330,11 @@ impl VpnServer {
         }
 
         info!("Starting AeroNyx Privacy Network Server on {}", self.config.listen_addr);
+        
+        // Check if all global references are properly initialized
+        if !crate::server::globals::all_initialized() {
+            warn!("Not all global references are initialized! Some functionality may be limited.");
+        }
 
         // --- Start Background Tasks (store handles internally) ---
         self.start_background_tasks().await;
@@ -481,7 +488,6 @@ impl VpnServer {
              info!("Server listener task stopped.");
         });
 
-        // *** FIX: Return the actual handle for the main server task ***
         Ok(main_server_handle)
     }
 
@@ -518,8 +524,6 @@ impl VpnServer {
             for handle in handles.iter() {
                 handle.abort(); // Request task cancellation
             }
-            // Optionally wait for tasks to finish after aborting
-            // futures::future::join_all(handles.drain(..)).await;
              handles.clear(); // Clear the list
         }
 
@@ -692,8 +696,6 @@ impl VpnServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Removed unused PathBuf import
-    // use std::path::PathBuf; // Corrected line 682
 
     #[tokio::test]
     #[ignore] // Still requires cert files
