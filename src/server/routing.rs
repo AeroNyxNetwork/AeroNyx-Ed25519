@@ -263,12 +263,12 @@ impl PacketRouter {
         session.set_current_room(Some(chat_id.to_string())).await;
         
         // Gather chat information
-        // This is a placeholder - customize based on your actual data model
+        // Use crate::utils::current_timestamp_millis() instead of chrono
         let chat_info = serde_json::json!({
             "type": "chat-info",
             "chatId": chat_id,
             "name": format!("Chat {}", chat_id),
-            "created_at": chrono::Utc::now().timestamp(),
+            "created_at": crate::utils::current_timestamp_millis(),
             "participant_count": session_manager.get_sessions_by_room(chat_id).await.len(),
             "encryption": "end-to-end"
         });
@@ -318,7 +318,7 @@ impl PacketRouter {
             "type": "participant-leave",
             "chatId": chat_id,
             "participantId": session.client_id,
-            "timestamp": chrono::Utc::now().timestamp()
+            "timestamp": crate::utils::current_timestamp_millis()
         });
         
         // Forward notification to all other participants in the room
@@ -370,11 +370,12 @@ impl PacketRouter {
         Ok(())
     }
 
+
 /// Handle delete chat request
 async fn handle_delete_chat_request(
     &self,
     payload: serde_json::Value,
-    session: &ClientSession,
+    _session: &ClientSession,  // Added underscore to fix unused variable warning
 ) -> Result<(), RoutingError> {
     // Extract chat ID from payload
     let chat_id = payload.get("chatId")
@@ -390,7 +391,7 @@ async fn handle_delete_chat_request(
     let is_authorized = true; // Replace with actual authorization check
     
     if !is_authorized {
-        // Create error response
+        // Create error response - this is just a placeholder since is_authorized is always true
         let error_response = serde_json::json!({
             "type": "delete-chat-response",
             "chatId": chat_id,
@@ -406,8 +407,8 @@ async fn handle_delete_chat_request(
         
         // Send error response to requester
         if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
-            if let Some(session_key) = session_key_manager.get_key(&session.client_id).await {
-                self.forward_envelope_to_session(&envelope, &session_key, session).await?;
+            if let Some(session_key) = session_key_manager.get_key(&_session.client_id).await {
+                self.forward_envelope_to_session(&envelope, &session_key, _session).await?;
             }
         }
         
@@ -418,7 +419,7 @@ async fn handle_delete_chat_request(
     let delete_notification = serde_json::json!({
         "type": "chat-deleted",
         "chatId": chat_id,
-        "timestamp": chrono::Utc::now().timestamp()
+        "timestamp": crate::utils::current_timestamp_millis()
     });
     
     // Get all sessions in the chat
@@ -454,7 +455,7 @@ async fn handle_delete_chat_request(
     
     Ok(())
 }
-
+    
     /// Process JSON payload from client
     async fn process_json_payload(
         &self,
@@ -502,11 +503,9 @@ async fn handle_delete_chat_request(
                 Ok(payload_size)
             },
             _ => {
-                // Instead of warning for every unknown type, log only once for truly unknown types
-                // Keep the warning for really unknown types, but not for the ones we now handle
+                // Instead of warning for every unknown type, log at debug level
                 debug!("Unknown JSON message type: {}", msg_type);
                 // Return success but don't perform any action
-                // This is more forgiving than returning an error, which might disconnect clients
                 Ok(payload_size)
             }
         }
