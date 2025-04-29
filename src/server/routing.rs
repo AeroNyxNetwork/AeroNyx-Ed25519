@@ -10,6 +10,7 @@ use std::io::Write;
 use std::sync::Arc;
 use rand::{Rng, thread_rng};
 use tokio::sync::Mutex;
+use chrono;
 
 use serde::{Serialize, Deserialize};
 // Removed unused debug import
@@ -243,6 +244,217 @@ impl PacketRouter {
         }
     }
 
+
+    async fn handle_chat_info_request(
+        &self,
+        payload: serde_json::Value,
+        session: &ClientSession,
+    ) -> Result<(), RoutingError> {
+        // Extract chat ID from payload
+        let chat_id = payload.get("chatId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RoutingError::InvalidPacket("Missing chatId in chat info request".to_string()))?;
+        
+        // Get session manager
+        let session_manager = crate::server::globals::get_session_manager()
+            .ok_or_else(|| RoutingError::Processing("Session manager not available".to_string()))?;
+        
+        // Set current room for the session
+        session.set_current_room(Some(chat_id.to_string())).await;
+        
+        // Gather chat information
+        // This is a placeholder - customize based on your actual data model
+        let chat_info = serde_json::json!({
+            "type": "chat-info",
+            "chatId": chat_id,
+            "name": format!("Chat {}", chat_id),
+            "created_at": chrono::Utc::now().timestamp(),
+            "participant_count": session_manager.get_sessions_by_room(chat_id).await.len(),
+            "encryption": "end-to-end"
+        });
+        
+        // Create envelope for response
+        let envelope = DataEnvelope {
+            payload_type: PayloadDataType::Json,
+            payload: chat_info,
+        };
+        
+        // Get session key manager
+        if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
+            // Get session key for the requesting client
+            if let Some(session_key) = session_key_manager.get_key(&session.client_id).await {
+                // Forward the chat info to the requesting client
+                self.forward_envelope_to_session(&envelope, &session_key, session).await?;
+            } else {
+                return Err(RoutingError::Processing(format!("No session key found for {}", session.client_id)));
+            }
+        } else {
+            return Err(RoutingError::Processing("Session key manager not available".to_string()));
+        }
+        
+        Ok(())
+    }
+
+
+    async fn handle_leave_chat_request(
+        &self,
+        payload: serde_json::Value,
+        session: &ClientSession,
+    ) -> Result<(), RoutingError> {
+        // Extract chat ID from payload
+        let chat_id = payload.get("chatId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RoutingError::InvalidPacket("Missing chatId in leave chat request".to_string()))?;
+        
+        // Get session manager
+        let session_manager = crate::server::globals::get_session_manager()
+            .ok_or_else(|| RoutingError::Processing("Session manager not available".to_string()))?;
+        
+        // Clear the current room for the session
+        session.set_current_room(None).await;
+        
+        // Create a notification for other participants
+        let leave_notification = serde_json::json!({
+            "type": "participant-leave",
+            "chatId": chat_id,
+            "participantId": session.client_id,
+            "timestamp": chrono::Utc::now().timestamp()
+        });
+        
+        // Forward notification to all other participants in the room
+        let sessions = session_manager.get_sessions_by_room(chat_id).await;
+        
+        // Get session key manager
+        if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
+            for target_session in sessions {
+                if target_session.id != session.id {
+                    // Create envelope
+                    let envelope = DataEnvelope {
+                        payload_type: PayloadDataType::Json,
+                        payload: leave_notification.clone(),
+                    };
+                    
+                    // Get target's session key
+                    if let Some(target_key) = session_key_manager.get_key(&target_session.client_id).await {
+                        // Try to forward the notification
+                        if let Err(e) = self.forward_envelope_to_session(&envelope, &target_key, &target_session).await {
+                            debug!("Failed to forward leave notification to {}: {}", target_session.client_id, e);
+                            // Continue with other sessions despite errors
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Send confirmation to the requester
+        let confirmation = serde_json::json!({
+            "type": "leave-chat-confirm",
+            "chatId": chat_id,
+            "success": true
+        });
+        
+        // Create envelope for confirmation
+        let envelope = DataEnvelope {
+            payload_type: PayloadDataType::Json,
+            payload: confirmation,
+        };
+        
+        // Get session key for requester
+        if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
+            if let Some(session_key) = session_key_manager.get_key(&session.client_id).await {
+                // Send confirmation
+                self.forward_envelope_to_session(&envelope, &session_key, session).await?;
+            }
+        }
+        
+        Ok(())
+    }
+
+/// Handle delete chat request
+async fn handle_delete_chat_request(
+    &self,
+    payload: serde_json::Value,
+    session: &ClientSession,
+) -> Result<(), RoutingError> {
+    // Extract chat ID from payload
+    let chat_id = payload.get("chatId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| RoutingError::InvalidPacket("Missing chatId in delete chat request".to_string()))?;
+    
+    // Get session manager
+    let session_manager = crate::server::globals::get_session_manager()
+        .ok_or_else(|| RoutingError::Processing("Session manager not available".to_string()))?;
+    
+    // Verify ownership or permissions (placeholder - implement based on your permission model)
+    // This is a placeholder check - replace with your actual authorization logic
+    let is_authorized = true; // Replace with actual authorization check
+    
+    if !is_authorized {
+        // Create error response
+        let error_response = serde_json::json!({
+            "type": "delete-chat-response",
+            "chatId": chat_id,
+            "success": false,
+            "error": "Not authorized to delete this chat"
+        });
+        
+        // Create envelope
+        let envelope = DataEnvelope {
+            payload_type: PayloadDataType::Json,
+            payload: error_response,
+        };
+        
+        // Send error response to requester
+        if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
+            if let Some(session_key) = session_key_manager.get_key(&session.client_id).await {
+                self.forward_envelope_to_session(&envelope, &session_key, session).await?;
+            }
+        }
+        
+        return Err(RoutingError::SecurityRisk("Unauthorized chat deletion attempt".to_string()));
+    }
+    
+    // Create delete notification for all participants
+    let delete_notification = serde_json::json!({
+        "type": "chat-deleted",
+        "chatId": chat_id,
+        "timestamp": chrono::Utc::now().timestamp()
+    });
+    
+    // Get all sessions in the chat
+    let sessions = session_manager.get_sessions_by_room(chat_id).await;
+    
+    // Forward notification to all participants
+    if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
+        for target_session in sessions {
+            // Create envelope
+            let envelope = DataEnvelope {
+                payload_type: PayloadDataType::Json,
+                payload: delete_notification.clone(),
+            };
+            
+            // Get target's session key
+            if let Some(target_key) = session_key_manager.get_key(&target_session.client_id).await {
+                // Clear the target's current room if it's the deleted chat
+                if let Some(current_room) = target_session.get_current_room().await {
+                    if current_room == chat_id {
+                        target_session.set_current_room(None).await;
+                    }
+                }
+                
+                // Try to forward the notification
+                if let Err(e) = self.forward_envelope_to_session(&envelope, &target_key, &target_session).await {
+                    debug!("Failed to forward deletion notification to {}: {}", target_session.client_id, e);
+                }
+            }
+        }
+    }
+    
+    // In a real implementation, you would delete chat data from permanent storage here
+    
+    Ok(())
+}
+
     /// Process JSON payload from client
     async fn process_json_payload(
         &self,
@@ -261,24 +473,41 @@ impl PacketRouter {
             "message" => {
                 // Handle the message and return the processed size
                 self.handle_chat_message(payload.clone(), session).await?;
-                // Return the size of the processed JSON
                 Ok(payload_size)
             },
-            "participants_request" => {
-                // Handle the request and return the processed size
+            // Add support for request-chat-info (likely the chat_info_request from logs)
+            "request-chat-info" | "chat_info_request" => {
+                // Handle the chat info request
+                self.handle_chat_info_request(payload.clone(), session).await?;
+                Ok(payload_size)
+            },
+            "request-participants" | "participants_request" => {
+                // Handle the participants request
                 self.handle_participants_request(session).await?;
-                // Return the size of the processed JSON
                 Ok(payload_size)
             },
-            "webrtc_signal" => {
-                // Handle the signal and return the processed size
+            "webrtc-signal" | "webrtc_signal" => {
+                // Handle the WebRTC signal
                 self.handle_webrtc_signal(payload.clone(), session).await?;
-                // Return the size of the processed JSON
+                Ok(payload_size)
+            },
+            "leave-chat" => {
+                // Handle leave chat request
+                self.handle_leave_chat_request(payload.clone(), session).await?;
+                Ok(payload_size)
+            },
+            "delete-chat" => {
+                // Handle delete chat request
+                self.handle_delete_chat_request(payload.clone(), session).await?;
                 Ok(payload_size)
             },
             _ => {
-                warn!("Unknown JSON message type: {}", msg_type);
-                Err(RoutingError::InvalidPacket(format!("Unknown message type: {}", msg_type)))
+                // Instead of warning for every unknown type, log only once for truly unknown types
+                // Keep the warning for really unknown types, but not for the ones we now handle
+                debug!("Unknown JSON message type: {}", msg_type);
+                // Return success but don't perform any action
+                // This is more forgiving than returning an error, which might disconnect clients
+                Ok(payload_size)
             }
         }
     }
