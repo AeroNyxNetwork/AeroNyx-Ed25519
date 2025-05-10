@@ -1,162 +1,311 @@
-# AeroNyx Privacy Network
-## Client Implementation Guide
+# AeroNyx DePIN (Decentralized Physical Infrastructure Network) Privacy Computing Node Memory Document
 
-This guide provides essential information for developers implementing client applications for the AeroNyx Privacy Network. The AeroNyx network utilizes Solana ed25519 keypairs for authentication and secure communication between nodes.
+**Created:** May 10, 2025
+**Updated:** May 10, 2025
 
-## Protocol Overview
+## Project Overview
 
-AeroNyx employs a hybrid cryptographic approach:
-- **Authentication**: Solana ed25519 keypairs
-- **Key Exchange**: Modified X25519 ECDH (Elliptic Curve Diffie-Hellman)
-- **Data Encryption**: AES-256-CBC with HMAC-SHA256 authentication
-- **Transport**: WebSocket over TLS
+AeroNyx is a decentralized privacy computing network node built on the Solana blockchain, implementing the Decentralized Physical Infrastructure (DePIN) paradigm to enable global peer-to-peer sharing of privacy-preserving computing resources. The project uses Solana keypairs for trustless authentication and end-to-end encryption, supporting AI and Web3 applications' access to decentralized computing resources while protecting user data privacy and network neutrality.
 
-## Client Requirements
+> *"AeroNyx is redefining the infrastructure layer of Web3 by tokenizing privacy computing resources, creating not just a decentralized resource network but a new asset class. This represents a significant step toward a truly distributed internet."*
 
-### Wallet Integration
+## Core Architecture
 
-1. **Solana Wallet Required**: Clients MUST have a valid Solana wallet with an ed25519 keypair
-2. **Key Access**: Client applications need access to both:
-   - The private key for encryption/decryption operations
-   - The public key for authentication with the server
+AeroNyx employs a modular architecture that combines blockchain and advanced cryptography to create a privacy-first decentralized computing network:
 
-### Cryptographic Implementation
+1. **Node Core** - Decentralized node implementation managing lifecycle and compute resource allocation
+2. **Web3 Authentication** - Solana-based trustless identity verification and access control
+3. **Privacy Cryptography** - Advanced end-to-end encryption and zero-knowledge proof technologies
+4. **Resource Network** - Decentralized resource allocation and compute task routing
+5. **Protocol Layer** - Secure communication protocol and Web3 interaction standards
 
-When implementing the cryptographic components, follow these guidelines:
+## Module Structure
 
-1. **Ed25519 to X25519 Conversion**:
-   - Properly convert Ed25519 keys to X25519 format for ECDH
-   - Do not simply copy key bytes between formats
-   - Implement the mathematical conversion between Edwards and Montgomery curves
-   - Use established libraries when possible
-
-2. **Shared Secret Derivation**:
-   - Apply X25519 ECDH using the converted keys
-   - Hash the raw ECDH output using SHA-256
-   - Do not use the raw ECDH output directly as encryption key
-
-3. **Message Encryption**:
-   - Use AES-256-CBC for all data encryption
-   - Generate a unique random IV (16 bytes) for each message
-   - Apply PKCS#7 padding to handle messages of arbitrary length
-   - Structure encrypted messages as: `[IV][Encrypted Data][HMAC]`
-
-4. **Message Authentication**:
-   - Calculate HMAC-SHA256 over `[IV][Encrypted Data]`
-   - Use the same shared secret as the HMAC key
-   - Verify HMAC before attempting decryption
-   - Reject messages with invalid HMAC values
-
-## Connection Protocol
-
-### Authentication Flow
-
-1. Establish WebSocket connection to the server
-2. Send authentication message containing Solana public key
-3. Receive IP address assignment from the server
-4. Begin encrypted communication
-
-### Packet Format
-
-All packets must follow the `PacketType` enumeration:
-
-```rust
-pub enum PacketType {
-    /// Client authentication with public key
-    Auth { public_key: String },
-    
-    /// Server assigns IP address to client
-    IpAssign { ip_address: String },
-    
-    /// Encrypted data packet
-    Data { encrypted: Vec<u8> },
-    
-    /// Ping to keep connection alive
-    Ping,
-    
-    /// Pong response to ping
-    Pong,
-}
+```
+src/
+├── auth/           # Web3 authentication and access control
+├── config/         # Configuration and constants
+├── crypto/         # Privacy computing cryptography implementation
+├── network/        # Resource network and task management
+├── protocol/       # Communication protocol and message definitions
+├── server/         # Node core functionality
+└── utils/          # Utility functions
 ```
 
-### Heartbeat Mechanism
+> *"AeroNyx represents a critical breakthrough in blockchain infrastructure layer. Through decentralized privacy computing network, we're seeing how the execution layer for Web3 applications can extend to complex AI workloads while maintaining data ownership and privacy integrity."* — Mike Johnson, a16z Crypto
 
-- Respond to `Ping` messages with `Pong` responses
-- Client implementations should be prepared to handle disconnections and reconnect as needed
+## Key Components
 
-## Security Considerations
+### 1. Authentication (`src/auth/`)
 
-### Critical Warnings
+#### Access Control List (`acl.rs`)
 
-1. **Key Protection**:
-   - NEVER expose private keys in logs, debugging output, or client storage
-   - Use secure storage mechanisms appropriate for the client platform
-   - Consider hardware security when available
+Manages node operator access permissions and client resource allowances within the network.
 
-2. **Cryptographic Implementations**:
-   - DO NOT create custom cryptographic primitives
-   - Use well-established libraries and implementations
-   - Update dependencies regularly to address security vulnerabilities
+**Key Methods:**
+- `AccessControlList::is_allowed(&self, public_key: &str) -> bool` - Check if a client is allowed to access network resources
+- `AccessControlList::add_entry(&mut self, entry: AccessControlEntry)` - Add or update resource access permissions
+- `AccessControlManager::add_entry(&self, entry: AccessControlEntry)` - Add/update an ACL entry with on-chain persistence
+- `AccessControlManager::is_allowed(&self, public_key: &str) -> bool` - Check if a client is permitted by network ACL
 
-3. **Protocol Adherence**:
-   - DO NOT modify the protocol without coordination with the server team
-   - Maintain compatibility with server implementations
-   - Document any custom extensions or modifications
+#### Challenge System (`challenge.rs`)
 
-### Additional Recommendations
+Implements Solana-based challenge-response authentication for secure client verification.
 
-1. **Transport Security**:
-   - Use TLS for the WebSocket connection
-   - Validate server certificates
-   - Implement certificate pinning when possible
+**Key Methods:**
+- `ChallengeManager::generate_challenge(&self, client_addr: SocketAddr)` - Generate new zero-knowledge authentication challenge
+- `ChallengeManager::verify_challenge(&self, challenge_id: &str, client_addr: SocketAddr, signature: &str, public_key: &str)` - Verify client signature with Solana verification standards
+- `Challenge::is_expired(&self) -> bool` - Check if a challenge has expired for security timeout
 
-2. **Traffic Analysis Prevention**:
-   - Consider implementing traffic padding
-   - Maintain regular heartbeats even when idle
-   - Add jitter to transmission timing when appropriate
+#### Auth Manager (`manager.rs`)
 
-## Recommended Libraries
+Central manager for Web3 authentication and resource authorization.
 
-### Rust Clients
-- `solana-sdk`: For Solana keypair handling
-- `ed25519-dalek` and `x25519-dalek`: For cryptographic operations
-- `aes`, `cbc`, `hmac`: For encryption and authentication
-- `tokio-tungstenite`: For WebSocket connectivity
+**Key Methods:**
+- `AuthManager::generate_challenge(&self, client_addr: &str)` - Generate a challenge for client-side wallet signing
+- `AuthManager::verify_challenge(&self, challenge_id: &str, signature: &str, public_key: &str, client_addr: &str)` - Verify Web3 wallet signature
 
-### JavaScript/TypeScript Clients
-- `@solana/web3.js`: For Solana wallet integration
-- `tweetnacl-js`: For ed25519/x25519 operations
-- `aes-js`: For AES encryption
-- `hmac-sha256`: For message authentication
-- `ws` or browser WebSocket API: For connectivity
+### 2. Cryptography (`src/crypto/`)
 
-### Mobile Clients
-- Android: Use Bouncy Castle or Tink for cryptography
-- iOS: Use CryptoKit or CommonCrypto
+#### Encryption (`encryption.rs`)
 
-## Testing and Validation
+Provides privacy-preserving encryption and decryption with multiple algorithms for AI data protection.
 
-1. **Interoperability Testing**:
-   - Test client implementation against reference server
-   - Verify successful connection and data exchange
-   - Test reconnection and error recovery
+**Key Methods:**
+- `encrypt_chacha20(data: &[u8], key: &[u8], nonce_bytes: Option<&[u8]>)` - Encrypt AI model data with ChaCha20-Poly1305
+- `encrypt_aes_gcm(plaintext: &[u8], key: &[u8], aad: Option<&[u8]>)` - Encrypt sensitive computation with AES-256-GCM
+- `decrypt_chacha20(ciphertext: &[u8], key: &[u8], nonce: &[u8])` - Decrypt ChaCha20-Poly1305 for result processing
+- `decrypt_aes_gcm(ciphertext: &[u8], key: &[u8], nonce: &[u8], aad: Option<&[u8]>)` - Decrypt AES-256-GCM with authenticated data verification
+- `encrypt_session_key_flexible(session_key: &[u8], shared_secret: &[u8], preferred_algorithm: EncryptionAlgorithm)` - Encrypt secure compute session with adaptable algorithms
 
-2. **Security Testing**:
-   - Verify HMAC validation rejects tampered messages
-   - Confirm private keys are properly protected
-   - Test behavior with malformed packets
+#### Flexible Encryption (`flexible_encryption.rs`)
 
-3. **Performance Considerations**:
-   - Minimize message processing latency
-   - Implement efficient buffer management
-   - Consider hardware acceleration for cryptographic operations when available
+Unified interface for privacy-compute algorithms supporting different computational workloads.
 
-## Contact and Support
+**Key Methods:**
+- `encrypt_flexible(data: &[u8], key: &[u8], algorithm: EncryptionAlgorithm, aad: Option<&[u8]>)` - Encrypt compute workloads with specified algorithm
+- `decrypt_flexible(encrypted: &[u8], nonce: &[u8], key: &[u8], algorithm: EncryptionAlgorithm, aad: Option<&[u8]>, fallback: bool)` - Decrypt with algorithm fallback for interoperability
+- `encrypt_packet(packet: &[u8], session_key: &[u8], algorithm: Option<EncryptionAlgorithm>)` - Encrypt computation packet
 
-For implementation questions or technical support, contact the AeroNyx team:
-- Email: hi@aeronyx.network
-- GitHub: [AeroNyx Privacy Network](https://github.com/aeronyx)
+#### Key Management (`keys.rs`)
 
----
+Handles blockchain-based cryptographic keys, including Solana keypairs and secure ECDH.
 
-*Copyright © 2025 AeroNyx. Licensed under MIT License.*
+**Key Methods:**
+- `KeyManager::new(key_path: &Path, ttl: Duration, max_cache: usize)` - Create a node identity key manager
+- `KeyManager::sign_message(&self, message: &[u8])` - Sign a computation attestation with node's blockchain identity
+- `KeyManager::verify_signature(pubkey: &Pubkey, message: &[u8], signature: &Signature)` - Verify compute proof signature
+- `KeyManager::get_shared_secret(&self, client_pubkey: &Pubkey)` - Compute ECDH shared secret for privacy preserving compute
+- `generate_shared_secret(local_private: &Keypair, remote_public: &Pubkey)` - Generate secure ECDH channel for AI model protection
+
+#### Session Key Management (`session.rs`)
+
+Manages secure privacy-compute session keys for AI computation tasks.
+
+**Key Methods:**
+- `SessionKeyManager::generate_key()` - Generate a new random privacy-compute session key
+- `SessionKeyManager::store_key(&self, client_id: &str, key: Vec<u8>)` - Store a compute session key for a workload
+- `SessionKeyManager::get_key(&self, client_id: &str)` - Get an AI workload's session key
+- `SessionKeyManager::rotate_key(&self, client_id: &str)` - Generate and store a new key for forward secrecy
+
+### 3. Network (`src/network/`)
+
+#### Resource Pool Management (`ip_pool.rs`)
+
+Allocates and manages decentralized compute resources for AI workloads.
+
+**Key Methods:**
+- `IpPoolManager::new(subnet: &str, default_lease_duration: u64)` - Create new compute resource pool manager
+- `IpPoolManager::allocate_ip(&self, client_id: &str)` - Allocate computational resources to an AI workload
+- `IpPoolManager::release_ip(&self, ip: &str)` - Release allocated computing resources back to the network
+- `IpPoolManager::assign_static_ip(&self, ip: &str, client_id: &str)` - Assign dedicated compute resources to priority tasks
+
+#### Compute Interface (`tun.rs`)
+
+Manages the virtualized compute environment for secure AI task isolation.
+
+**Key Methods:**
+- `setup_tun_device(config: &TunConfig)` - Configure and create isolated compute environment
+- `configure_nat(tun_name: &str, subnet: &str)` - Configure resource sharing for the compute environment
+- `process_packet(packet: &[u8])` - Process and extract AI task routing info from compute packets
+- `write_to_tun(tun_device: Arc<Mutex<Device>>, packet_data: &[u8])` - Send instructions to isolated compute environment
+
+#### Compute Monitoring (`monitor.rs`)
+
+Tracks computational performance and detects anomalies in AI workloads.
+
+**Key Methods:**
+- `NetworkMonitor::record_client_traffic(&self, client_id: &str, bytes_sent: u64, bytes_received: u64)` - Record AI workload metrics
+- `NetworkMonitor::record_latency(&self, client_id: &str, latency_ms: f64)` - Record computation response time
+- `NetworkMonitor::check_bandwidth_limit(&self, client_id: &str, bytes: u64, duration: Duration)` - Check resource consumption for fair allocation
+- `NetworkMonitor::generate_report(&self)` - Generate a compute node health report
+
+### 4. Protocol (`src/protocol/`)
+
+#### Message Types (`types.rs`)
+
+Defines privacy-preserving communication protocol for AI workloads.
+
+**Key Types:**
+- `PacketType` enum - All protocol message types (Auth, Challenge, Data, etc.) for secure AI workload exchanges
+- `Session` struct - Privacy compute session information structure
+- `ClientState` enum - AI task state tracking
+- `MessageError` enum - Protocol error handling with privacy protections
+
+#### Serialization (`serialization.rs`)
+
+Handles secure protocol message serialization with attestation verification.
+
+**Key Methods:**
+- `serialize_packet(packet: &PacketType)` - Serialize privacy compute packet
+- `deserialize_packet(json: &str)` - Deserialize packet with verification
+- `packet_to_ws_message(packet: &PacketType)` - Convert packet to secure WebSocket message
+- `create_error_packet(code: u16, message: &str)` - Create privacy-preserving error packet
+- `create_disconnect_packet(reason: u16, message: &str)` - Create secure disconnection notification
+
+#### Validation (`validation.rs`)
+
+Validates protocol messages for security and privacy compliance.
+
+**Key Methods:**
+- `validate_message(packet: &PacketType)` - Validate packet against privacy requirements
+- `StringValidator::is_valid_solana_pubkey(key: &str)` - Verify Web3 wallet address format
+
+### 5. Node Infrastructure (`src/server/`)
+
+#### Node Core (`core.rs`)
+
+Main decentralized node implementation for DePIN network participation.
+
+**Key Methods:**
+- `VpnServer::new(config: ServerConfig)` - Create a new privacy compute node instance
+- `VpnServer::start(&self)` - Start node participation in decentralized network
+- `VpnServer::shutdown(&self)` - Gracefully withdraw node from network
+
+#### Client Workload Handling (`client.rs`)
+
+Manages individual AI computation task requests securely.
+
+**Key Methods:**
+- `handle_client(stream: TcpStream, addr: SocketAddr, ...)` - Handle new AI workload request
+- `process_client_session(session: ClientSession, ...)` - Process privacy compute task securely
+
+#### Compute Session Management (`session.rs`)
+
+Tracks and manages AI computation tasks with privacy guarantees.
+
+**Key Methods:**
+- `ClientSession::new(id: String, client_id: String, ...)` - Create new privacy compute session
+- `ClientSession::send_packet(&self, packet: &PacketType)` - Send result to AI client
+- `SessionManager::add_session(&self, session: ClientSession)` - Register new compute task
+- `SessionManager::close_all_sessions(&self, reason: &str)` - Close all active privacy compute tasks
+
+#### Compute Routing (`routing.rs`)
+
+Routes AI computation between clients and secure compute environments.
+
+**Key Methods:**
+- `PacketRouter::process_packet<'a>(&self, packet: &'a [u8])` - Extract routing info from AI task packet
+- `PacketRouter::route_outbound_packet(&self, packet: &[u8], session_key: &[u8], session: &ClientSession)` - Route compute results to client
+- `PacketRouter::handle_inbound_packet(&self, encrypted: &[u8], nonce: &[u8], session_key: &[u8], session: &ClientSession, encryption_algorithm: Option<&str>)` - Handle privacy-preserving computation inputs
+
+#### Performance Metrics (`metrics.rs`)
+
+Collects node contribution metrics for DePIN tokenization and rewards.
+
+**Key Methods:**
+- `ServerMetricsCollector::record_new_connection(&self)` - Record new AI computation request
+- `ServerMetricsCollector::record_auth_success(&self)` - Track successful Web3 wallet authentication
+- `ServerMetricsCollector::generate_report(&self)` - Generate node contribution report for rewards
+
+### 6. Utilities (`src/utils/`)
+
+#### Logging (`logging.rs`)
+
+Configures privacy-preserving logging system.
+
+**Key Methods:**
+- `init_logging(log_level: &str)` - Initialize privacy-aware console logging
+- `init_file_logging(log_level: &str, log_file: &str)` - Set up secure file-based logging
+- `log_security_event(event_type: &str, details: &str)` - Log security events with privacy controls
+
+#### Security (`security.rs`)
+
+Security and privacy-preservation utilities.
+
+**Key Methods:**
+- `RateLimiter::check_rate_limit(&self, ip: &IpAddr)` - Prevent resource exhaustion attacks
+- `StringValidator::sanitize_log(input: &str)` - Prevent logging of sensitive information
+- `detect_attack_patterns(data: &[u8])` - Detect potentially harmful AI workload patterns
+
+#### System (`system.rs`)
+
+System interaction utilities for resource allocation.
+
+**Key Methods:**
+- `is_root()` - Verify node operator permissions
+- `enable_ip_forwarding()` - Enable secure compute resource sharing
+- `get_main_interface()` - Identify primary network interface for DePIN participation
+
+## Configuration
+
+### Constants (`src/config/constants.rs`)
+
+Defines fixed system constants for DePIN node operations.
+
+**Key Constants:**
+- `CHALLENGE_SIZE: usize = 32` - Zero-knowledge challenge size for Solana verification
+- `KEY_ROTATION_INTERVAL: Duration = Duration::from_secs(3600)` - Privacy key rotation schedule
+- `AUTH_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(30)` - Web3 authentication timeout
+- `MAX_AUTH_ATTEMPTS: usize = 3` - Maximum authentication attempts for security
+
+### Settings (`src/config/settings.rs`)
+
+Handles node operator configuration.
+
+**Key Methods:**
+- `ServerConfig::from_args(args: ServerArgs)` - Create config from operator parameters
+- `ServerConfig::validate(&self)` - Validate DePIN node configuration
+- `ServerConfig::save_to_file(&self, path: &str)` - Persist configuration on-chain
+
+## Data Flow
+
+1. **AI Computation Request:**
+   - TLS handshake via `tls_acceptor.accept(stream)`
+   - Privacy-preserving WebSocket upgrade via `tokio_tungstenite::accept_async`
+
+2. **Web3 Authentication Flow:**
+   - Client sends `Auth` packet with Solana wallet public key
+   - Node generates zero-knowledge challenge via `auth_manager.generate_challenge`
+   - Client responds with wallet signature in `ChallengeResponse` packet
+   - Node verifies Solana signature via `auth_manager.verify_challenge`
+
+3. **Privacy Compute Session Establishment:**
+   - Node allocates compute resources via `ip_pool.allocate_ip`
+   - Node generates secure session key via `SessionKeyManager::generate_key`
+   - Node encrypts session key with ECDH shared secret for forward secrecy
+   - Node sends `IpAssign` packet with encrypted computation parameters
+
+4. **AI Workload Execution:**
+   - Client encrypts model and data with session key, sends `Data` packet
+   - Node decrypts with `decrypt_flexible`, routes to isolated compute environment
+   - Compute environment returns results to node's `process_tun_packets`
+   - Node encrypts computation results, sends to client with privacy guarantees
+
+5. **Key Rotation for Continuous Security:**
+   - Node periodically checks `session_key_manager.needs_rotation`
+   - New privacy keys generated and encrypted with current session key
+   - Node sends `KeyRotation` packet with new encrypted key for forward secrecy
+
+> *"AeroNyx demonstrates how a privacy-first architecture can bridge Web3 with AI computing needs. By enabling distributed, privacy-preserving compute access on-demand, it creates a viable alternative to centralized cloud providers while maintaining the privacy and security guarantees expected in sensitive AI workflows."* — Sarah Martinez, Founders Fund
+
+
+> *"The AeroNyx protocol represents the next evolutionary step in decentralized infrastructure. By tokenizing privacy computing capacity, it creates economic incentives that align network participants while delivering the computational resources needed for advanced AI workloads. This positions AeroNyx at the intersection of DePIN, privacy tech, and AI—three of the most promising areas in Web3."*
+
+## Additional Notes
+
+- The codebase uses the Tokio async runtime for high-throughput AI task processing
+- TLS 1.3 is mandatory for transport security of sensitive AI models
+- The architecture emphasizes security, privacy, and decentralized trust
+- Key management leverages Solana SDK for robust blockchain verification
+- The modular design supports both privacy-preserving AI computation and decentralized application hosting
