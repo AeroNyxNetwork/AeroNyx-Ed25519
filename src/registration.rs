@@ -1,4 +1,4 @@
-// src/registration.rs - Enhanced version with conservative improvements
+// src/registration.rs - 简单可靠的实现
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -71,8 +71,6 @@ pub struct RegistrationManager {
     registration_code: Option<String>,
     wallet_address: Option<String>,
     node_signature: Option<String>,
-    last_heartbeat_time: Option<chrono::DateTime<chrono::Utc>>,
-    heartbeat_interval_secs: u64,
 }
 
 impl RegistrationManager {
@@ -98,8 +96,6 @@ impl RegistrationManager {
             registration_code: None,
             wallet_address: None,
             node_signature: None,
-            last_heartbeat_time: None,
-            heartbeat_interval_secs: 60,  // Default interval
         }
     }
 
@@ -339,7 +335,7 @@ impl RegistrationManager {
     }
 
     // Enhanced heartbeat with improved error handling
-    pub async fn send_heartbeat(&mut self, status_info: serde_json::Value) -> Result<HeartbeatResponse, String> {
+    pub async fn send_heartbeat(&self, status_info: serde_json::Value) -> Result<HeartbeatResponse, String> {
         if self.reference_code.is_none() {
             return Err("Missing reference code for heartbeat".to_string());
         }
@@ -424,20 +420,8 @@ impl RegistrationManager {
                             }
                         };
                         
-                        // Update last heartbeat time
-                        self.last_heartbeat_time = Some(chrono::Utc::now());
-                        
                         if api_response.success {
                             if let Some(data) = api_response.data {
-                                // Update heartbeat interval if provided in next_heartbeat
-                                if let Some(seconds) = self.parse_next_heartbeat(&data.next_heartbeat) {
-                                    if seconds != self.heartbeat_interval_secs {
-                                        debug!("Updating heartbeat interval from {} to {} seconds", 
-                                               self.heartbeat_interval_secs, seconds);
-                                        self.heartbeat_interval_secs = seconds;
-                                    }
-                                }
-                                
                                 return Ok(data);
                             } else {
                                 return Err("No data in heartbeat response".to_string());
@@ -474,22 +458,16 @@ impl RegistrationManager {
         }
     }
 
-    // Improved heartbeat loop with graceful shutdown - using Arc<RwLock<Self>> pattern for thread safety
+    // Improved heartbeat loop
     pub async fn start_heartbeat_loop(
-        self: Arc<RwLock<Self>>,
+        &self,
         server_state: Arc<RwLock<ServerState>>,
         metrics: Arc<ServerMetricsCollector>,
     ) {
         info!("Starting node heartbeat loop for AeroNyx DePIN participation");
         
-        // Get current interval from self
-        let heartbeat_interval_secs = {
-            let manager = self.read().await;
-            manager.heartbeat_interval_secs
-        };
-        
-        // Start with the current interval
-        let mut interval = time::interval(Duration::from_secs(heartbeat_interval_secs));
+        // Start with a default 60 second interval
+        let mut interval = time::interval(Duration::from_secs(60));
         let mut consecutive_failures = 0;
         
         // Create channels for graceful shutdown
@@ -513,62 +491,24 @@ impl RegistrationManager {
             })
         };
         
-        // Spawn a task to handle OS signals where available
-        #[cfg(unix)]
-        let signal_handler = {
-            let shutdown_tx = shutdown_tx.clone();
-            
-            tokio::spawn(async move {
-                let mut sigterm = tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::terminate()
-                ).expect("Failed to create SIGTERM handler");
-                
-                let mut sigint = tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::interrupt()
-                ).expect("Failed to create SIGINT handler");
-                
-                tokio::select! {
-                    _ = sigterm.recv() => {
-                        info!("Received SIGTERM signal, initiating heartbeat shutdown");
-                        let _ = shutdown_tx.send(()).await;
-                    }
-                    _ = sigint.recv() => {
-                        info!("Received SIGINT signal, initiating heartbeat shutdown");
-                        let _ = shutdown_tx.send(()).await;
-                    }
-                }
-            })
-        };
+        // Heartbeat manager is a clone for thread safety
+        let manager = self.clone();
         
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     // Collect system metrics and server data
-                    let status_info = {
-                        let manager = self.read().await;
-                        manager.collect_system_metrics(&metrics).await
-                    };
+                    let status_info = manager.collect_system_metrics(&metrics).await;
                     
-                    // Send heartbeat with a mutable reference
-                    let heartbeat_result = {
-                        let mut manager = self.write().await;
-                        manager.send_heartbeat(status_info).await
-                    };
-                    
-                    match heartbeat_result {
+                    // Send heartbeat
+                    match manager.send_heartbeat(status_info).await {
                         Ok(response) => {
                             consecutive_failures = 0;
                             debug!("Heartbeat successful. Node status: {}. Next heartbeat in {}", 
                                    response.status, response.next_heartbeat);
                             
-                            // Get next heartbeat interval
-                            let next_interval = {
-                                let manager = self.read().await;
-                                manager.parse_next_heartbeat(&response.next_heartbeat)
-                            };
-                            
                             // Adjust heartbeat interval based on server response
-                            if let Some(seconds) = next_interval {
+                            if let Some(seconds) = manager.parse_next_heartbeat(&response.next_heartbeat) {
                                 if seconds != interval.period().as_secs() {
                                     info!("Adjusting heartbeat interval to {} seconds", seconds);
                                     interval = time::interval(Duration::from_secs(seconds));
@@ -592,21 +532,13 @@ impl RegistrationManager {
                     info!("Received shutdown signal, sending final heartbeat and terminating loop");
                     
                     // Send final heartbeat with shutting_down status
-                    let mut final_status = {
-                        let manager = self.read().await;
-                        manager.collect_system_metrics(&metrics).await
-                    };
+                    let mut final_status = manager.collect_system_metrics(&metrics).await;
                     
                     if let Some(obj) = final_status.as_object_mut() {
                         obj.insert("status".to_string(), serde_json::Value::String("shutting_down".to_string()));
                     }
                     
-                    let final_result = {
-                        let mut manager = self.write().await;
-                        manager.send_heartbeat(final_status).await
-                    };
-                    
-                    match final_result {
+                    match manager.send_heartbeat(final_status).await {
                         Ok(_) => info!("Final heartbeat sent successfully"),
                         Err(e) => warn!("Failed to send final heartbeat: {}", e),
                     }
@@ -616,11 +548,7 @@ impl RegistrationManager {
             }
         }
         
-        // Clean up monitoring tasks
-        #[cfg(unix)]
-        let _ = tokio::join!(state_monitor, signal_handler);
-        
-        #[cfg(not(unix))]
+        // Wait for monitor task to complete
         let _ = state_monitor.await;
         
         info!("Heartbeat loop terminated");
@@ -802,16 +730,6 @@ impl RegistrationManager {
         } else {
             Err(format!("API connection test failed with status: {}", status))
         }
-    }
-    
-    // Get the last heartbeat time
-    pub fn get_last_heartbeat(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.last_heartbeat_time
-    }
-    
-    // Get the current heartbeat interval
-    pub fn get_heartbeat_interval(&self) -> u64 {
-        self.heartbeat_interval_secs
     }
 }
 
