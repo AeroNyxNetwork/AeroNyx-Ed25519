@@ -1,4 +1,4 @@
-// Modified src/registration.rs
+// Modified src/registration.rs 
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -119,7 +119,7 @@ impl RegistrationManager {
     pub async fn check_status(&self, registration_code: &str) -> Result<NodeStatusResponse, String> {
         debug!("Checking node status with API");
         
-        // Modified: Correct endpoint URL for check-node-status
+        // Correct API endpoint URL matching Django configuration
         let response = self.client
             .post(&format!("{}/api/aeronyx/check-node-status/", self.api_url))
             .json(&serde_json::json!({
@@ -153,7 +153,7 @@ impl RegistrationManager {
         // Generate a node signature (in production this would be cryptographically secure)
         let node_signature = format!("node-sig-{}", utils::random_string(16));
 
-        // Modified: Correct endpoint URL for confirm-registration
+        // Correct API endpoint URL matching Django configuration
         let response = self.client
             .post(&format!("{}/api/aeronyx/confirm-registration/", self.api_url))
             .json(&serde_json::json!({
@@ -197,7 +197,7 @@ impl RegistrationManager {
         let reference_code = self.reference_code.as_ref().unwrap();
         debug!("Sending heartbeat for node {}", reference_code);
 
-        // Modified: Correct endpoint URL for node-heartbeat
+        // Correct API endpoint URL matching Django configuration
         let response = self.client
             .post(&format!("{}/api/aeronyx/node-heartbeat/", self.api_url))
             .json(&serde_json::json!({
@@ -356,6 +356,23 @@ impl RegistrationManager {
             },
             "node_version": env!("CARGO_PKG_VERSION"),
         })
+    }
+
+    // Test API connection 
+    pub async fn test_api_connection(&self) -> Result<bool, String> {
+        // Simple test to see if the API is accessible
+        match self.client.get(&format!("{}/api/aeronyx/node-types/", self.api_url)).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    info!("Successfully connected to API server");
+                    Ok(true)
+                } else {
+                    warn!("API server returned status: {}", response.status());
+                    Ok(false)
+                }
+            },
+            Err(e) => Err(format!("Failed to connect to API server: {}", e))
+        }
     }
 }
 
