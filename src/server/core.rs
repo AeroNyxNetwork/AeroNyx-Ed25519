@@ -30,6 +30,7 @@ use crate::server::metrics::ServerMetricsCollector;
 use crate::server::client::handle_client;
 use crate::server::packet::start_tun_packet_processor;
 use crate::utils::security::RateLimiter;
+use crate::registration::RegistrationManager;
 
 // --- ServerError enum remains the same ---
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +118,8 @@ pub struct VpnServer {
     pub state: Arc<RwLock<ServerState>>,
     /// Server task handles (background tasks ONLY)
     pub task_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// Registration manager
+    pub registration_manager: Option<Arc<RegistrationManager>>,
 }
 
 impl VpnServer {
@@ -222,6 +225,16 @@ impl VpnServer {
             warn!("Failed to configure NAT: {}. VPN routing may not work correctly.", e);
         }
 
+        // Initialize registration manager
+        let registration_manager = Arc::new(RegistrationManager::new(&config.api_url));
+        let has_registration = registration_manager.load_from_config(&config).unwrap_or(false);
+        
+        if has_registration {
+            info!("Loaded existing node registration");
+        } else {
+            warn!("No node registration found. Register the node using the setup command.");
+        }
+
         Ok(Self {
             config,
             tls_acceptor,
@@ -237,6 +250,7 @@ impl VpnServer {
             rate_limiter,
             state: Arc::new(RwLock::new(ServerState::Created)),
             task_handles: Arc::new(Mutex::new(Vec::new())),
+            registration_manager: Some(registration_manager),
         })
     }
 
@@ -353,6 +367,21 @@ impl VpnServer {
             handles.push(tun_processor_handle);
         }
 
+        // --- Start heartbeat in background if registered ---
+        if let Some(reg_manager) = &self.registration_manager {
+            let reg_manager_clone = reg_manager.clone();
+            let server_state_clone = self.state.clone();
+            let metrics_clone = self.metrics.clone();
+            
+            let heartbeat_handle = tokio::spawn(async move {
+                reg_manager_clone.start_heartbeat_loop(server_state_clone, metrics_clone).await;
+            });
+            
+            {
+                let mut handles = self.task_handles.lock().await;
+                handles.push(heartbeat_handle);
+            }
+        }
 
         // --- Prepare for Main Loop ---
         let tls_acceptor = self.tls_acceptor.clone();
@@ -753,6 +782,10 @@ mod tests {
             max_connections_per_ip: 5,
             data_dir: temp_dir.path().to_path_buf(),
             server_key_file: temp_dir.path().join("server_key.json"),
+            registration_code: None,
+            registration_reference_code: None,
+            wallet_address: None,
+            api_url: "https://api.aeronyx.network".to_string(),
             key_manager: None, // Let KeyManager be created internally if needed
         };
 
