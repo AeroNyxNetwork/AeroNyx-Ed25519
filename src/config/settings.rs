@@ -35,11 +35,22 @@ pub enum ConfigError {
     InvalidSocketAddr(#[from] std::net::AddrParseError),
 }
 
+/// Command enum for subcommands
+#[derive(Parser, Debug, Clone)]
+pub enum Command {
+    /// Set up node registration
+    Setup {
+        /// Registration code from API
+        #[clap(long, required = true)]
+        registration_code: String,
+    }
+}
+
 /// Command line arguments for the server
 #[derive(Parser, Debug, Clone)]
 #[clap(
-    name = "AeroNyx Privacy Network Server",
-    about = "Military-grade privacy network with Solana keypair authentication",
+    name = "AeroNyx Privacy Network Node",
+    about = "Decentralized privacy compute network node with blockchain integration",
     version,
     author
 )]
@@ -107,6 +118,26 @@ pub struct ServerArgs {
     /// Configuration file path
     #[clap(long)]
     pub config_file: Option<String>,
+    
+    /// Registration code from API
+    #[clap(long)]
+    pub registration_code: Option<String>,
+    
+    /// Reference code for registered node
+    #[clap(long)]
+    pub registration_reference_code: Option<String>,
+    
+    /// Wallet address for rewards
+    #[clap(long)]
+    pub wallet_address: Option<String>,
+    
+    /// API server URL
+    #[clap(long, default_value = "https://api.aeronyx.network")]
+    pub api_url: String,
+    
+    /// Registration setup command
+    #[clap(subcommand)]
+    pub command: Option<Command>,
 }
 
 /// Server configuration
@@ -153,6 +184,18 @@ pub struct ServerConfig {
     
     /// Server keypair path
     pub server_key_file: PathBuf,
+    
+    /// Registration code from API
+    pub registration_code: Option<String>,
+    
+    /// Reference code for registered node
+    pub registration_reference_code: Option<String>,
+    
+    /// Wallet address for rewards
+    pub wallet_address: Option<String>,
+    
+    /// API server URL
+    pub api_url: String,
     
     /// Key manager for server keys
     #[serde(skip)]
@@ -211,6 +254,10 @@ impl ServerConfig {
             max_connections_per_ip: args.max_connections_per_ip,
             data_dir,
             server_key_file,
+            registration_code: args.registration_code,
+            registration_reference_code: args.registration_reference_code,
+            wallet_address: args.wallet_address,
+            api_url: args.api_url,
             key_manager: None,
         };
         
@@ -292,6 +339,10 @@ mod tests {
             max_connections_per_ip: 10,
             data_dir: PathBuf::from("/tmp"),
             server_key_file: PathBuf::from("/tmp/server_key.json"),
+            registration_code: None,
+            registration_reference_code: None,
+            wallet_address: None,
+            api_url: "https://api.aeronyx.network".to_string(),
             key_manager: None,
         };
         
@@ -315,6 +366,10 @@ mod tests {
             max_connections_per_ip: 10,
             data_dir: PathBuf::from("/tmp"),
             server_key_file: PathBuf::from("/tmp/server_key.json"),
+            registration_code: None,
+            registration_reference_code: None,
+            wallet_address: None,
+            api_url: "https://api.aeronyx.network".to_string(),
             key_manager: None,
         };
         
@@ -342,6 +397,10 @@ mod tests {
             max_connections_per_ip: 10,
             data_dir: PathBuf::from("/tmp"),
             server_key_file: PathBuf::from("/tmp/server_key.json"),
+            registration_code: None,
+            registration_reference_code: None,
+            wallet_address: None,
+            api_url: "https://api.aeronyx.network".to_string(),
             key_manager: None,
         };
         
