@@ -1,4 +1,4 @@
-// src/config/settings.rs
+// Modified src/config/settings.rs
 //! Server configuration settings.
 //!
 //! This module contains the server configuration structures and
@@ -138,34 +138,6 @@ pub struct ServerArgs {
     /// Registration setup command
     #[clap(subcommand)]
     pub command: Option<Command>,
-}
-
-pub fn save_registration(&self, reference_code: &str, wallet_address: &str) -> Result<(), String> {
-    let mut config = self.clone();
-    
-    // Update the registration fields
-    config.registration_reference_code = Some(reference_code.to_string());
-    config.wallet_address = Some(wallet_address.to_string());
-    
-    // Create a config directory if it doesn't exist
-    if !self.data_dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(&self.data_dir) {
-            return Err(format!("Failed to create data directory: {}", e));
-        }
-    }
-    
-    // Save to a file in the data directory
-    let config_path = self.data_dir.join("registration.json");
-    let json = match serde_json::to_string_pretty(&config) {
-        Ok(json) => json,
-        Err(e) => return Err(format!("Failed to serialize config: {}", e)),
-    };
-    
-    if let Err(e) = std::fs::write(&config_path, json) {
-        return Err(format!("Failed to write registration to file: {}", e));
-    }
-    
-    Ok(())
 }
 
 /// Server configuration
@@ -343,6 +315,28 @@ impl ServerConfig {
         let config: Self = serde_json::from_str(&content)?;
         config.validate()?;
         Ok(config)
+    }
+    
+    /// Save registration information to a file
+    pub fn save_registration(&self, reference_code: &str, wallet_address: &str) -> Result<(), anyhow::Error> {
+        let mut config = self.clone();
+        
+        // Update the registration fields
+        config.registration_reference_code = Some(reference_code.to_string());
+        config.wallet_address = Some(wallet_address.to_string());
+        
+        // Create a config directory if it doesn't exist
+        if !self.data_dir.exists() {
+            std::fs::create_dir_all(&self.data_dir)?;
+        }
+        
+        // Save to a file in the data directory
+        let config_path = self.data_dir.join("registration.json");
+        let json = serde_json::to_string_pretty(&config)?;
+        
+        std::fs::write(&config_path, json)?;
+        
+        Ok(())
     }
 }
 
