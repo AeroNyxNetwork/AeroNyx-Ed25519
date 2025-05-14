@@ -374,11 +374,6 @@ Entry point for the AeroNyx node application.
    - New privacy keys generated and encrypted with current session key
    - Node sends `KeyRotation` packet with new encrypted key for forward secrecy
 
-> *"AeroNyx demonstrates how a privacy-first architecture can bridge Web3 with AI computing needs. By enabling distributed, privacy-preserving compute access on-demand, it creates a viable alternative to centralized cloud providers while maintaining the privacy and security guarantees expected in sensitive AI workflows."* — Sarah Martinez, Founders Fund
-
-
-> *"The AeroNyx protocol represents the next evolutionary step in decentralized infrastructure. By tokenizing privacy computing capacity, it creates economic incentives that align network participants while delivering the computational resources needed for advanced AI workloads. This positions AeroNyx at the intersection of DePIN, privacy tech, and AI—three of the most promising areas in Web3."*
-
 ## Recent Updates (May 14, 2025)
 
 - Added node registration system with API integration
