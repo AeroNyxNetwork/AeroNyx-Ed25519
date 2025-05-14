@@ -1,6 +1,5 @@
+// Modified src/main.rs 
 //! AeroNyx Privacy Network Server
-//! 
-//! A privacy-focused VPN server using Solana keypairs for authentication
 //! and end-to-end encryption.
 use clap::Parser;
 use std::path::Path;
@@ -115,6 +114,18 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
     // Create registration manager
     let reg_manager = RegistrationManager::new(&config.api_url);
     
+    // Test API connection first
+    info!("Testing connection to API server at {}", config.api_url);
+    match reg_manager.test_api_connection().await {
+        Ok(true) => info!("API connection test successful"),
+        Ok(false) => info!("API connection test received error response, will try to proceed anyway"),
+        Err(e) => {
+            error!("Cannot connect to API server: {}", e);
+            error!("Please check your network connection and API URL configuration.");
+            return Err(anyhow::anyhow!("Cannot connect to API server: {}", e));
+        }
+    }
+    
     // Collect system information
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
     let os_type = std::env::consts::OS.to_string();
@@ -153,13 +164,13 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
                 },
                 Err(e) => {
                     error!("Failed to get node status: {}", e);
-                    return Err(anyhow::anyhow!("Registration confirmation failed"));
+                    return Err(anyhow::anyhow!("Registration confirmation failed: {}", e));
                 }
             }
         },
         Ok(false) => {
             error!("Registration was not confirmed by the server");
-            return Err(anyhow::anyhow!("Registration not confirmed"));
+            return Err(anyhow::anyhow!("Registration not confirmed by server"));
         },
         Err(e) => {
             error!("Registration failed: {}", e);
