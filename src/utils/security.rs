@@ -71,6 +71,18 @@ impl RateLimiter {
         }
     }
 
+
+    pub fn random_string(length: usize) -> String {
+        use rand::{thread_rng, Rng};
+        use rand::distributions::Alphanumeric;
+        
+        thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(length)
+            .map(char::from)
+            .collect()
+    }
+    
     /// Check if an IP address should be rate limited with improved efficiency
     /// Modified to avoid potential deadlock by not holding multiple locks simultaneously
     pub async fn check_rate_limit(&self, ip: &IpAddr) -> bool {
