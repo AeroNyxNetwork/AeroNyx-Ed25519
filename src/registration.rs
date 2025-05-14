@@ -339,7 +339,7 @@ impl RegistrationManager {
     }
 
     // Enhanced heartbeat with improved error handling
-    pub async fn send_heartbeat(&self, status_info: serde_json::Value) -> Result<HeartbeatResponse, String> {
+    pub async fn send_heartbeat(&mut self, status_info: serde_json::Value) -> Result<HeartbeatResponse, String> {
         if self.reference_code.is_none() {
             return Err("Missing reference code for heartbeat".to_string());
         }
@@ -404,9 +404,6 @@ impl RegistrationManager {
                     debug!("Heartbeat response code: {}", status);
                     
                     if status.is_success() {
-                        // Save the headers before consuming the response
-                        let resp_headers = response.headers().clone();
-                        
                         // Read response text
                         let text = match response.text().await {
                             Ok(t) => t,
@@ -477,16 +474,22 @@ impl RegistrationManager {
         }
     }
 
-    // Improved heartbeat loop with graceful shutdown
+    // Improved heartbeat loop with graceful shutdown - using Arc<RwLock<Self>> pattern for thread safety
     pub async fn start_heartbeat_loop(
-        &self,
+        self: Arc<RwLock<Self>>,
         server_state: Arc<RwLock<ServerState>>,
         metrics: Arc<ServerMetricsCollector>,
     ) {
         info!("Starting node heartbeat loop for AeroNyx DePIN participation");
         
-        // Start with a default 60 second interval
-        let mut interval = time::interval(Duration::from_secs(self.heartbeat_interval_secs));
+        // Get current interval from self
+        let heartbeat_interval_secs = {
+            let manager = self.read().await;
+            manager.heartbeat_interval_secs
+        };
+        
+        // Start with the current interval
+        let mut interval = time::interval(Duration::from_secs(heartbeat_interval_secs));
         let mut consecutive_failures = 0;
         
         // Create channels for graceful shutdown
@@ -541,17 +544,31 @@ impl RegistrationManager {
             tokio::select! {
                 _ = interval.tick() => {
                     // Collect system metrics and server data
-                    let status_info = self.collect_system_metrics(&metrics).await;
+                    let status_info = {
+                        let manager = self.read().await;
+                        manager.collect_system_metrics(&metrics).await
+                    };
                     
-                    // Send heartbeat
-                    match self.send_heartbeat(status_info).await {
+                    // Send heartbeat with a mutable reference
+                    let heartbeat_result = {
+                        let mut manager = self.write().await;
+                        manager.send_heartbeat(status_info).await
+                    };
+                    
+                    match heartbeat_result {
                         Ok(response) => {
                             consecutive_failures = 0;
                             debug!("Heartbeat successful. Node status: {}. Next heartbeat in {}", 
                                    response.status, response.next_heartbeat);
                             
+                            // Get next heartbeat interval
+                            let next_interval = {
+                                let manager = self.read().await;
+                                manager.parse_next_heartbeat(&response.next_heartbeat)
+                            };
+                            
                             // Adjust heartbeat interval based on server response
-                            if let Some(seconds) = self.parse_next_heartbeat(&response.next_heartbeat) {
+                            if let Some(seconds) = next_interval {
                                 if seconds != interval.period().as_secs() {
                                     info!("Adjusting heartbeat interval to {} seconds", seconds);
                                     interval = time::interval(Duration::from_secs(seconds));
@@ -575,13 +592,21 @@ impl RegistrationManager {
                     info!("Received shutdown signal, sending final heartbeat and terminating loop");
                     
                     // Send final heartbeat with shutting_down status
-                    let mut final_status = self.collect_system_metrics(&metrics).await;
+                    let mut final_status = {
+                        let manager = self.read().await;
+                        manager.collect_system_metrics(&metrics).await
+                    };
                     
                     if let Some(obj) = final_status.as_object_mut() {
                         obj.insert("status".to_string(), serde_json::Value::String("shutting_down".to_string()));
                     }
                     
-                    match self.send_heartbeat(final_status).await {
+                    let final_result = {
+                        let mut manager = self.write().await;
+                        manager.send_heartbeat(final_status).await
+                    };
+                    
+                    match final_result {
                         Ok(_) => info!("Final heartbeat sent successfully"),
                         Err(e) => warn!("Failed to send final heartbeat: {}", e),
                     }
