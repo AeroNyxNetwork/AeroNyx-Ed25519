@@ -224,17 +224,20 @@ impl VpnServer {
         if let Err(e) = configure_nat(&config.tun_name, &config.subnet) {
             warn!("Failed to configure NAT: {}. VPN routing may not work correctly.", e);
         }
-
+        
         // Initialize registration manager
         let registration_manager = Arc::new(RegistrationManager::new(&config.api_url));
-        let has_registration = registration_manager.load_from_config(&config).unwrap_or(false);
+        
+        // Create a temporary clone for the mutable operation
+        let mut reg_manager_clone = RegistrationManager::new(&config.api_url);
+        let has_registration = reg_manager_clone.load_from_config(&config).unwrap_or(false);
         
         if has_registration {
             info!("Loaded existing node registration");
         } else {
             warn!("No node registration found. Register the node using the setup command.");
         }
-
+        
         Ok(Self {
             config,
             tls_acceptor,
