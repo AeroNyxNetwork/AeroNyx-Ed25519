@@ -119,8 +119,9 @@ impl RegistrationManager {
     pub async fn check_status(&self, registration_code: &str) -> Result<NodeStatusResponse, String> {
         debug!("Checking node status with API");
         
+        // Modified: Correct endpoint URL for check-node-status
         let response = self.client
-            .post(&format!("{}/api/aeronyx/node/check-status", self.api_url))
+            .post(&format!("{}/api/aeronyx/check-node-status/", self.api_url))
             .json(&serde_json::json!({
                 "registration_code": registration_code,
             }))
@@ -152,8 +153,9 @@ impl RegistrationManager {
         // Generate a node signature (in production this would be cryptographically secure)
         let node_signature = format!("node-sig-{}", utils::random_string(16));
 
+        // Modified: Correct endpoint URL for confirm-registration
         let response = self.client
-            .post(&format!("{}/api/aeronyx/node/confirm-registration", self.api_url))
+            .post(&format!("{}/api/aeronyx/confirm-registration/", self.api_url))
             .json(&serde_json::json!({
                 "registration_code": registration_code,
                 "node_signature": node_signature,
@@ -195,8 +197,9 @@ impl RegistrationManager {
         let reference_code = self.reference_code.as_ref().unwrap();
         debug!("Sending heartbeat for node {}", reference_code);
 
+        // Modified: Correct endpoint URL for node-heartbeat
         let response = self.client
-            .post(&format!("{}/api/aeronyx/node/heartbeat", self.api_url))
+            .post(&format!("{}/api/aeronyx/node-heartbeat/", self.api_url))
             .json(&serde_json::json!({
                 "reference_code": reference_code,
                 "node_signature": node_signature,
@@ -367,7 +370,7 @@ mod tests {
         let mut server = Server::new();
         
         // Setup mock server
-        let mock = server.mock("POST", "/api/aeronyx/node/confirm-registration")
+        let mock = server.mock("POST", "/api/aeronyx/confirm-registration/")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"success":true,"message":"Registration confirmed","data":{},"errors":null}"#)
@@ -389,7 +392,7 @@ mod tests {
         let mut server = Server::new();
         
         // Setup mock server
-        let mock = server.mock("POST", "/api/aeronyx/node/check-status")
+        let mock = server.mock("POST", "/api/aeronyx/check-node-status/")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"success":true,"message":"Status retrieved","data":{"id":1,"reference_code":"test-ref","name":"test-node","status":"active","node_type":"basic","created_at":"2023-01-01","activated_at":"2023-01-01","last_seen":"2023-01-01","uptime":"1 day","resources":{"cpu_usage":10,"memory_usage":20,"storage_usage":30,"bandwidth_usage":40}},"errors":null}"#)
