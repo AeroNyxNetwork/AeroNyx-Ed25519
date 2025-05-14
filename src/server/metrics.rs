@@ -95,6 +95,8 @@ pub struct ServerMetricsCollector {
 
 
 impl ServerMetricsCollector {
+
+
     /// Create a new metrics collector
     pub fn new(interval: Duration, max_history: usize) -> Self {
         Self {
@@ -108,6 +110,24 @@ impl ServerMetricsCollector {
         }
     }
 
+    /// Get the count of active connections
+    pub async fn get_active_connections(&self) -> usize {
+        let metrics = self.metrics.read().await;
+        metrics.active_connections
+    }
+    
+    /// Get the total bytes sent
+    pub async fn get_total_bytes_sent(&self) -> u64 {
+        let metrics = self.metrics.read().await;
+        metrics.bytes_sent
+    }
+    
+    /// Get the total bytes received
+    pub async fn get_total_bytes_received(&self) -> u64 {
+        let metrics = self.metrics.read().await;
+        metrics.bytes_received
+    }
+    
     /// Start metrics collection
     pub async fn start(&self) -> bool {
         let mut running_guard = self.running.write().await;
