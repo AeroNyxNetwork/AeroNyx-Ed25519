@@ -1,4 +1,4 @@
-// Enhanced src/registration.rs with improvements for AeroNyx DePIN
+// src/registration.rs - Enhanced version with conservative improvements
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -53,28 +53,16 @@ pub struct NodeResources {
     pub bandwidth_usage: i32,
 }
 
-// Enhanced heartbeat response with Solana integration
+// Heartbeat response
 #[derive(Debug, Deserialize)]
 pub struct HeartbeatResponse {
     pub id: u64,
     pub status: String,
     pub last_seen: String,
     pub next_heartbeat: String,
-    pub reward_eligible: Option<bool>,             // Indicates if node is eligible for rewards
-    pub pending_rewards: Option<f64>,              // Pending rewards amount if available
-    pub network_status: Option<NetworkStatus>,     // Overall network status information
 }
 
-// Network status information
-#[derive(Debug, Deserialize)]
-pub struct NetworkStatus {
-    pub active_nodes: u32,
-    pub total_nodes: u32, 
-    pub avg_cpu_usage: f32,
-    pub avg_memory_usage: f32,
-}
-
-/// Improved node registration handler with enhanced security
+// Node registration handler
 #[derive(Clone)]
 pub struct RegistrationManager {
     client: Client,
@@ -89,14 +77,14 @@ pub struct RegistrationManager {
 
 impl RegistrationManager {
     pub fn new(api_url: &str) -> Self {
-        // Build a robust client with retry capability and security headers
+        // Build a robust client with retry capability
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .tcp_keepalive(Some(Duration::from_secs(60)))
             .user_agent("AeroNyx-Node/1.0")
-            .pool_max_idle_per_host(5)        // Enhanced connection pooling
+            .pool_max_idle_per_host(5)           // Add connection pooling
             .pool_idle_timeout(Some(Duration::from_secs(90)))
-            .https_only(true)                 // Enforce HTTPS for security
+            .https_only(true)                    // Enforce HTTPS for security
             .build()
             .unwrap_or_else(|_| {
                 warn!("Failed to build custom HTTP client, using default");
@@ -111,7 +99,7 @@ impl RegistrationManager {
             wallet_address: None,
             node_signature: None,
             last_heartbeat_time: None,
-            heartbeat_interval_secs: 60,     // Default interval
+            heartbeat_interval_secs: 60,  // Default interval
         }
     }
 
@@ -131,7 +119,7 @@ impl RegistrationManager {
         }
         
         if let Some(wallet_address) = &config.wallet_address {
-            if !Self::is_valid_solana_address(wallet_address) {
+            if !Self::is_valid_wallet_address(wallet_address) {
                 warn!("Wallet address format appears invalid, but continuing: {}", wallet_address);
             }
             self.wallet_address = Some(wallet_address.clone());
@@ -145,13 +133,12 @@ impl RegistrationManager {
         Ok(has_minimum)
     }
 
-    // Basic validation for Solana wallet address format
-    fn is_valid_solana_address(address: &str) -> bool {
-        // Simple format check: Solana addresses are base58-encoded and typically 32-44 chars
-        address.len() >= 32 && address.len() <= 44 && address.chars().all(|c| {
-            // Base58 charset contains alphanumerics except for 0, O, I, and l
-            (c.is_ascii_alphanumeric() && c != '0' && c != 'O' && c != 'I' && c != 'l')
-        })
+    // Basic validation for wallet address format
+    fn is_valid_wallet_address(address: &str) -> bool {
+        // Simple format check: Wallet addresses should be 32-44 characters
+        address.len() >= 32 && address.len() <= 44 && address.chars().all(|c| 
+            c.is_ascii_alphanumeric() && c != '0' && c != 'O' && c != 'I' && c != 'l'
+        )
     }
 
     // Check registration status with improved error handling
@@ -255,13 +242,6 @@ impl RegistrationManager {
             // Add node version
             obj.insert("node_version".to_string(), serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()));
             
-            // Add build timestamp if defined
-            if let Ok(timestamp) = option_env!("BUILD_TIMESTAMP").ok_or("").map(|s| s.to_string()) {
-                if !timestamp.is_empty() {
-                    obj.insert("build_timestamp".to_string(), serde_json::Value::String(timestamp));
-                }
-            }
-            
             // Add secure timestamp
             obj.insert("registration_timestamp".to_string(), 
                       serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
@@ -333,14 +313,9 @@ impl RegistrationManager {
                         }
                     } else if status == StatusCode::TOO_MANY_REQUESTS {
                         // Handle rate limiting with backoff
-                        let retry_after = response.headers()
-                            .get(header::RETRY_AFTER)
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(5);
-                            
-                        warn!("Rate limited, waiting {} seconds before retry", retry_after);
-                        tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                        let retry_seconds = 5u64;
+                        warn!("Rate limited, waiting {} seconds before retry", retry_seconds);
+                        tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
                         continue;
                     } else {
                         // Request failed with other error
@@ -363,7 +338,7 @@ impl RegistrationManager {
         }
     }
 
-    // Enhanced heartbeat with privacy computing metrics
+    // Enhanced heartbeat with improved error handling
     pub async fn send_heartbeat(&self, status_info: serde_json::Value) -> Result<HeartbeatResponse, String> {
         if self.reference_code.is_none() {
             return Err("Missing reference code for heartbeat".to_string());
@@ -380,13 +355,15 @@ impl RegistrationManager {
         headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
         headers.insert(header::ACCEPT, header::HeaderValue::from_static("application/json"));
         
-        // Add enhanced security headers
-        headers.insert("X-Node-Version", header::HeaderValue::from_str(env!("CARGO_PKG_VERSION")).unwrap_or_default());
+        // Add node version header safely
+        if let Ok(version_value) = header::HeaderValue::from_str(env!("CARGO_PKG_VERSION")) {
+            headers.insert("X-Node-Version", version_value);
+        }
         
         let url = format!("{}/api/aeronyx/node-heartbeat/", self.api_url);
         debug!("Sending heartbeat to: {}", url);
         
-        // Enhance status info with privacy-focused metrics
+        // Enhance status info with security information
         let mut enhanced_status = status_info.clone();
         
         // Add timestamp for security validation
@@ -394,7 +371,7 @@ impl RegistrationManager {
             obj.insert("timestamp".to_string(), 
                       serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
                       
-            // Add wallet address if available (for reward tracking)
+            // Add wallet address if available
             if let Some(wallet) = &self.wallet_address {
                 obj.insert("wallet_address".to_string(), 
                           serde_json::Value::String(wallet.clone()));
@@ -427,6 +404,9 @@ impl RegistrationManager {
                     debug!("Heartbeat response code: {}", status);
                     
                     if status.is_success() {
+                        // Save the headers before consuming the response
+                        let resp_headers = response.headers().clone();
+                        
                         // Read response text
                         let text = match response.text().await {
                             Ok(t) => t,
@@ -461,23 +441,6 @@ impl RegistrationManager {
                                     }
                                 }
                                 
-                                // Log reward eligibility if available
-                                if let Some(eligible) = data.reward_eligible {
-                                    if eligible {
-                                        info!("Node is eligible for DePIN rewards");
-                                        if let Some(pending) = data.pending_rewards {
-                                            info!("Pending rewards: {}", pending);
-                                        }
-                                    }
-                                }
-                                
-                                // Log network status if available
-                                if let Some(network) = &data.network_status {
-                                    debug!("Network status: {}/{} active nodes, Avg CPU: {}%, Avg Memory: {}%", 
-                                           network.active_nodes, network.total_nodes, 
-                                           network.avg_cpu_usage, network.avg_memory_usage);
-                                }
-                                
                                 return Ok(data);
                             } else {
                                 return Err("No data in heartbeat response".to_string());
@@ -487,14 +450,9 @@ impl RegistrationManager {
                         }
                     } else if status == StatusCode::TOO_MANY_REQUESTS {
                         // Handle rate limiting
-                        let retry_after = response.headers()
-                            .get(header::RETRY_AFTER)
-                            .and_then(|h| h.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(5);
-                            
-                        warn!("Rate limited, waiting {} seconds before retry", retry_after);
-                        tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                        let retry_seconds = 5u64; 
+                        warn!("Rate limited, waiting {} seconds before retry", retry_seconds);
+                        tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
                         continue;
                     } else {
                         // Request failed
@@ -509,10 +467,8 @@ impl RegistrationManager {
                         return Err(format!("Heartbeat API request failed after {} retries: {}", max_retries, e));
                     }
                     
-                    // Exponential backoff with jitter for distributed systems
-                    let base_backoff = 2u64.pow(retry_count as u32);
-                    let jitter = (rand::random::<f64>() * 0.5) as u64; // 0-0.5 seconds jitter
-                    let backoff_secs = base_backoff + jitter;
+                    // Exponential backoff
+                    let backoff_secs = 2u64.pow(retry_count as u32);
                     
                     warn!("Heartbeat request failed, retrying in {} seconds. Error: {}", backoff_secs, e);
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
@@ -521,7 +477,7 @@ impl RegistrationManager {
         }
     }
 
-    // Improved heartbeat loop with DePIN participation signals
+    // Improved heartbeat loop with graceful shutdown
     pub async fn start_heartbeat_loop(
         &self,
         server_state: Arc<RwLock<ServerState>>,
@@ -554,38 +510,29 @@ impl RegistrationManager {
             })
         };
         
-        // Spawn a task to handle OS signals
+        // Spawn a task to handle OS signals where available
+        #[cfg(unix)]
         let signal_handler = {
             let shutdown_tx = shutdown_tx.clone();
             
             tokio::spawn(async move {
-                #[cfg(unix)]
-                {
-                    let mut sigterm = tokio::signal::unix::signal(
-                        tokio::signal::unix::SignalKind::terminate()
-                    ).expect("Failed to create SIGTERM handler");
-                    
-                    let mut sigint = tokio::signal::unix::signal(
-                        tokio::signal::unix::SignalKind::interrupt()
-                    ).expect("Failed to create SIGINT handler");
-                    
-                    tokio::select! {
-                        _ = sigterm.recv() => {
-                            info!("Received SIGTERM signal, initiating heartbeat shutdown");
-                            let _ = shutdown_tx.send(()).await;
-                        }
-                        _ = sigint.recv() => {
-                            info!("Received SIGINT signal, initiating heartbeat shutdown");
-                            let _ = shutdown_tx.send(()).await;
-                        }
-                    }
-                }
+                let mut sigterm = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate()
+                ).expect("Failed to create SIGTERM handler");
                 
-                #[cfg(windows)]
-                {
-                    // Windows-specific signal handling if needed
-                    // For now just wait forever
-                    std::future::pending::<()>().await;
+                let mut sigint = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::interrupt()
+                ).expect("Failed to create SIGINT handler");
+                
+                tokio::select! {
+                    _ = sigterm.recv() => {
+                        info!("Received SIGTERM signal, initiating heartbeat shutdown");
+                        let _ = shutdown_tx.send(()).await;
+                    }
+                    _ = sigint.recv() => {
+                        info!("Received SIGINT signal, initiating heartbeat shutdown");
+                        let _ = shutdown_tx.send(()).await;
+                    }
                 }
             })
         };
@@ -593,7 +540,7 @@ impl RegistrationManager {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // Collect system metrics and server data with privacy considerations
+                    // Collect system metrics and server data
                     let status_info = self.collect_system_metrics(&metrics).await;
                     
                     // Send heartbeat
@@ -645,12 +592,16 @@ impl RegistrationManager {
         }
         
         // Clean up monitoring tasks
+        #[cfg(unix)]
         let _ = tokio::join!(state_monitor, signal_handler);
+        
+        #[cfg(not(unix))]
+        let _ = state_monitor.await;
         
         info!("Heartbeat loop terminated");
     }
 
-    // Enhanced helper to parse next heartbeat interval from API response
+    // Helper to parse next heartbeat interval from API response
     fn parse_next_heartbeat(&self, next_heartbeat: &str) -> Option<u64> {
         // Handle different formats returned by API
         if next_heartbeat.contains("30 seconds") {
@@ -666,11 +617,10 @@ impl RegistrationManager {
         } else if next_heartbeat.contains("1800 seconds") || next_heartbeat.contains("30 minutes") {
             Some(1800)
         } else {
-            // Try to parse numeric values with "seconds" suffix
-            let re = regex::Regex::new(r"(\d+)\s*seconds").ok()?;
-            if let Some(caps) = re.captures(next_heartbeat) {
-                if let Some(seconds_str) = caps.get(1) {
-                    if let Ok(seconds) = seconds_str.as_str().parse::<u64>() {
+            // Try to extract numeric value from string using basic parsing
+            for part in next_heartbeat.split_whitespace() {
+                if let Ok(seconds) = part.parse::<u64>() {
+                    if seconds > 0 && next_heartbeat.contains("second") {
                         return Some(seconds);
                     }
                 }
@@ -682,7 +632,7 @@ impl RegistrationManager {
         }
     }
 
-    // Enhanced system metrics collection for DePIN rewards
+    // Enhanced system metrics collection
     async fn collect_system_metrics(&self, metrics_collector: &ServerMetricsCollector) -> serde_json::Value {
         // Collect metrics in parallel for efficiency
         let (memory_result, cpu_result, storage_result, uptime_result) = tokio::join!(
@@ -739,31 +689,6 @@ impl RegistrationManager {
         let bytes_sent = metrics_collector.get_total_bytes_sent().await;
         let bytes_received = metrics_collector.get_total_bytes_received().await;
         
-        // Additional metrics for privacy computing tasks - with safe fallbacks if methods don't exist
-        let privacy_compute_tasks = if let Ok(tasks) = metrics_collector.get_privacy_compute_count().await {
-            tasks
-        } else {
-            0 // Fallback if method not implemented
-        };
-        
-        let avg_task_duration = if let Ok(duration) = metrics_collector.get_average_task_duration().await {
-            duration
-        } else {
-            0.0 // Fallback if method not implemented
-        };
-        
-        let total_completed_tasks = if let Ok(tasks) = metrics_collector.get_total_completed_tasks().await {
-            tasks
-        } else {
-            0 // Fallback if method not implemented
-        };
-        
-        let task_success_rate = if let Ok(rate) = metrics_collector.get_task_success_rate().await {
-            rate
-        } else {
-            100.0 // Fallback if method not implemented
-        };
-        
         // Get uptime
         let uptime_str = match uptime_result {
             Ok(Ok(uptime_secs)) => {
@@ -789,12 +714,6 @@ impl RegistrationManager {
                 "sent_bytes": bytes_sent,
                 "received_bytes": bytes_received,
                 "active_connections": active_connections
-            },
-            "privacy_computing": {
-                "active_tasks": privacy_compute_tasks,
-                "avg_task_duration_ms": avg_task_duration,
-                "total_tasks_completed": total_completed_tasks,
-                "success_rate": task_success_rate
             },
             "node_version": env!("CARGO_PKG_VERSION"),
             "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -921,15 +840,15 @@ mod tests {
     }
     
     #[tokio::test]
-    async fn test_is_valid_solana_address() {
-        // Valid Solana-like addresses
-        assert!(RegistrationManager::is_valid_solana_address("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"));
-        assert!(RegistrationManager::is_valid_solana_address("6FQMVPgYmvTtCpq5YMFujHCzHKA7jZAJDVDvBokTfWZx"));
+    async fn test_is_valid_wallet_address() {
+        // Valid-like addresses
+        assert!(RegistrationManager::is_valid_wallet_address("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"));
+        assert!(RegistrationManager::is_valid_wallet_address("6FQMVPgYmvTtCpq5YMFujHCzHKA7jZAJDVDvBokTfWZx"));
         
         // Invalid addresses
-        assert!(!RegistrationManager::is_valid_solana_address("0x1234567890abcdef1234567890abcdef12345678")); // Ethereum format
-        assert!(!RegistrationManager::is_valid_solana_address("invalid"));
-        assert!(!RegistrationManager::is_valid_solana_address("")); 
+        assert!(!RegistrationManager::is_valid_wallet_address("0x1234567890abcdef1234567890abcdef12345678")); // Ethereum format
+        assert!(!RegistrationManager::is_valid_wallet_address("invalid"));
+        assert!(!RegistrationManager::is_valid_wallet_address("")); 
     }
     
     #[tokio::test]
