@@ -1,4 +1,4 @@
-// src/registration.rs - 简单可靠的实现
+// src/registration.rs
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
