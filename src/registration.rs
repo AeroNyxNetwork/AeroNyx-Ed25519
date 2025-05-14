@@ -1,4 +1,4 @@
-// src/registration.rs
+// Modified src/registration.rs
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -150,7 +150,7 @@ impl RegistrationManager {
         info!("Confirming node registration with API");
 
         // Generate a node signature (in production this would be cryptographically secure)
-        let node_signature = format!("node-sig-{}", utils::security::random_string(16));
+        let node_signature = format!("node-sig-{}", utils::random_string(16));
 
         let response = self.client
             .post(&format!("{}/api/aeronyx/node/confirm-registration", self.api_url))
@@ -190,7 +190,7 @@ impl RegistrationManager {
         }
 
         // Generate a new node signature for each heartbeat
-        let node_signature = format!("node-sig-{}", utils::security::random_string(16));
+        let node_signature = format!("node-sig-{}", utils::random_string(16));
 
         let reference_code = self.reference_code.as_ref().unwrap();
         debug!("Sending heartbeat for node {}", reference_code);
@@ -353,25 +353,6 @@ impl RegistrationManager {
             },
             "node_version": env!("CARGO_PKG_VERSION"),
         })
-    }
-}
-
-// Add extension trait for ServerConfig to save registration
-impl ServerConfig {
-    pub fn save_registration(&self, reference_code: &str, wallet_address: &str) -> Result<(), String> {
-        let mut config = self.clone();
-        
-        // Update registration fields
-        config.registration_reference_code = Some(reference_code.to_string());
-        config.wallet_address = Some(wallet_address.to_string());
-        
-        // Save to config file
-        let config_path = self.data_dir.join("registration.json");
-        config.save_to_file(config_path.to_str().unwrap_or("registration.json"))
-            .map_err(|e| format!("Failed to save registration data: {}", e))?;
-        
-        info!("Saved registration data to {:?}", config_path);
-        Ok(())
     }
 }
 
