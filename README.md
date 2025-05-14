@@ -1,7 +1,7 @@
 # AeroNyx DePIN (Decentralized Physical Infrastructure Network) Privacy Computing Node Memory Document
 
 **Created:** May 10, 2025
-**Updated:** May 10, 2025
+**Updated:** May 14, 2025
 
 ## Project Overview
 
@@ -18,6 +18,8 @@ AeroNyx employs a modular architecture that combines blockchain and advanced cry
 3. **Privacy Cryptography** - Advanced end-to-end encryption and zero-knowledge proof technologies
 4. **Resource Network** - Decentralized resource allocation and compute task routing
 5. **Protocol Layer** - Secure communication protocol and Web3 interaction standards
+6. **Registration System** - API-based node registration and network participation management
+
 
 ## Module Structure
 
@@ -28,9 +30,11 @@ src/
 ├── crypto/         # Privacy computing cryptography implementation
 ├── network/        # Resource network and task management
 ├── protocol/       # Communication protocol and message definitions
+├── registration/   # Node registration and network participation
 ├── server/         # Node core functionality
 └── utils/          # Utility functions
 ```
+
 
 > *"AeroNyx represents a critical breakthrough in blockchain infrastructure layer. Through decentralized privacy computing network, we're seeing how the execution layer for Web3 applications can extend to complex AI workloads while maintaining data ownership and privacy integrity."* — Mike Johnson, a16z Crypto
 
@@ -171,7 +175,28 @@ Validates protocol messages for security and privacy compliance.
 - `validate_message(packet: &PacketType)` - Validate packet against privacy requirements
 - `StringValidator::is_valid_solana_pubkey(key: &str)` - Verify Web3 wallet address format
 
-### 5. Node Infrastructure (`src/server/`)
+### 5. Registration (`src/registration.rs`)
+
+Manages node registration and participation in the AeroNyx network.
+
+**Key Structures:**
+- `RegistrationManager` - Manages node registration and API communication
+- `ApiResponse<T>` - Generic API response structure
+- `RegistrationCodeResponse` - Response for registration code validation
+- `NodeStatusResponse` - Node status information
+- `HeartbeatResponse` - Response to heartbeat messages
+
+**Key Methods:**
+- `RegistrationManager::new(api_url: &str)` - Create new registration manager
+- `RegistrationManager::load_from_config(&mut self, config: &ServerConfig)` - Load existing registration
+- `RegistrationManager::check_status(&self, registration_code: &str)` - Check node registration status
+- `RegistrationManager::confirm_registration(&self, registration_code: &str, node_info: serde_json::Value)` - Confirm node registration
+- `RegistrationManager::send_heartbeat(&self, status_info: serde_json::Value)` - Send node heartbeat
+- `RegistrationManager::start_heartbeat_loop(&self, server_state: Arc<RwLock<ServerState>>, metrics: Arc<ServerMetricsCollector>)` - Start periodic heartbeat
+- `RegistrationManager::collect_system_metrics(&self, metrics_collector: &ServerMetricsCollector)` - Collect node system metrics
+- `ServerConfig::save_registration(&self, reference_code: &str, wallet_address: &str)` - Save registration details
+
+### 6. Node Infrastructure (`src/server/`)
 
 #### Node Core (`core.rs`)
 
@@ -181,6 +206,9 @@ Main decentralized node implementation for DePIN network participation.
 - `VpnServer::new(config: ServerConfig)` - Create a new privacy compute node instance
 - `VpnServer::start(&self)` - Start node participation in decentralized network
 - `VpnServer::shutdown(&self)` - Gracefully withdraw node from network
+
+**Key Fields:**
+- `registration_manager: Option<Arc<RegistrationManager>>` - Manager for node registration and heartbeat
 
 #### Client Workload Handling (`client.rs`)
 
@@ -218,7 +246,7 @@ Collects node contribution metrics for DePIN tokenization and rewards.
 - `ServerMetricsCollector::record_auth_success(&self)` - Track successful Web3 wallet authentication
 - `ServerMetricsCollector::generate_report(&self)` - Generate node contribution report for rewards
 
-### 6. Utilities (`src/utils/`)
+### 7. Utilities (`src/utils/`)
 
 #### Logging (`logging.rs`)
 
@@ -237,6 +265,7 @@ Security and privacy-preservation utilities.
 - `RateLimiter::check_rate_limit(&self, ip: &IpAddr)` - Prevent resource exhaustion attacks
 - `StringValidator::sanitize_log(input: &str)` - Prevent logging of sensitive information
 - `detect_attack_patterns(data: &[u8])` - Detect potentially harmful AI workload patterns
+- `random_string(length: usize)` - Generate cryptographically secure random strings
 
 #### System (`system.rs`)
 
@@ -246,6 +275,10 @@ System interaction utilities for resource allocation.
 - `is_root()` - Verify node operator permissions
 - `enable_ip_forwarding()` - Enable secure compute resource sharing
 - `get_main_interface()` - Identify primary network interface for DePIN participation
+- `get_system_memory()` - Get system memory information for metrics reporting
+- `get_load_average()` - Get CPU load information for metrics reporting
+- `get_disk_usage()` - Get storage utilization information
+- `get_system_uptime()` - Get system uptime information for node reliability metrics
 
 ## Configuration
 
@@ -267,32 +300,76 @@ Handles node operator configuration.
 - `ServerConfig::from_args(args: ServerArgs)` - Create config from operator parameters
 - `ServerConfig::validate(&self)` - Validate DePIN node configuration
 - `ServerConfig::save_to_file(&self, path: &str)` - Persist configuration on-chain
+- `ServerConfig::save_registration(&self, reference_code: &str, wallet_address: &str)` - Save node registration details
+
+**Key Additions:**
+- Command line arguments for registering a node:
+  - `registration_code: Option<String>` - API registration code
+  - `registration_reference_code: Option<String>` - Node reference code
+  - `wallet_address: Option<String>` - Wallet for node rewards
+  - `api_url: String` - API server URL
+- Added Command enum for setup subcommand functionality
+
+## Main Application Flow
+
+### Main (`src/main.rs`)
+
+Entry point for the AeroNyx node application.
+
+**Key Methods:**
+- `main()` - Application entry point
+- `wait_for_shutdown_signal()` - Handle graceful shutdown
+- `handle_registration_setup()` - Process node registration command
+
+**Registration Flow:**
+1. Parse command line arguments with `ServerArgs::parse()`
+2. Check for registration setup command
+3. If registering, collect system information including:
+   - Hostname
+   - Operating system type
+   - CPU specifications
+   - Memory specifications
+4. Confirm registration with API server
+5. Save registration details for future node operation
 
 ## Data Flow
 
-1. **AI Computation Request:**
+1. **Node Registration:**
+   - Operator obtains registration code from network portal
+   - Operator runs setup command with registration code
+   - Node collects system information for registration
+   - Node confirms registration with API server
+   - Node stores registration reference code and wallet address
+
+2. **Node Heartbeat:**
+   - Node establishes regular heartbeat with API server
+   - Node reports system metrics and health status
+   - Node receives next heartbeat timing instructions
+   - Node adjusts heartbeat interval based on network conditions
+
+3. **AI Computation Request:**
    - TLS handshake via `tls_acceptor.accept(stream)`
    - Privacy-preserving WebSocket upgrade via `tokio_tungstenite::accept_async`
 
-2. **Web3 Authentication Flow:**
+4. **Web3 Authentication Flow:**
    - Client sends `Auth` packet with Solana wallet public key
    - Node generates zero-knowledge challenge via `auth_manager.generate_challenge`
    - Client responds with wallet signature in `ChallengeResponse` packet
    - Node verifies Solana signature via `auth_manager.verify_challenge`
 
-3. **Privacy Compute Session Establishment:**
+5. **Privacy Compute Session Establishment:**
    - Node allocates compute resources via `ip_pool.allocate_ip`
    - Node generates secure session key via `SessionKeyManager::generate_key`
    - Node encrypts session key with ECDH shared secret for forward secrecy
    - Node sends `IpAssign` packet with encrypted computation parameters
 
-4. **AI Workload Execution:**
+6. **AI Workload Execution:**
    - Client encrypts model and data with session key, sends `Data` packet
    - Node decrypts with `decrypt_flexible`, routes to isolated compute environment
    - Compute environment returns results to node's `process_tun_packets`
    - Node encrypts computation results, sends to client with privacy guarantees
 
-5. **Key Rotation for Continuous Security:**
+7. **Key Rotation for Continuous Security:**
    - Node periodically checks `session_key_manager.needs_rotation`
    - New privacy keys generated and encrypted with current session key
    - Node sends `KeyRotation` packet with new encrypted key for forward secrecy
@@ -302,10 +379,22 @@ Handles node operator configuration.
 
 > *"The AeroNyx protocol represents the next evolutionary step in decentralized infrastructure. By tokenizing privacy computing capacity, it creates economic incentives that align network participants while delivering the computational resources needed for advanced AI workloads. This positions AeroNyx at the intersection of DePIN, privacy tech, and AI—three of the most promising areas in Web3."*
 
+## Recent Updates (May 14, 2025)
+
+- Added node registration system with API integration
+- Implemented node heartbeat mechanism for network participation tracking
+- Updated ServerArgs to include registration parameters
+- Added Setup command for streamlined node registration
+- Enhanced system metrics collection for node health reporting
+- Added registration persistence and recovery mechanisms
+- Integrated registration status with node startup flow
+
 ## Additional Notes
 
 - The codebase uses the Tokio async runtime for high-throughput AI task processing
 - TLS 1.3 is mandatory for transport security of sensitive AI models
 - The architecture emphasizes security, privacy, and decentralized trust
 - Key management leverages Solana SDK for robust blockchain verification
+- Registration includes exponential backoff for API communication resilience
+- Node heartbeat frequency is dynamically adjusted based on network conditions
 - The modular design supports both privacy-preserving AI computation and decentralized application hosting
