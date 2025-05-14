@@ -1,4 +1,4 @@
-// Fixed src/registration.rs
+// Fixed src/registration.rs with correct content type and CSRF handling
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
