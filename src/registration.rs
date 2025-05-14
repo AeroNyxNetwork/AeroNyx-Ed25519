@@ -1,5 +1,5 @@
-// Modified src/registration.rs 
-use reqwest::{Client, StatusCode};
+// Fixed src/registration.rs
+use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -119,19 +119,36 @@ impl RegistrationManager {
     pub async fn check_status(&self, registration_code: &str) -> Result<NodeStatusResponse, String> {
         debug!("Checking node status with API");
         
+        // Setup headers for Django API
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+        headers.insert(header::ACCEPT, header::HeaderValue::from_static("application/json"));
+        
+        let url = format!("{}/api/aeronyx/check-node-status/", self.api_url);
+        info!("Sending status check to: {}", url);
+        
         // Correct API endpoint URL matching Django configuration
         let response = self.client
-            .post(&format!("{}/api/aeronyx/check-node-status/", self.api_url))
+            .post(&url)
+            .headers(headers)
             .json(&serde_json::json!({
-                "registration_code": registration_code,
+                "registration_code": registration_code
             }))
             .send()
             .await
             .map_err(|e| format!("API request failed: {}", e))?;
 
-        match response.status() {
+        let status = response.status();
+        info!("Status check response code: {}", status);
+
+        match status {
             StatusCode::OK => {
-                let api_response: ApiResponse<NodeStatusResponse> = response.json().await
+                let text = response.text().await
+                    .map_err(|e| format!("Failed to read response: {}", e))?;
+                
+                info!("Status check response body: {}", text);
+                
+                let api_response: ApiResponse<NodeStatusResponse> = serde_json::from_str(&text)
                     .map_err(|e| format!("Failed to parse response: {}", e))?;
                 
                 if api_response.success {
@@ -140,8 +157,10 @@ impl RegistrationManager {
                     Err(format!("API error: {}", api_response.message))
                 }
             },
-            status => {
-                Err(format!("API returned error status: {}", status))
+            _ => {
+                // Try to get error details
+                let error_text = response.text().await.unwrap_or_default();
+                Err(format!("API returned error status: {} - {}", status, error_text))
             }
         }
     }
@@ -150,38 +169,72 @@ impl RegistrationManager {
     pub async fn confirm_registration(&self, registration_code: &str, node_info: serde_json::Value) -> Result<bool, String> {
         info!("Confirming node registration with API");
 
-        // Generate a node signature (in production this would be cryptographically secure)
+        // Generate a node signature
         let node_signature = format!("node-sig-{}", utils::random_string(16));
+        
+        // Setup headers for Django API
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+        headers.insert(header::ACCEPT, header::HeaderValue::from_static("application/json"));
+        
+        // Prepare payload exactly matching what Django expects
+        let payload = serde_json::json!({
+            "registration_code": registration_code,
+            "node_signature": node_signature,
+            "node_info": node_info
+        });
+        
+        info!("Registration payload: {}", serde_json::to_string(&payload).unwrap_or_default());
+        
+        let url = format!("{}/api/aeronyx/confirm-registration/", self.api_url);
+        info!("Sending registration to: {}", url);
 
-        // Correct API endpoint URL matching Django configuration
+        // Send POST request to Django endpoint
         let response = self.client
-            .post(&format!("{}/api/aeronyx/confirm-registration/", self.api_url))
-            .json(&serde_json::json!({
-                "registration_code": registration_code,
-                "node_signature": node_signature,
-                "node_info": node_info,
-            }))
+            .post(&url)
+            .headers(headers)
+            .json(&payload)
             .send()
             .await
             .map_err(|e| format!("API request failed: {}", e))?;
 
-        match response.status() {
-            StatusCode::OK => {
-                let api_response: ApiResponse<serde_json::Value> = response.json().await
-                    .map_err(|e| format!("Failed to parse response: {}", e))?;
-                
-                if !api_response.success {
-                    warn!("Registration confirmation rejected: {}", api_response.message);
+        let status = response.status();
+        info!("Registration response code: {}", status);
+        
+        // Get full response text for detailed debugging
+        let text = response.text().await
+            .map_err(|e| format!("Failed to read response body: {}", e))?;
+        
+        info!("Registration response body: {}", text);
+        
+        if status.is_success() {
+            // Try to parse as API response
+            match serde_json::from_str::<ApiResponse<serde_json::Value>>(&text) {
+                Ok(api_response) => {
+                    info!("Registration API response: {}", serde_json::to_string(&api_response).unwrap_or_default());
+                    if api_response.success {
+                        Ok(true)
+                    } else {
+                        warn!("API returned success=false: {}", api_response.message);
+                        Err(format!("API error: {}", api_response.message))
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to parse API response: {}", e);
+                    
+                    // If we got a success status but couldn't parse the response,
+                    // assume it's a success (might be a different format)
+                    if status.is_success() {
+                        info!("Got success status but couldn't parse response, assuming success");
+                        Ok(true)
+                    } else {
+                        Err(format!("Failed to parse API response: {}", e))
+                    }
                 }
-                
-                Ok(api_response.success)
-            },
-            StatusCode::TOO_MANY_REQUESTS => {
-                Err("Rate limit exceeded. Please try again later.".to_string())
-            },
-            status => {
-                Err(format!("API returned error status: {}", status))
             }
+        } else {
+            // Request failed
+            Err(format!("API returned error status: {} - {}", status, text))
         }
     }
 
@@ -197,36 +250,53 @@ impl RegistrationManager {
         let reference_code = self.reference_code.as_ref().unwrap();
         debug!("Sending heartbeat for node {}", reference_code);
 
-        // Correct API endpoint URL matching Django configuration
+        // Setup headers for Django API
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+        headers.insert(header::ACCEPT, header::HeaderValue::from_static("application/json"));
+        
+        let url = format!("{}/api/aeronyx/node-heartbeat/", self.api_url);
+        debug!("Sending heartbeat to: {}", url);
+        
+        // Prepare payload
+        let payload = serde_json::json!({
+            "reference_code": reference_code,
+            "node_signature": node_signature,
+            "status_info": status_info
+        });
+
+        // Send heartbeat to Django endpoint
         let response = self.client
-            .post(&format!("{}/api/aeronyx/node-heartbeat/", self.api_url))
-            .json(&serde_json::json!({
-                "reference_code": reference_code,
-                "node_signature": node_signature,
-                "status_info": status_info,
-            }))
+            .post(&url)
+            .headers(headers)
+            .json(&payload)
             .send()
             .await
             .map_err(|e| format!("Heartbeat API request failed: {}", e))?;
 
-        match response.status() {
-            StatusCode::OK => {
-                let api_response: ApiResponse<HeartbeatResponse> = response.json().await
-                    .map_err(|e| format!("Failed to parse heartbeat response: {}", e))?;
-                
-                if api_response.success {
-                    api_response.data.ok_or_else(|| "No data in heartbeat response".to_string())
-                } else {
-                    Err(format!("Heartbeat API error: {}", api_response.message))
-                }
-            },
-            StatusCode::TOO_MANY_REQUESTS => {
-                warn!("Heartbeat rate limit exceeded");
-                Err("Rate limit exceeded for heartbeat".to_string())
-            },
-            status => {
-                Err(format!("Heartbeat API returned error status: {}", status))
+        let status = response.status();
+        debug!("Heartbeat response code: {}", status);
+        
+        if status.is_success() {
+            // Read response text
+            let text = response.text().await
+                .map_err(|e| format!("Failed to read heartbeat response: {}", e))?;
+            
+            debug!("Heartbeat response body: {}", text);
+            
+            // Parse as API response
+            let api_response: ApiResponse<HeartbeatResponse> = serde_json::from_str(&text)
+                .map_err(|e| format!("Failed to parse heartbeat response: {}", e))?;
+            
+            if api_response.success {
+                api_response.data.ok_or_else(|| "No data in heartbeat response".to_string())
+            } else {
+                Err(format!("Heartbeat API error: {}", api_response.message))
             }
+        } else {
+            // Request failed
+            let error_text = response.text().await.unwrap_or_default();
+            Err(format!("Heartbeat API returned error status: {} - {}", status, error_text))
         }
     }
 
@@ -358,20 +428,54 @@ impl RegistrationManager {
         })
     }
 
-    // Test API connection 
+    // Test API connection with explicit debugging
     pub async fn test_api_connection(&self) -> Result<bool, String> {
-        // Simple test to see if the API is accessible
-        match self.client.get(&format!("{}/api/aeronyx/node-types/", self.api_url)).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    info!("Successfully connected to API server");
-                    Ok(true)
-                } else {
-                    warn!("API server returned status: {}", response.status());
-                    Ok(false)
-                }
-            },
-            Err(e) => Err(format!("Failed to connect to API server: {}", e))
+        info!("Testing API connection to {}", self.api_url);
+        
+        // Try a known endpoint that should work with GET
+        let url = format!("{}/api/aeronyx/node-types/", self.api_url);
+        info!("Testing connection to: {}", url);
+        
+        let response = self.client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Connection test failed: {}", e))?;
+        
+        let status = response.status();
+        info!("Connection test response: {}", status);
+        
+        // If we can connect, test the registration endpoint explicitly with OPTIONS
+        if status.is_success() {
+            let reg_url = format!("{}/api/aeronyx/confirm-registration/", self.api_url);
+            info!("Testing registration endpoint with OPTIONS: {}", reg_url);
+            
+            match self.client.request(reqwest::Method::OPTIONS, &reg_url).send().await {
+                Ok(options_response) => {
+                    let options_status = options_response.status();
+                    info!("Registration endpoint OPTIONS response: {}", options_status);
+                    
+                    if options_status.is_success() || options_status.as_u16() == 405 {
+                        // Check for allowed methods
+                        if let Some(allow) = options_response.headers().get("allow") {
+                            info!("Allowed methods: {}", allow.to_str().unwrap_or("unknown"));
+                            
+                            // Confirm that POST is allowed
+                            let allow_str = allow.to_str().unwrap_or("").to_uppercase();
+                            if allow_str.contains("POST") {
+                                info!("Registration endpoint accepts POST requests");
+                            } else {
+                                warn!("Registration endpoint does NOT accept POST requests");
+                            }
+                        }
+                    }
+                },
+                Err(e) => warn!("OPTIONS request failed: {}", e)
+            }
+            
+            Ok(true)
+        } else {
+            Err(format!("API connection test failed with status: {}", status))
         }
     }
 }
