@@ -373,32 +373,38 @@ impl VpnServer {
             if let Some(reference_code) = &self.config.registration_reference_code {
                 info!("Starting WebSocket connection for registered node");
                 
-                // Solution 1: If RegistrationManager uses interior mutability (e.g., with Mutex/RwLock fields)
-                // This assumes start_websocket_connection takes &self, not &mut self
-                let ws_manager = reg_manager.clone();
-                let reference_code = reference_code.clone();
+                // Create a new RegistrationManager instance for the WebSocket task
+                let mut ws_manager = RegistrationManager::new(&self.config.api_url);
                 
-                let ws_handle = tokio::spawn(async move {
-                    // Keep trying to connect with exponential backoff
-                    let mut retry_delay = Duration::from_secs(5);
-                    loop {
-                        match ws_manager.start_websocket_connection(reference_code.clone(), None).await {
-                            Ok(_) => {
-                                info!("WebSocket connection established successfully");
-                                break;
-                            }
-                            Err(e) => {
-                                error!("WebSocket connection failed: {}", e);
-                                tokio::time::sleep(retry_delay).await;
-                                retry_delay = (retry_delay * 2).min(Duration::from_secs(300)); // Max 5 minutes
+                // Load the configuration into the new instance
+                let config = self.config.clone();
+                if let Err(e) = ws_manager.load_from_config(&config) {
+                    error!("Failed to load registration config for WebSocket: {}", e);
+                } else {
+                    let reference_code = reference_code.clone();
+                    
+                    let ws_handle = tokio::spawn(async move {
+                        // Keep trying to connect with exponential backoff
+                        let mut retry_delay = Duration::from_secs(5);
+                        loop {
+                            match ws_manager.start_websocket_connection(reference_code.clone(), None).await {
+                                Ok(_) => {
+                                    info!("WebSocket connection established successfully");
+                                    break;
+                                }
+                                Err(e) => {
+                                    error!("WebSocket connection failed: {}", e);
+                                    tokio::time::sleep(retry_delay).await;
+                                    retry_delay = (retry_delay * 2).min(Duration::from_secs(300)); // Max 5 minutes
+                                }
                             }
                         }
+                    });
+                    
+                    {
+                        let mut handles = self.task_handles.lock().await;
+                        handles.push(ws_handle);
                     }
-                });
-                
-                {
-                    let mut handles = self.task_handles.lock().await;
-                    handles.push(ws_handle);
                 }
             }
         }
