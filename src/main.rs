@@ -5,7 +5,7 @@ use clap::Parser;
 use std::path::Path;
 use std::process;
 use tokio::signal;
-use tracing::{error, info};
+use tracing::{error, info, warn};  // Add warn import
 
 mod auth;
 mod config;
@@ -15,9 +15,7 @@ mod protocol;
 mod server;
 mod utils;
 mod registration;
-mod hardware;
-
-pub mod hardware;
+mod hardware;  // Only declare once
 
 use config::settings::{ServerConfig, ServerArgs, Command};
 use server::VpnServer;
@@ -143,7 +141,7 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
             info!("  CPU: {} cores, {}", info.cpu.cores, info.cpu.model);
             info!("  Memory: {} GB", info.memory.total / (1024 * 1024 * 1024));
             info!("  OS: {} {}", info.os.distribution, info.os.version);
-            info!("  Public IP: {}", info.public_ip);
+            info!("  Public IP: {}", info.network.public_ip);  // Fixed: access through network field
             info
         }
         Err(e) => {
@@ -184,7 +182,7 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
                 Some(registration_code.to_string())
             ).await {
                 Ok(_) => info!("WebSocket connection test successful"),
-                Err(e) => warn!("WebSocket connection test failed: {}", e),
+                Err(e) => warn!("WebSocket connection test failed: {}", e),  // Fixed: use warn! macro
             }
             
             info!("\nNext steps:");
