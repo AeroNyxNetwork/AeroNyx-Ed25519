@@ -14,11 +14,12 @@ categories = ["networking", "cryptography"]
 # Async runtime
 tokio = { version = "1.28", features = ["full"] }
 futures = "0.3"
+futures-util = "0.3"
 aes-gcm = "0.10.3"
 base64 = "0.13"
 gethostname = "0.4.1"
 sys-info = "0.9.1"
-generic-array = "0.14.7"  # Added this line for AES-GCM support
+generic-array = "0.14.7"
 # WebSockets
 tokio-tungstenite = { version = "0.19", features = ["rustls-tls-webpki-roots"] }
 # Networking
@@ -77,6 +78,8 @@ reqwest = { version = "0.11", features = ["blocking", "json"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1.4"
 crossbeam-channel = "0.5"
+# Network interface enumeration
+pnet = "0.34"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.26", features = ["user"] }
