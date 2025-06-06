@@ -372,12 +372,13 @@ impl VpnServer {
         if let Some(reg_manager) = &self.registration_manager {
             if let Some(reference_code) = &self.config.registration_reference_code {
                 info!("Starting WebSocket connection for registered node");
-                let ws_manager = (*reg_manager).clone();  // Fixed: removed mut
+                
+                // Solution 1: If RegistrationManager uses interior mutability (e.g., with Mutex/RwLock fields)
+                // This assumes start_websocket_connection takes &self, not &mut self
+                let ws_manager = reg_manager.clone();
                 let reference_code = reference_code.clone();
                 
                 let ws_handle = tokio::spawn(async move {
-                    // Create a mutable clone inside the async block
-                    let mut ws_manager = ws_manager;
                     // Keep trying to connect with exponential backoff
                     let mut retry_delay = Duration::from_secs(5);
                     loop {
