@@ -72,7 +72,6 @@ pub enum ServerError {
     Internal(String),
 }
 
-
 // --- ServerState enum remains the same ---
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerState {
@@ -225,18 +224,22 @@ impl VpnServer {
             warn!("Failed to configure NAT: {}. VPN routing may not work correctly.", e);
         }
         
-        // Initialize registration manager
-        let registration_manager = Arc::new(RegistrationManager::new(&config.api_url));
-        
-        // Create a temporary clone for the mutable operation
-        let mut reg_manager_clone = RegistrationManager::new(&config.api_url);
-        let has_registration = reg_manager_clone.load_from_config(&config).unwrap_or(false);
-        
-        if has_registration {
-            info!("Loaded existing node registration");
+        // Initialize registration manager if we have registration data
+        let registration_manager = if config.registration_reference_code.is_some() {
+            info!("Loading registration data...");
+            let mut manager = RegistrationManager::new(&config.api_url);
+            
+            if manager.load_from_config(&config).unwrap_or(false) {
+                info!("Registration data loaded successfully");
+                Some(Arc::new(manager))
+            } else {
+                warn!("Incomplete registration data, node features disabled");
+                None
+            }
         } else {
-            warn!("No node registration found. Register the node using the setup command.");
-        }
+            info!("No registration data found. Register the node using: aeronyx-private-ed25519 setup --registration-code <CODE>");
+            None
+        };
         
         Ok(Self {
             config,
@@ -253,7 +256,7 @@ impl VpnServer {
             rate_limiter,
             state: Arc::new(RwLock::new(ServerState::Created)),
             task_handles: Arc::new(Mutex::new(Vec::new())),
-            registration_manager: Some(registration_manager),
+            registration_manager,
         })
     }
 
@@ -281,12 +284,10 @@ impl VpnServer {
         // E0277 Fix: Collect into a Vec<Certificate>
         let rustls_certs: Vec<Certificate> = certs_bytes.into_iter().map(Certificate).collect();
 
-
         // Validate certificate expiry (basic check)
         if let Err(e) = Self::validate_certificate_expiry(&rustls_certs) {
              warn!("Certificate validation warning: {}", e);
         }
-
 
         let key_file = std::fs::File::open(&config.key_file)
             .map_err(|e| ServerError::Tls(format!("Failed to open key file: {}", e)))?;
@@ -302,7 +303,6 @@ impl VpnServer {
              })
              .ok_or_else(|| ServerError::Tls("No valid private key (PKCS#8 or RSA) found in key file".to_string()))?;
 
-
         // Use rustls safe defaults, TLS 1.3 only
         let mut tls_config = RustlsServerConfig::builder()
             .with_safe_defaults()
@@ -315,7 +315,6 @@ impl VpnServer {
 
         Ok(Arc::new(tls_config))
     }
-
 
     /// Validate certificate expiration dates (basic check)
     fn validate_certificate_expiry(certs: &[Certificate]) -> Result<(), ServerError> {
@@ -332,7 +331,6 @@ impl VpnServer {
              Err(e) => Err(ServerError::Tls(format!("Invalid certificate structure: {}", e))),
          }
     }
-
 
     /// Start the VPN server
     /// Returns a JoinHandle for the main listener task.
@@ -370,19 +368,35 @@ impl VpnServer {
             handles.push(tun_processor_handle);
         }
 
-        // --- Start heartbeat in background if registered ---
+        // --- Start WebSocket connection if registered ---
         if let Some(reg_manager) = &self.registration_manager {
-            let reg_manager_clone = reg_manager.clone();
-            let server_state_clone = self.state.clone();
-            let metrics_clone = self.metrics.clone();
-            
-            let heartbeat_handle = tokio::spawn(async move {
-                reg_manager_clone.start_heartbeat_loop(server_state_clone, metrics_clone).await;
-            });
-            
-            {
-                let mut handles = self.task_handles.lock().await;
-                handles.push(heartbeat_handle);
+            if let Some(reference_code) = &self.config.registration_reference_code {
+                info!("Starting WebSocket connection for registered node");
+                let mut ws_manager = (*reg_manager).clone();
+                let reference_code = reference_code.clone();
+                
+                let ws_handle = tokio::spawn(async move {
+                    // Keep trying to connect with exponential backoff
+                    let mut retry_delay = Duration::from_secs(5);
+                    loop {
+                        match ws_manager.start_websocket_connection(reference_code.clone(), None).await {
+                            Ok(_) => {
+                                info!("WebSocket connection established successfully");
+                                break;
+                            }
+                            Err(e) => {
+                                error!("WebSocket connection failed: {}", e);
+                                tokio::time::sleep(retry_delay).await;
+                                retry_delay = (retry_delay * 2).min(Duration::from_secs(300)); // Max 5 minutes
+                            }
+                        }
+                    }
+                });
+                
+                {
+                    let mut handles = self.task_handles.lock().await;
+                    handles.push(ws_handle);
+                }
             }
         }
 
@@ -423,7 +437,6 @@ impl VpnServer {
                      return;
                  }
              };
-
 
              // --- Accept Loop ---
              loop {
@@ -547,7 +560,6 @@ impl VpnServer {
         // Give some time for messages to be sent
         time::sleep(Duration::from_millis(500)).await;
 
-
         // --- Abort Background Tasks stored in task_handles ---
         info!("Stopping background tasks...");
         {
@@ -559,11 +571,9 @@ impl VpnServer {
              handles.clear(); // Clear the list
         }
 
-
         // --- Stop Monitor and Metrics ---
          self.network_monitor.stop().await;
          self.metrics.stop().await;
-
 
         // --- Final State Update ---
         {
@@ -574,7 +584,6 @@ impl VpnServer {
         info!("Server shutdown complete.");
         Ok(())
     }
-
 
     /// Start background maintenance tasks
      async fn start_background_tasks(&self) {
@@ -614,7 +623,6 @@ impl VpnServer {
                  if current_state == ServerState::ShuttingDown || current_state == ServerState::Stopped { break; }
                  // Continue if running or starting
                  if current_state != ServerState::Running && current_state != ServerState::Starting { continue; }
-
 
                  let removed = ip_pool_clone.cleanup_expired().await;
                  if !removed.is_empty() {
@@ -659,7 +667,6 @@ impl VpnServer {
                   // Continue if running or starting
                   if current_state != ServerState::Running && current_state != ServerState::Starting { continue; }
 
-
                   let removed = auth_manager_clone.cleanup_expired_challenges().await;
                   if removed > 0 {
                       debug!("Cleaned up {} expired authentication challenges", removed);
@@ -667,7 +674,6 @@ impl VpnServer {
               }
                debug!("Auth challenge cleanup task stopped.");
           }));
-
 
          // --- Task: Metrics Reporting ---
           let metrics_clone = self.metrics.clone();
@@ -689,13 +695,11 @@ impl VpnServer {
                debug!("Metrics reporting task stopped.");
           }));
 
-
-        // --- Start Monitor and Metrics Collection Tasks ---
+         // --- Start Monitor and Metrics Collection Tasks ---
          self.network_monitor.start().await;
          self.metrics.start().await;
 
-
-        // --- Store Background Task Handles ---
+         // --- Store Background Task Handles ---
          {
              let mut task_handles_guard = self.task_handles.lock().await;
              task_handles_guard.extend(handles); // Add all background handles
@@ -722,7 +726,6 @@ impl VpnServer {
         self.ip_pool.clone()
     }
 }
-
 
 // --- Tests ---
 #[cfg(test)]
