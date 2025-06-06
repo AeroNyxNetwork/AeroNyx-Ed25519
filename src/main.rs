@@ -118,6 +118,7 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
     
     // Create registration manager
     let mut reg_manager = RegistrationManager::new(&config.api_url);
+    reg_manager.set_data_dir(config.data_dir.clone());
     
     // Test API connection first
     info!("Testing connection to API server at {}", config.api_url);
@@ -170,7 +171,7 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
                 info!("  Hardware fingerprint registered successfully");
             }
             
-            // Save registration data
+            // Save registration data to config file (for backward compatibility)
             let wallet_address = response.node.wallet_address.clone();
             config.save_registration(&response.node.reference_code, &wallet_address)?;
             
