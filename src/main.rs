@@ -1,11 +1,12 @@
-// Modified src/main.rs 
+// src/main.rs
 //! AeroNyx Privacy Network Server
-//! and end-to-end encryption.
+//! Decentralized Physical Infrastructure Network (DePIN) node
 use clap::Parser;
 use std::path::Path;
 use std::process;
 use tokio::signal;
 use tracing::{error, info};
+
 mod auth;
 mod config;
 mod crypto;
@@ -14,10 +15,14 @@ mod protocol;
 mod server;
 mod utils;
 mod registration;
+mod hardware;
+
+pub mod hardware;
 
 use config::settings::{ServerConfig, ServerArgs, Command};
 use server::VpnServer;
 use registration::RegistrationManager;
+use hardware::HardwareInfo;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -67,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     
     // Wait for either server to finish or shutdown signal
     tokio::select! {
-        result = server_handle => {
+        _ = server_handle => {
             info!("Server stopped");
         }
         _ = shutdown_future => {
@@ -105,75 +110,105 @@ async fn wait_for_shutdown_signal() {
 
 /// Handle registration setup command
 async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -> anyhow::Result<()> {
-    info!("Setting up node registration");
+    info!("Setting up AeroNyx node registration");
     
     // Create temporary config
     let mut config = ServerConfig::from_args(args.clone())?;
     config.registration_code = Some(registration_code.to_string());
     
     // Create registration manager
-    let reg_manager = RegistrationManager::new(&config.api_url);
+    let mut reg_manager = RegistrationManager::new(&config.api_url);
     
     // Test API connection first
     info!("Testing connection to API server at {}", config.api_url);
     match reg_manager.test_api_connection().await {
         Ok(true) => info!("API connection test successful"),
-        Ok(false) => info!("API connection test received error response, will try to proceed anyway"),
+        Ok(false) => {
+            error!("API connection test failed");
+            return Err(anyhow::anyhow!("Cannot connect to API server"));
+        }
         Err(e) => {
             error!("Cannot connect to API server: {}", e);
-            error!("Please check your network connection and API URL configuration.");
             return Err(anyhow::anyhow!("Cannot connect to API server: {}", e));
         }
     }
     
-    // Collect system information
-    let hostname = gethostname::gethostname().to_string_lossy().to_string();
-    let os_type = std::env::consts::OS.to_string();
-    let cpu_info = match sys_info::cpu_num() {
-        Ok(count) => format!("{} cores", count),
-        Err(_) => "Unknown".to_string(),
-    };
-    let memory_info = match sys_info::mem_info() {
-        Ok(mem) => format!("{} MB total", mem.total / 1024),
-        Err(_) => "Unknown".to_string(),
+    // Collect hardware information
+    info!("Collecting hardware information...");
+    let hardware_info = match HardwareInfo::collect().await {
+        Ok(info) => {
+            info!("Hardware information collected successfully");
+            info!("  Hostname: {}", info.hostname);
+            info!("  CPU: {} cores, {}", info.cpu.cores, info.cpu.model);
+            info!("  Memory: {} GB", info.memory.total / (1024 * 1024 * 1024));
+            info!("  OS: {} {}", info.os.distribution, info.os.version);
+            info!("  Public IP: {}", info.public_ip);
+            info
+        }
+        Err(e) => {
+            error!("Failed to collect hardware information: {}", e);
+            return Err(anyhow::anyhow!("Failed to collect hardware information: {}", e));
+        }
     };
     
-    let node_info = serde_json::json!({
-        "hostname": hostname,
-        "os_type": os_type,
-        "cpu_info": cpu_info,
-        "memory_info": memory_info,
-        "version": env!("CARGO_PKG_VERSION"),
-    });
+    // Generate hardware fingerprint
+    let fingerprint = hardware_info.generate_fingerprint();
+    info!("Hardware fingerprint generated: {}...", &fingerprint[..16]);
     
-    // Confirm registration with the server
-    match reg_manager.confirm_registration(registration_code, node_info).await {
-        Ok(true) => {
-            // Check status to get reference code
-            match reg_manager.check_status(registration_code).await {
-                Ok(status) => {
-                    info!("Registration successful!");
-                    info!("Node reference code: {}", status.reference_code);
-                    info!("Node status: {}", status.status);
-                    
-                    // Save registration data
-                    let wallet_address = args.wallet_address.clone().unwrap_or_else(|| "Unknown".to_string());
-                    config.save_registration(&status.reference_code, &wallet_address)?;
-                    
-                    info!("Registration data saved. You can now start the node normally.");
-                },
-                Err(e) => {
-                    error!("Failed to get node status: {}", e);
-                    return Err(anyhow::anyhow!("Registration confirmation failed: {}", e));
-                }
+    // Confirm registration with hardware info
+    info!("Confirming registration with server...");
+    match reg_manager.confirm_registration_with_hardware(registration_code, &hardware_info).await {
+        Ok(response) => {
+            info!("Registration confirmed successfully!");
+            info!("  Node ID: {}", response.node.id);
+            info!("  Reference Code: {}", response.node.reference_code);
+            info!("  Node Type: {}", response.node.node_type);
+            info!("  Status: {}", response.node.status);
+            info!("  Security Level: {}", response.security.security_level);
+            
+            if response.security.hardware_fingerprint_generated {
+                info!("  Hardware fingerprint registered successfully");
             }
-        },
-        Ok(false) => {
-            error!("Registration was not confirmed by the server");
-            return Err(anyhow::anyhow!("Registration not confirmed by server"));
-        },
+            
+            // Save registration data
+            let wallet_address = response.node.wallet_address.clone();
+            config.save_registration(&response.node.reference_code, &wallet_address)?;
+            
+            info!("Registration data saved successfully");
+            
+            // Test WebSocket connection
+            info!("Testing WebSocket connection...");
+            match reg_manager.start_websocket_connection(
+                response.node.reference_code.clone(),
+                Some(registration_code.to_string())
+            ).await {
+                Ok(_) => info!("WebSocket connection test successful"),
+                Err(e) => warn!("WebSocket connection test failed: {}", e),
+            }
+            
+            info!("\nNext steps:");
+            for (i, step) in response.next_steps.iter().enumerate() {
+                info!("  {}. {}", i + 1, step);
+            }
+            
+            info!("\nRegistration completed successfully! You can now start the node normally.");
+        }
         Err(e) => {
             error!("Registration failed: {}", e);
+            
+            // Check for specific error types
+            if e.contains("hardware_fingerprint_conflict") || e.contains("Hardware already registered") {
+                error!("\nThis hardware has already been registered with another node.");
+                error!("Each physical device can only be registered once to prevent abuse.");
+                error!("If you believe this is an error, please contact support.");
+            } else if e.contains("code_already_used") {
+                error!("\nThis registration code has already been used.");
+                error!("Please generate a new registration code from your dashboard.");
+            } else if e.contains("code_expired") {
+                error!("\nThis registration code has expired.");
+                error!("Registration codes are valid for 24 hours. Please generate a new one.");
+            }
+            
             return Err(anyhow::anyhow!("Registration failed: {}", e));
         }
     }
