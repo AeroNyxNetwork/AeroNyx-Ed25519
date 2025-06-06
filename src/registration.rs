@@ -6,13 +6,18 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time;
 use tracing::{debug, error, info, warn};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use futures_util::{SinkExt, StreamExt};
+use std::path::PathBuf;
+use std::fs;
 
 use crate::config::settings::ServerConfig;
 use crate::server::core::ServerState;
 use crate::server::metrics::ServerMetricsCollector;
 use crate::utils;
+use crate::hardware::HardwareInfo;
 
-// API Response structure
+// API Response structures
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ApiResponse<T> {
     pub success: bool,
@@ -21,68 +26,101 @@ pub struct ApiResponse<T> {
     pub errors: Option<serde_json::Value>,
 }
 
-// Registration code response
+// Registration confirmation response
 #[derive(Debug, Deserialize)]
-pub struct RegistrationCodeResponse {
-    pub node_id: u64,
-    pub reference_code: String,
-    pub registration_code: String,
-    pub setup_command: String,
+pub struct RegistrationConfirmResponse {
+    pub success: bool,
+    pub result_code: String,
+    pub node: NodeInfo,
+    pub security: SecurityInfo,
+    pub next_steps: Vec<String>,
 }
 
-// Node status response
 #[derive(Debug, Deserialize)]
-pub struct NodeStatusResponse {
+pub struct NodeInfo {
     pub id: u64,
     pub reference_code: String,
     pub name: String,
     pub status: String,
     pub node_type: String,
-    pub created_at: String,
-    pub activated_at: Option<String>,
-    pub last_seen: Option<String>,
-    pub uptime: String,
-    pub resources: NodeResources,
+    pub registration_confirmed_at: String,
+    pub wallet_address: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct NodeResources {
-    pub cpu_usage: i32,
-    pub memory_usage: i32,
-    pub storage_usage: i32,
-    pub bandwidth_usage: i32,
+pub struct SecurityInfo {
+    pub hardware_fingerprint_generated: bool,
+    pub fingerprint_preview: String,
+    pub security_level: String,
+    pub registration_ip: String,
 }
 
-// Heartbeat response
-#[derive(Debug, Deserialize)]
-pub struct HeartbeatResponse {
-    pub id: u64,
-    pub status: String,
-    pub last_seen: String,
-    pub next_heartbeat: String,
+// WebSocket message types
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum WebSocketMessage {
+    #[serde(rename = "auth")]
+    Auth {
+        reference_code: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        registration_code: Option<String>,
+    },
+    #[serde(rename = "heartbeat")]
+    Heartbeat {
+        status: String,
+        uptime_seconds: u64,
+        metrics: HeartbeatMetrics,
+    },
+    #[serde(rename = "status_update")]
+    StatusUpdate {
+        status: String,
+    },
+    #[serde(rename = "ping")]
+    Ping {
+        timestamp: u64,
+    },
 }
 
-// Node registration handler
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HeartbeatMetrics {
+    pub cpu: f64,
+    pub mem: f64,
+    pub disk: f64,
+    pub net: f64,
+}
+
+// Stored registration data
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StoredRegistration {
+    pub reference_code: String,
+    pub wallet_address: String,
+    pub hardware_fingerprint: String,
+    pub registered_at: String,
+    pub node_type: String,
+}
+
+// Node registration and WebSocket handler
 #[derive(Clone)]
 pub struct RegistrationManager {
     client: Client,
     api_url: String,
-    reference_code: Option<String>,
-    registration_code: Option<String>,
-    wallet_address: Option<String>,
-    node_signature: Option<String>,
+    pub reference_code: Option<String>,
+    pub registration_code: Option<String>,
+    pub wallet_address: Option<String>,
+    hardware_fingerprint: Option<String>,
+    websocket_connected: Arc<RwLock<bool>>,
+    start_time: std::time::Instant,
+    data_dir: PathBuf,
 }
 
 impl RegistrationManager {
     pub fn new(api_url: &str) -> Self {
-        // Build a robust client with retry capability
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .tcp_keepalive(Some(Duration::from_secs(60)))
             .user_agent("AeroNyx-Node/1.0")
-            .pool_max_idle_per_host(5)           // Add connection pooling
+            .pool_max_idle_per_host(5)
             .pool_idle_timeout(Some(Duration::from_secs(90)))
-            .https_only(true)                    // Enforce HTTPS for security
             .build()
             .unwrap_or_else(|_| {
                 warn!("Failed to build custom HTTP client, using default");
@@ -95,720 +133,477 @@ impl RegistrationManager {
             reference_code: None,
             registration_code: None,
             wallet_address: None,
-            node_signature: None,
+            hardware_fingerprint: None,
+            websocket_connected: Arc::new(RwLock::new(false)),
+            start_time: std::time::Instant::now(),
+            data_dir: PathBuf::from("data"),
         }
     }
 
-    // Load existing registration from config
+    // Set data directory for storing registration info
+    pub fn set_data_dir(&mut self, data_dir: PathBuf) {
+        self.data_dir = data_dir;
+    }
+
+    // Load existing registration from local storage
     pub fn load_from_config(&mut self, config: &ServerConfig) -> Result<bool, String> {
-        debug!("Loading registration configuration from server config");
+        debug!("Loading registration configuration");
         
-        // Load registration data from config
-        if let Some(reference_code) = &config.registration_reference_code {
-            self.reference_code = Some(reference_code.clone());
-            debug!("Loaded reference code: {}", reference_code);
+        self.data_dir = config.data_dir.clone();
+        
+        // Try to load stored registration data
+        let reg_file = self.data_dir.join("registration.json");
+        if reg_file.exists() {
+            match fs::read_to_string(&reg_file) {
+                Ok(content) => {
+                    match serde_json::from_str::<StoredRegistration>(&content) {
+                        Ok(stored_reg) => {
+                            info!("Loaded stored registration data");
+                            self.reference_code = Some(stored_reg.reference_code.clone());
+                            self.wallet_address = Some(stored_reg.wallet_address.clone());
+                            self.hardware_fingerprint = Some(stored_reg.hardware_fingerprint.clone());
+                            
+                            // Verify hardware fingerprint hasn't changed
+                            if let Err(e) = self.verify_hardware_fingerprint().await {
+                                error!("Hardware fingerprint verification failed: {}", e);
+                                return Err("Hardware has changed since registration".to_string());
+                            }
+                            
+                            return Ok(true);
+                        }
+                        Err(e) => {
+                            error!("Failed to parse registration data: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to read registration file: {}", e);
+                }
+            }
         }
         
-        if let Some(registration_code) = &config.registration_code {
-            self.registration_code = Some(registration_code.clone());
-            debug!("Loaded registration code");
+        // Fall back to config file data if available
+        if let Some(reference_code) = &config.registration_reference_code {
+            self.reference_code = Some(reference_code.clone());
+            debug!("Loaded reference code from config: {}", reference_code);
         }
         
         if let Some(wallet_address) = &config.wallet_address {
-            if !Self::is_valid_wallet_address(wallet_address) {
-                warn!("Wallet address format appears invalid, but continuing: {}", wallet_address);
-            }
             self.wallet_address = Some(wallet_address.clone());
-            debug!("Loaded wallet address: {}", wallet_address);
+            debug!("Loaded wallet address from config: {}", wallet_address);
         }
         
-        // Check if we have the minimum required data for operation
-        let has_minimum = self.reference_code.is_some() && self.wallet_address.is_some();
+        let has_minimum = self.reference_code.is_some();
         info!("Registration configuration loaded, has minimum required data: {}", has_minimum);
         
         Ok(has_minimum)
     }
 
-    // Basic validation for wallet address format
-    fn is_valid_wallet_address(address: &str) -> bool {
-        // Simple format check: Wallet addresses should be 32-44 characters
-        address.len() >= 32 && address.len() <= 44 && address.chars().all(|c| 
-            c.is_ascii_alphanumeric() && c != '0' && c != 'O' && c != 'I' && c != 'l'
-        )
-    }
-
-    // Check registration status with improved error handling
-    pub async fn check_status(&self, registration_code: &str) -> Result<NodeStatusResponse, String> {
-        debug!("Checking node status with API");
-        
-        // Setup headers for Django API
-        let mut headers = header::HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
-        headers.insert(header::ACCEPT, header::HeaderValue::from_static("application/json"));
-        
-        let url = format!("{}/api/aeronyx/check-node-status/", self.api_url);
-        info!("Sending status check to: {}", url);
-        
-        // Correct API endpoint URL matching Django configuration
-        let response = match self.client
-            .post(&url)
-            .headers(headers)
-            .json(&serde_json::json!({
-                "registration_code": registration_code
-            }))
-            .send()
-            .await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    error!("Failed to send status check request: {}", e);
-                    return Err(format!("API request failed: {}", e));
-                }
-            };
-
-        let status = response.status();
-        info!("Status check response code: {}", status);
-
-        match status {
-            StatusCode::OK => {
-                let text = match response.text().await {
-                    Ok(text) => text,
-                    Err(e) => {
-                        error!("Failed to read status response body: {}", e);
-                        return Err(format!("Failed to read response: {}", e));
-                    }
-                };
-                
-                debug!("Status check response body: {}", text);
-                
-                let api_response: ApiResponse<NodeStatusResponse> = match serde_json::from_str(&text) {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        error!("Failed to parse status response: {}", e);
-                        return Err(format!("Failed to parse response: {}", e));
-                    }
-                };
-                
-                if api_response.success {
-                    api_response.data.ok_or_else(|| {
-                        error!("API returned success but no data");
-                        "No data in response".to_string()
-                    })
-                } else {
-                    error!("API error: {}", api_response.message);
-                    Err(format!("API error: {}", api_response.message))
-                }
-            },
-            StatusCode::TOO_MANY_REQUESTS => {
-                warn!("Rate limited by API, implementing backoff");
-                // Get retry-after header if available
-                let retry_after = response.headers()
-                    .get(header::RETRY_AFTER)
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(30);
-                
-                Err(format!("Rate limited by API, retry after {} seconds", retry_after))
-            },
-            _ => {
-                // Try to get error details
-                let error_text = response.text().await.unwrap_or_default();
-                error!("API error status: {} - {}", status, error_text);
-                Err(format!("API returned error status: {} - {}", status, error_text))
-            }
-        }
-    }
-
-    // Confirm registration with the server with enhanced security
-    pub async fn confirm_registration(&self, registration_code: &str, node_info: serde_json::Value) -> Result<bool, String> {
-        info!("Confirming node registration with API");
-
-        // Generate a unique node signature with enhanced randomness
-        let node_signature = format!("node-sig-{}", utils::random_string(32));
-        
-        // Setup headers for Django API
-        let mut headers = header::HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
-        headers.insert(header::ACCEPT, header::HeaderValue::from_static("application/json"));
-        
-        // Prepare payload exactly matching what Django expects
-        let mut enhanced_node_info = node_info.clone();
-        
-        // Add additional security and version information
-        if let Some(obj) = enhanced_node_info.as_object_mut() {
-            // Add node version
-            obj.insert("node_version".to_string(), serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()));
+    // Verify hardware fingerprint hasn't changed
+    async fn verify_hardware_fingerprint(&self) -> Result<(), String> {
+        if let Some(stored_fingerprint) = &self.hardware_fingerprint {
+            let current_hardware = HardwareInfo::collect().await
+                .map_err(|e| format!("Failed to collect hardware info: {}", e))?;
+            let current_fingerprint = current_hardware.generate_fingerprint();
             
-            // Add secure timestamp
-            obj.insert("registration_timestamp".to_string(), 
-                      serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
+            if &current_fingerprint != stored_fingerprint {
+                error!("Hardware fingerprint mismatch!");
+                error!("Stored: {}", stored_fingerprint);
+                error!("Current: {}", current_fingerprint);
+                return Err("Hardware has changed since registration".to_string());
+            }
+            
+            debug!("Hardware fingerprint verified successfully");
         }
+        
+        Ok(())
+    }
+
+    // Save registration data locally
+    fn save_registration_data(&self, node_info: &NodeInfo, hardware_fingerprint: String) -> Result<(), String> {
+        let stored_reg = StoredRegistration {
+            reference_code: node_info.reference_code.clone(),
+            wallet_address: node_info.wallet_address.clone(),
+            hardware_fingerprint,
+            registered_at: node_info.registration_confirmed_at.clone(),
+            node_type: node_info.node_type.clone(),
+        };
+        
+        // Ensure data directory exists
+        fs::create_dir_all(&self.data_dir)
+            .map_err(|e| format!("Failed to create data directory: {}", e))?;
+        
+        let reg_file = self.data_dir.join("registration.json");
+        let json = serde_json::to_string_pretty(&stored_reg)
+            .map_err(|e| format!("Failed to serialize registration data: {}", e))?;
+        
+        fs::write(&reg_file, json)
+            .map_err(|e| format!("Failed to save registration data: {}", e))?;
+        
+        info!("Registration data saved to {:?}", reg_file);
+        Ok(())
+    }
+
+    // Confirm registration with hardware fingerprint
+    pub async fn confirm_registration_with_hardware(
+        &mut self,
+        registration_code: &str,
+        hardware_info: &HardwareInfo,
+    ) -> Result<RegistrationConfirmResponse, String> {
+        info!("Confirming node registration with hardware fingerprint");
+
+        let hardware_fingerprint = hardware_info.generate_fingerprint();
+        info!("Generated hardware fingerprint: {}...", &hardware_fingerprint[..16]);
+
+        let node_info = serde_json::to_value(hardware_info)
+            .map_err(|e| format!("Failed to serialize hardware info: {}", e))?;
+        
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+        headers.insert(header::ACCEPT, header::HeaderValue::from_static("application/json"));
         
         let payload = serde_json::json!({
             "registration_code": registration_code,
-            "node_signature": node_signature,
-            "node_info": enhanced_node_info
+            "node_info": node_info,
+            "node_signature": format!("node-sig-{}", utils::random_string(32)),
         });
-        
-        debug!("Registration payload prepared with enhanced security information");
         
         let url = format!("{}/api/aeronyx/confirm-registration/", self.api_url);
-        info!("Sending registration to: {}", url);
+        debug!("Sending registration confirmation to: {}", url);
 
-        // Send POST request to Django endpoint with exponential backoff retry
-        let mut retry_count = 0;
-        let max_retries = 3;
-        
-        loop {
-            let response_result = self.client
-                .post(&url)
-                .headers(headers.clone())
-                .json(&payload)
-                .send()
-                .await;
-                
-            match response_result {
-                Ok(response) => {
-                    let status = response.status();
-                    info!("Registration response code: {}", status);
-                    
-                    // Get full response text for detailed debugging
-                    let text = match response.text().await {
-                        Ok(t) => t,
-                        Err(e) => {
-                            error!("Failed to read registration response body: {}", e);
-                            return Err(format!("Failed to read response body: {}", e));
-                        }
-                    };
-                    
-                    debug!("Registration response body: {}", text);
-                    
-                    if status.is_success() {
-                        // Try to parse as API response
-                        match serde_json::from_str::<ApiResponse<serde_json::Value>>(&text) {
-                            Ok(api_response) => {
-                                debug!("Registration API response parsed successfully");
-                                if api_response.success {
-                                    return Ok(true);
-                                } else {
-                                    warn!("API returned success=false: {}", api_response.message);
-                                    return Err(format!("API error: {}", api_response.message));
-                                }
-                            },
-                            Err(e) => {
-                                warn!("Failed to parse API response: {}", e);
-                                
-                                // If we got a success status but couldn't parse the response,
-                                // assume it's a success (might be a different format)
-                                if status.is_success() {
-                                    info!("Got success status but couldn't parse response, assuming success");
-                                    return Ok(true);
-                                } else {
-                                    return Err(format!("Failed to parse API response: {}", e));
-                                }
-                            }
-                        }
-                    } else if status == StatusCode::TOO_MANY_REQUESTS {
-                        // Handle rate limiting with backoff
-                        let retry_seconds = 5u64;
-                        warn!("Rate limited, waiting {} seconds before retry", retry_seconds);
-                        tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
-                        continue;
-                    } else {
-                        // Request failed with other error
-                        return Err(format!("API returned error status: {} - {}", status, text));
-                    }
-                },
-                Err(e) => {
-                    retry_count += 1;
-                    if retry_count >= max_retries {
-                        error!("Failed to send registration after {} retries: {}", max_retries, e);
-                        return Err(format!("API request failed after {} retries: {}", max_retries, e));
-                    }
-                    
-                    // Exponential backoff
-                    let backoff_secs = 2u64.pow(retry_count as u32);
-                    warn!("Registration request failed, retrying in {} seconds. Error: {}", backoff_secs, e);
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                }
-            }
-        }
-    }
+        let response = self.client
+            .post(&url)
+            .headers(headers)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send registration request: {}", e))?;
 
-    // Enhanced heartbeat with improved error handling
-    pub async fn send_heartbeat(&self, status_info: serde_json::Value) -> Result<HeartbeatResponse, String> {
-        if self.reference_code.is_none() {
-            return Err("Missing reference code for heartbeat".to_string());
-        }
+        let status = response.status();
+        let text = response.text().await
+            .map_err(|e| format!("Failed to read response: {}", e))?;
 
-        // Generate a cryptographically secure node signature for each heartbeat
-        let node_signature = format!("node-sig-{}", utils::random_string(32));
+        debug!("Registration response: {} - {}", status, text);
 
-        let reference_code = self.reference_code.as_ref().unwrap();
-        debug!("Sending heartbeat for node {}", reference_code);
-
-        // Setup headers for Django API
-        let mut headers = header::HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
-        headers.insert(header::ACCEPT, header::HeaderValue::from_static("application/json"));
-        
-        // Add node version header safely
-        if let Ok(version_value) = header::HeaderValue::from_str(env!("CARGO_PKG_VERSION")) {
-            headers.insert("X-Node-Version", version_value);
-        }
-        
-        let url = format!("{}/api/aeronyx/node-heartbeat/", self.api_url);
-        debug!("Sending heartbeat to: {}", url);
-        
-        // Enhance status info with security information
-        let mut enhanced_status = status_info.clone();
-        
-        // Add timestamp for security validation
-        if let Some(obj) = enhanced_status.as_object_mut() {
-            obj.insert("timestamp".to_string(), 
-                      serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
-                      
-            // Add wallet address if available
-            if let Some(wallet) = &self.wallet_address {
-                obj.insert("wallet_address".to_string(), 
-                          serde_json::Value::String(wallet.clone()));
-            }
-        }
-        
-        // Prepare payload with enhanced security
-        let payload = serde_json::json!({
-            "reference_code": reference_code,
-            "node_signature": node_signature,
-            "status_info": enhanced_status
-        });
-
-        // Implement retry logic with exponential backoff
-        let mut retry_count = 0;
-        let max_retries = 3;
-        
-        loop {
-            // Send heartbeat to Django endpoint
-            let response_result = self.client
-                .post(&url)
-                .headers(headers.clone())
-                .json(&payload)
-                .send()
-                .await;
-                
-            match response_result {
-                Ok(response) => {
-                    let status = response.status();
-                    debug!("Heartbeat response code: {}", status);
-                    
-                    if status.is_success() {
-                        // Read response text
-                        let text = match response.text().await {
-                            Ok(t) => t,
-                            Err(e) => {
-                                warn!("Failed to read heartbeat response: {}", e);
-                                return Err(format!("Failed to read heartbeat response: {}", e));
-                            }
-                        };
-                        
-                        debug!("Heartbeat response body: {}", text);
-                        
-                        // Parse as API response
-                        let api_response: ApiResponse<HeartbeatResponse> = match serde_json::from_str(&text) {
-                            Ok(resp) => resp,
-                            Err(e) => {
-                                warn!("Failed to parse heartbeat response: {}", e);
-                                return Err(format!("Failed to parse heartbeat response: {}", e));
-                            }
-                        };
-                        
-                        if api_response.success {
-                            if let Some(data) = api_response.data {
-                                return Ok(data);
-                            } else {
-                                return Err("No data in heartbeat response".to_string());
-                            }
-                        } else {
-                            return Err(format!("Heartbeat API error: {}", api_response.message));
-                        }
-                    } else if status == StatusCode::TOO_MANY_REQUESTS {
-                        // Handle rate limiting
-                        let retry_seconds = 5u64; 
-                        warn!("Rate limited, waiting {} seconds before retry", retry_seconds);
-                        tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
-                        continue;
-                    } else {
-                        // Request failed
-                        let error_text = response.text().await.unwrap_or_default();
-                        return Err(format!("Heartbeat API returned error status: {} - {}", status, error_text));
-                    }
-                },
-                Err(e) => {
-                    retry_count += 1;
-                    if retry_count >= max_retries {
-                        error!("Failed to send heartbeat after {} retries: {}", max_retries, e);
-                        return Err(format!("Heartbeat API request failed after {} retries: {}", max_retries, e));
-                    }
-                    
-                    // Exponential backoff
-                    let backoff_secs = 2u64.pow(retry_count as u32);
-                    
-                    warn!("Heartbeat request failed, retrying in {} seconds. Error: {}", backoff_secs, e);
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                }
-            }
-        }
-    }
-
-    // Improved heartbeat loop
-    pub async fn start_heartbeat_loop(
-        &self,
-        server_state: Arc<RwLock<ServerState>>,
-        metrics: Arc<ServerMetricsCollector>,
-    ) {
-        info!("Starting node heartbeat loop for AeroNyx DePIN participation");
-        
-        // Start with a default 60 second interval
-        let mut interval = time::interval(Duration::from_secs(60));
-        let mut consecutive_failures = 0;
-        
-        // Create channels for graceful shutdown
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-        
-        // Spawn a task to monitor server state
-        let state_monitor = {
-            let server_state = server_state.clone();
-            let shutdown_tx = shutdown_tx.clone();
+        if status.is_success() {
+            let api_response: ApiResponse<RegistrationConfirmResponse> = serde_json::from_str(&text)
+                .map_err(|e| format!("Failed to parse response: {}", e))?;
             
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    let state = *server_state.read().await;
-                    if state != ServerState::Running {
-                        info!("Server state changed to {:?}, signaling heartbeat shutdown", state);
-                        let _ = shutdown_tx.send(()).await;
-                        break;
-                    }
+            if api_response.success {
+                if let Some(ref data) = api_response.data {
+                    // Save registration data locally
+                    self.save_registration_data(&data.node, hardware_fingerprint.clone())?;
+                    
+                    // Update internal state
+                    self.reference_code = Some(data.node.reference_code.clone());
+                    self.wallet_address = Some(data.node.wallet_address.clone());
+                    self.hardware_fingerprint = Some(hardware_fingerprint);
                 }
-            })
-        };
+                
+                api_response.data.ok_or_else(|| "No data in response".to_string())
+            } else {
+                Err(format!("Registration failed: {}", api_response.message))
+            }
+        } else {
+            Err(format!("Registration failed with status {}: {}", status, text))
+        }
+    }
+
+    // Start WebSocket connection for all node communication
+    pub async fn start_websocket_connection(
+        &mut self,
+        reference_code: String,
+        registration_code: Option<String>,
+    ) -> Result<(), String> {
+        self.reference_code = Some(reference_code.clone());
+        if let Some(code) = registration_code {
+            self.registration_code = Some(code);
+        }
+
+        // Build WebSocket URL
+        let ws_url = self.api_url
+            .replace("https://", "wss://")
+            .replace("http://", "ws://");
+        let ws_url = format!("{}/ws/aeronyx/node/", ws_url.trim_end_matches('/'));
         
-        // Heartbeat manager is a clone for thread safety
-        let manager = self.clone();
+        info!("Connecting to WebSocket: {}", ws_url);
+
+        // Connect with retry logic
+        let mut retry_count = 0;
+        let max_retries = 5;
+        
+        loop {
+            match self.connect_and_run_websocket(&ws_url).await {
+                Ok(_) => {
+                    info!("WebSocket connection closed normally");
+                    break;
+                }
+                Err(e) => {
+                    error!("WebSocket error: {}", e);
+                    retry_count += 1;
+                    
+                    if retry_count >= max_retries {
+                        return Err(format!("Failed to establish WebSocket connection after {} attempts", max_retries));
+                    }
+                    
+                    let backoff = Duration::from_secs(2u64.pow(retry_count));
+                    warn!("Retrying WebSocket connection in {:?} (attempt {}/{})", backoff, retry_count, max_retries);
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    async fn connect_and_run_websocket(&self, ws_url: &str) -> Result<(), String> {
+        let (ws_stream, _) = connect_async(ws_url)
+            .await
+            .map_err(|e| format!("WebSocket connection failed: {}", e))?;
+        
+        info!("WebSocket connected successfully");
+        *self.websocket_connected.write().await = true;
+        
+        let (mut write, mut read) = ws_stream.split();
+        
+        // Set up heartbeat interval
+        let mut heartbeat_interval = time::interval(Duration::from_secs(60));
+        let mut authenticated = false;
+        let metrics_collector = Arc::new(ServerMetricsCollector::new(
+            Duration::from_secs(60),
+            60,
+        ));
         
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    // Collect system metrics and server data
-                    let status_info = manager.collect_system_metrics(&metrics).await;
-                    
-                    // Send heartbeat
-                    match manager.send_heartbeat(status_info).await {
-                        Ok(response) => {
-                            consecutive_failures = 0;
-                            debug!("Heartbeat successful. Node status: {}. Next heartbeat in {}", 
-                                   response.status, response.next_heartbeat);
+                Some(message) = read.next() => {
+                    match message {
+                        Ok(Message::Text(text)) => {
+                            debug!("Received WebSocket message: {}", text);
                             
-                            // Adjust heartbeat interval based on server response
-                            if let Some(seconds) = manager.parse_next_heartbeat(&response.next_heartbeat) {
-                                if seconds != interval.period().as_secs() {
-                                    info!("Adjusting heartbeat interval to {} seconds", seconds);
-                                    interval = time::interval(Duration::from_secs(seconds));
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                                match json.get("type").and_then(|t| t.as_str()) {
+                                    Some("connection_established") => {
+                                        info!("WebSocket connection established, sending auth");
+                                        
+                                        // Send authentication
+                                        let auth_msg = if self.registration_code.is_some() {
+                                            WebSocketMessage::Auth {
+                                                reference_code: self.reference_code.clone().unwrap(),
+                                                registration_code: self.registration_code.clone(),
+                                            }
+                                        } else {
+                                            WebSocketMessage::Auth {
+                                                reference_code: self.reference_code.clone().unwrap(),
+                                                registration_code: None,
+                                            }
+                                        };
+                                        
+                                        let auth_json = serde_json::to_string(&auth_msg)
+                                            .map_err(|e| format!("Failed to serialize auth: {}", e))?;
+                                        
+                                        write.send(Message::Text(auth_json)).await
+                                            .map_err(|e| format!("Failed to send auth: {}", e))?;
+                                    }
+                                    
+                                    Some("auth_success") => {
+                                        info!("WebSocket authentication successful");
+                                        authenticated = true;
+                                        
+                                        // Get heartbeat interval from server
+                                        if let Some(interval_secs) = json.get("heartbeat_interval").and_then(|v| v.as_u64()) {
+                                            heartbeat_interval = time::interval(Duration::from_secs(interval_secs));
+                                        }
+                                    }
+                                    
+                                    Some("heartbeat_ack") => {
+                                        debug!("Heartbeat acknowledged");
+                                        
+                                        // Update next heartbeat interval if provided
+                                        if let Some(next_interval) = json.get("next_interval").and_then(|v| v.as_u64()) {
+                                            heartbeat_interval = time::interval(Duration::from_secs(next_interval));
+                                        }
+                                    }
+                                    
+                                    Some("error") => {
+                                        let error_code = json.get("error_code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                                        let message = json.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+                                        error!("WebSocket error [{}]: {}", error_code, message);
+                                        
+                                        // Handle specific errors
+                                        match error_code {
+                                            "hardware_fingerprint_conflict" => {
+                                                return Err("Hardware already registered with another node".to_string());
+                                            }
+                                            "auth_failed" => {
+                                                return Err("Authentication failed - invalid reference code".to_string());
+                                            }
+                                            "node_suspended" => {
+                                                return Err("Node has been suspended".to_string());
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    
+                                    Some("command") => {
+                                        // Handle server commands
+                                        if let Some(command) = json.get("command").and_then(|c| c.as_str()) {
+                                            info!("Received server command: {}", command);
+                                            // TODO: Implement command handling
+                                        }
+                                    }
+                                    
+                                    Some("pong") => {
+                                        debug!("Pong received");
+                                    }
+                                    
+                                    _ => {
+                                        debug!("Unknown message type: {:?}", json);
+                                    }
                                 }
                             }
-                        },
-                        Err(e) => {
-                            consecutive_failures += 1;
-                            error!("Heartbeat failed: {} (consecutive failures: {})", e, consecutive_failures);
-                            
-                            // Exponential backoff for failures, but not more than 5 minutes
-                            if consecutive_failures > 1 {
-                                let backoff_secs = (60 * consecutive_failures).min(300);
-                                warn!("Increasing heartbeat interval to {} seconds due to failures", backoff_secs);
-                                interval = time::interval(Duration::from_secs(backoff_secs));
-                            }
                         }
+                        Ok(Message::Close(_)) => {
+                            info!("WebSocket closed by server");
+                            break;
+                        }
+                        Ok(Message::Ping(data)) => {
+                            debug!("Received ping, sending pong");
+                            write.send(Message::Pong(data)).await
+                                .map_err(|e| format!("Failed to send pong: {}", e))?;
+                        }
+                        Err(e) => {
+                            error!("WebSocket error: {}", e);
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                _ = shutdown_rx.recv() => {
-                    info!("Received shutdown signal, sending final heartbeat and terminating loop");
-                    
-                    // Send final heartbeat with shutting_down status
-                    let mut final_status = manager.collect_system_metrics(&metrics).await;
-                    
-                    if let Some(obj) = final_status.as_object_mut() {
-                        obj.insert("status".to_string(), serde_json::Value::String("shutting_down".to_string()));
+                
+                _ = heartbeat_interval.tick() => {
+                    if authenticated {
+                        let heartbeat = self.create_heartbeat_message(&metrics_collector).await;
+                        let heartbeat_json = serde_json::to_string(&heartbeat)
+                            .map_err(|e| format!("Failed to serialize heartbeat: {}", e))?;
+                        
+                        if let Err(e) = write.send(Message::Text(heartbeat_json)).await {
+                            error!("Failed to send heartbeat: {}", e);
+                            break;
+                        }
+                        debug!("Heartbeat sent via WebSocket");
                     }
-                    
-                    match manager.send_heartbeat(final_status).await {
-                        Ok(_) => info!("Final heartbeat sent successfully"),
-                        Err(e) => warn!("Failed to send final heartbeat: {}", e),
-                    }
-                    
-                    break;
                 }
             }
         }
         
-        // Wait for monitor task to complete
-        let _ = state_monitor.await;
+        *self.websocket_connected.write().await = false;
         
-        info!("Heartbeat loop terminated");
-    }
-
-    // Helper to parse next heartbeat interval from API response
-    fn parse_next_heartbeat(&self, next_heartbeat: &str) -> Option<u64> {
-        // Handle different formats returned by API
-        if next_heartbeat.contains("30 seconds") {
-            Some(30)
-        } else if next_heartbeat.contains("60 seconds") || next_heartbeat.contains("1 minute") {
-            Some(60)
-        } else if next_heartbeat.contains("120 seconds") || next_heartbeat.contains("2 minutes") {
-            Some(120)
-        } else if next_heartbeat.contains("300 seconds") || next_heartbeat.contains("5 minutes") {
-            Some(300)
-        } else if next_heartbeat.contains("600 seconds") || next_heartbeat.contains("10 minutes") {
-            Some(600)
-        } else if next_heartbeat.contains("1800 seconds") || next_heartbeat.contains("30 minutes") {
-            Some(1800)
+        if !authenticated {
+            Err("Failed to authenticate with WebSocket server".to_string())
         } else {
-            // Try to extract numeric value from string using basic parsing
-            for part in next_heartbeat.split_whitespace() {
-                if let Ok(seconds) = part.parse::<u64>() {
-                    if seconds > 0 && next_heartbeat.contains("second") {
-                        return Some(seconds);
-                    }
-                }
-            }
-            
-            // Default to 60 seconds if we can't parse
-            debug!("Could not parse next heartbeat time '{}', using default 60 seconds", next_heartbeat);
-            Some(60)
+            Ok(())
         }
     }
 
-    // Enhanced system metrics collection
-    async fn collect_system_metrics(&self, metrics_collector: &ServerMetricsCollector) -> serde_json::Value {
-        // Collect metrics in parallel for efficiency
-        let (memory_result, cpu_result, storage_result, uptime_result) = tokio::join!(
-            tokio::task::spawn_blocking(|| utils::system::get_system_memory()),
-            tokio::task::spawn_blocking(|| utils::system::get_load_average()),
-            tokio::task::spawn_blocking(|| utils::system::get_disk_usage()),
-            tokio::task::spawn_blocking(|| utils::system::get_system_uptime())
-        );
+    async fn create_heartbeat_message(&self, metrics_collector: &ServerMetricsCollector) -> WebSocketMessage {
+        let uptime_seconds = self.start_time.elapsed().as_secs();
         
-        // Get memory usage
-        let memory = match memory_result {
-            Ok(Ok((total, available))) => {
-                let used_percentage = ((total - available) as f64 / total as f64) * 100.0;
-                used_percentage as i32
+        // Collect system metrics
+        let cpu_usage = self.get_cpu_usage().await;
+        let mem_usage = self.get_memory_usage().await;
+        let disk_usage = self.get_disk_usage().await;
+        let net_usage = self.get_network_usage().await;
+        
+        WebSocketMessage::Heartbeat {
+            status: "active".to_string(),
+            uptime_seconds,
+            metrics: HeartbeatMetrics {
+                cpu: cpu_usage,
+                mem: mem_usage,
+                disk: disk_usage,
+                net: net_usage,
             },
-            _ => {
-                warn!("Failed to get system memory info");
-                0
-            }
-        };
-        
-        // Get CPU load
-        let cpu = match cpu_result {
-            Ok(Ok((one_min, five_min, fifteen_min))) => {
-                // Return the one minute load average multiplied by 10 for precision
-                let load = (one_min * 10.0) as i32;
-                
-                // Also store the full load information for detailed metrics
-                let load_details = serde_json::json!({
-                    "one_min": one_min,
-                    "five_min": five_min,
-                    "fifteen_min": fifteen_min
-                });
-                
-                (load, load_details)
-            },
-            _ => {
-                warn!("Failed to get CPU load info");
-                (0, serde_json::json!(null))
-            }
-        };
-        
-        // Get disk usage
-        let storage = match storage_result {
-            Ok(Ok(percentage)) => percentage as i32,
-            _ => {
-                warn!("Failed to get storage usage info");
-                0
-            }
-        };
-        
-        // Get server metrics
-        let active_connections = metrics_collector.get_active_connections().await;
-        let bytes_sent = metrics_collector.get_total_bytes_sent().await;
-        let bytes_received = metrics_collector.get_total_bytes_received().await;
-        
-        // Get uptime
-        let uptime_str = match uptime_result {
-            Ok(Ok(uptime_secs)) => {
-                let days = uptime_secs / 86400;
-                let hours = (uptime_secs % 86400) / 3600;
-                format!("{} days, {} hours", days, hours)
-            },
-            _ => {
-                warn!("Failed to get system uptime");
-                "Unknown".to_string()
-            }
-        };
-        
-        // Build the complete system metrics report
-        serde_json::json!({
-            "status": "active",
-            "uptime": uptime_str,
-            "cpu_usage": cpu.0,
-            "cpu_details": cpu.1,
-            "memory_usage": memory,
-            "storage_usage": storage,
-            "bandwidth_usage": {
-                "sent_bytes": bytes_sent,
-                "received_bytes": bytes_received,
-                "active_connections": active_connections
-            },
-            "node_version": env!("CARGO_PKG_VERSION"),
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-        })
+        }
     }
 
-    // Test API connection with explicit debugging
+    async fn get_cpu_usage(&self) -> f64 {
+        if let Ok((one_min, _, _)) = tokio::task::spawn_blocking(|| utils::system::get_load_average()).await.unwrap_or(Err("Failed".to_string())) {
+            let cpu_count = sys_info::cpu_num().unwrap_or(1) as f64;
+            (one_min / cpu_count * 100.0).min(100.0)
+        } else {
+            0.0
+        }
+    }
+
+    async fn get_memory_usage(&self) -> f64 {
+        if let Ok(Ok((total, available))) = tokio::task::spawn_blocking(|| utils::system::get_system_memory()).await {
+            ((total - available) as f64 / total as f64 * 100.0)
+        } else {
+            0.0
+        }
+    }
+
+    async fn get_disk_usage(&self) -> f64 {
+        if let Ok(Ok(usage)) = tokio::task::spawn_blocking(|| utils::system::get_disk_usage()).await {
+            usage
+        } else {
+            0.0
+        }
+    }
+
+    async fn get_network_usage(&self) -> f64 {
+        // TODO: Implement actual network usage calculation
+        10.0
+    }
+
+    // Test API connection
     pub async fn test_api_connection(&self) -> Result<bool, String> {
         info!("Testing API connection to {}", self.api_url);
         
-        // Try a known endpoint that should work with GET
         let url = format!("{}/api/aeronyx/node-types/", self.api_url);
-        info!("Testing connection to: {}", url);
         
-        let response = match self.client
+        let response = self.client
             .get(&url)
-            .timeout(Duration::from_secs(10))  // Shorter timeout for test
+            .timeout(Duration::from_secs(10))
             .send()
-            .await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    error!("Connection test failed: {}", e);
-                    return Err(format!("Connection test failed: {}", e));
-                }
-            };
+            .await
+            .map_err(|e| format!("Connection test failed: {}", e))?;
         
         let status = response.status();
         info!("Connection test response: {}", status);
         
-        // If we can connect, test the registration endpoint explicitly with OPTIONS
-        if status.is_success() {
-            let reg_url = format!("{}/api/aeronyx/confirm-registration/", self.api_url);
-            info!("Testing registration endpoint with OPTIONS: {}", reg_url);
-            
-            match self.client.request(reqwest::Method::OPTIONS, &reg_url)
-                .timeout(Duration::from_secs(10))
-                .send().await {
-                Ok(options_response) => {
-                    let options_status = options_response.status();
-                    info!("Registration endpoint OPTIONS response: {}", options_status);
-                    
-                    if options_status.is_success() || options_status.as_u16() == 405 {
-                        // Check for allowed methods
-                        if let Some(allow) = options_response.headers().get("allow") {
-                            info!("Allowed methods: {}", allow.to_str().unwrap_or("unknown"));
-                            
-                            // Confirm that POST is allowed
-                            let allow_str = allow.to_str().unwrap_or("").to_uppercase();
-                            if allow_str.contains("POST") {
-                                info!("Registration endpoint accepts POST requests");
-                            } else {
-                                warn!("Registration endpoint does NOT accept POST requests");
-                            }
-                        }
-                    }
-                },
-                Err(e) => warn!("OPTIONS request failed: {}", e)
-            }
-            
-            Ok(true)
-        } else {
-            Err(format!("API connection test failed with status: {}", status))
-        }
+        Ok(status.is_success())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mockito::Server;
-    use tokio;
-
-    #[tokio::test]
-    async fn test_confirm_registration() {
-        let mut server = Server::new();
-        
-        // Setup mock server
-        let mock = server.mock("POST", "/api/aeronyx/confirm-registration/")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"success":true,"message":"Registration confirmed","data":{},"errors":null}"#)
-            .create();
-        
-        let manager = RegistrationManager::new(&server.url());
-        let result = manager.confirm_registration(
-            "test-code", 
-            serde_json::json!({"hostname": "test", "os_type": "linux"})
-        ).await;
-        
-        mock.assert();
-        assert!(result.is_ok());
-        assert!(result.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_check_status() {
-        let mut server = Server::new();
-        
-        // Setup mock server
-        let mock = server.mock("POST", "/api/aeronyx/check-node-status/")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"success":true,"message":"Status retrieved","data":{"id":1,"reference_code":"test-ref","name":"test-node","status":"active","node_type":"basic","created_at":"2023-01-01","activated_at":"2023-01-01","last_seen":"2023-01-01","uptime":"1 day","resources":{"cpu_usage":10,"memory_usage":20,"storage_usage":30,"bandwidth_usage":40}},"errors":null}"#)
-            .create();
-        
-        let manager = RegistrationManager::new(&server.url());
-        let result = manager.check_status("test-code").await;
-        
-        mock.assert();
-        assert!(result.is_ok());
-        let status = result.unwrap();
-        assert_eq!(status.reference_code, "test-ref");
-        assert_eq!(status.status, "active");
-    }
     
-    #[tokio::test]
-    async fn test_is_valid_wallet_address() {
-        // Valid-like addresses
-        assert!(RegistrationManager::is_valid_wallet_address("9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"));
-        assert!(RegistrationManager::is_valid_wallet_address("6FQMVPgYmvTtCpq5YMFujHCzHKA7jZAJDVDvBokTfWZx"));
+    #[test]
+    fn test_websocket_message_serialization() {
+        let auth = WebSocketMessage::Auth {
+            reference_code: "AERO-12345".to_string(),
+            registration_code: Some("AERO-REG123".to_string()),
+        };
         
-        // Invalid addresses
-        assert!(!RegistrationManager::is_valid_wallet_address("0x1234567890abcdef1234567890abcdef12345678")); // Ethereum format
-        assert!(!RegistrationManager::is_valid_wallet_address("invalid"));
-        assert!(!RegistrationManager::is_valid_wallet_address("")); 
-    }
-    
-    #[tokio::test]
-    async fn test_parse_next_heartbeat() {
-        let manager = RegistrationManager::new("http://localhost");
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains("\"type\":\"auth\""));
+        assert!(json.contains("AERO-12345"));
         
-        assert_eq!(manager.parse_next_heartbeat("30 seconds"), Some(30));
-        assert_eq!(manager.parse_next_heartbeat("60 seconds"), Some(60));
-        assert_eq!(manager.parse_next_heartbeat("1 minute"), Some(60));
-        assert_eq!(manager.parse_next_heartbeat("120 seconds"), Some(120));
-        assert_eq!(manager.parse_next_heartbeat("2 minutes"), Some(120));
-        assert_eq!(manager.parse_next_heartbeat("300 seconds"), Some(300));
-        assert_eq!(manager.parse_next_heartbeat("5 minutes"), Some(300));
-        assert_eq!(manager.parse_next_heartbeat("600 seconds"), Some(600));
-        assert_eq!(manager.parse_next_heartbeat("10 minutes"), Some(600));
-        assert_eq!(manager.parse_next_heartbeat("1800 seconds"), Some(1800));
-        assert_eq!(manager.parse_next_heartbeat("30 minutes"), Some(1800));
-        assert_eq!(manager.parse_next_heartbeat("invalid"), Some(60)); // Default
+        let heartbeat = WebSocketMessage::Heartbeat {
+            status: "active".to_string(),
+            uptime_seconds: 3600,
+            metrics: HeartbeatMetrics {
+                cpu: 25.5,
+                mem: 45.2,
+                disk: 60.1,
+                net: 10.3,
+            },
+        };
+        
+        let json = serde_json::to_string(&heartbeat).unwrap();
+        assert!(json.contains("\"type\":\"heartbeat\""));
+        assert!(json.contains("\"cpu\":25.5"));
     }
 }
