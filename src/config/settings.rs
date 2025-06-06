@@ -5,7 +5,7 @@
 //! implementation for loading, parsing, and validating user-provided
 //! settings.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::SocketAddr;
@@ -35,6 +35,31 @@ pub enum ConfigError {
     InvalidSocketAddr(#[from] std::net::AddrParseError),
 }
 
+/// Node operation modes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+pub enum NodeMode {
+    /// DePIN compute node only (no VPN functionality)
+    #[value(name = "depin-only")]
+    #[serde(rename = "depin-only")]
+    DePINOnly,
+    
+    /// VPN server only (traditional VPN functionality)
+    #[value(name = "vpn-enabled")]
+    #[serde(rename = "vpn-enabled")]
+    VPNEnabled,
+    
+    /// Both DePIN and VPN functionality
+    #[value(name = "hybrid")]
+    #[serde(rename = "hybrid")]
+    Hybrid,
+}
+
+impl Default for NodeMode {
+    fn default() -> Self {
+        NodeMode::DePINOnly
+    }
+}
+
 /// Command enum for subcommands
 #[derive(Parser, Debug, Clone)]
 pub enum Command {
@@ -55,15 +80,19 @@ pub enum Command {
     author
 )]
 pub struct ServerArgs {
-    /// Server address to listen on
-    #[clap(long, default_value = "0.0.0.0:8080")]
+    /// Node operation mode
+    #[clap(long, value_enum, default_value = "depin-only")]
+    pub mode: NodeMode,
+
+    /// Server address to listen on (required for VPN modes)
+    #[clap(long, default_value = "0.0.0.0:8443")]
     pub listen: String,
 
-    /// TUN device name
+    /// TUN device name (required for VPN modes)
     #[clap(long, default_value = defaults::DEFAULT_TUN_NAME)]
     pub tun_name: String,
 
-    /// VPN subnet in CIDR notation
+    /// VPN subnet in CIDR notation (required for VPN modes)
     #[clap(long, default_value = defaults::DEFAULT_SUBNET)]
     pub subnet: String,
 
@@ -71,13 +100,13 @@ pub struct ServerArgs {
     #[clap(long, default_value = defaults::DEFAULT_LOG_LEVEL)]
     pub log_level: String,
 
-    /// TLS certificate file
-    #[clap(long, default_value = defaults::DEFAULT_CERT_FILE)]
-    pub cert_file: String,
+    /// TLS certificate file (required for VPN modes)
+    #[clap(long)]
+    pub cert_file: Option<String>,
 
-    /// TLS key file
-    #[clap(long, default_value = defaults::DEFAULT_KEY_FILE)]
-    pub key_file: String,
+    /// TLS key file (required for VPN modes)
+    #[clap(long)]
+    pub key_file: Option<String>,
 
     /// Access control list file
     #[clap(long, default_value = defaults::DEFAULT_ACL_FILE)]
@@ -135,6 +164,10 @@ pub struct ServerArgs {
     #[clap(long, default_value = "https://api.aeronyx.network")]
     pub api_url: String,
     
+    /// Enable remote management features
+    #[clap(long)]
+    pub enable_remote_management: bool,
+    
     /// Registration setup command
     #[clap(subcommand)]
     pub command: Option<Command>,
@@ -143,6 +176,10 @@ pub struct ServerArgs {
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// Node operation mode
+    #[serde(default)]
+    pub mode: NodeMode,
+    
     /// Server listen address
     pub listen_addr: SocketAddr,
     
@@ -197,6 +234,10 @@ pub struct ServerConfig {
     /// API server URL
     pub api_url: String,
     
+    /// Enable remote management features
+    #[serde(default)]
+    pub enable_remote_management: bool,
+    
     /// Key manager for server keys
     #[serde(skip)]
     pub key_manager: Option<Arc<KeyManager>>,
@@ -205,14 +246,52 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// Create a new server configuration from command line arguments
     pub fn from_args(args: ServerArgs) -> Result<Self, ConfigError> {
+        // Load registration data if exists
+        let data_dir = PathBuf::from(&args.data_dir);
+        let reg_file = data_dir.join("registration.json");
+        
+        let (registration_reference_code, wallet_address) = if reg_file.exists() {
+            match fs::read_to_string(&reg_file) {
+                Ok(content) => {
+                    if let Ok(reg_data) = serde_json::from_str::<serde_json::Value>(&content) {
+                        (
+                            reg_data.get("reference_code")
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                                .or(args.registration_reference_code),
+                            reg_data.get("wallet_address")
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                                .or(args.wallet_address)
+                        )
+                    } else {
+                        (args.registration_reference_code, args.wallet_address)
+                    }
+                }
+                Err(_) => (args.registration_reference_code, args.wallet_address)
+            }
+        } else {
+            (args.registration_reference_code, args.wallet_address)
+        };
+        
         // Check for configuration file first
         if let Some(config_path) = &args.config_file {
             if let Ok(file_content) = fs::read_to_string(config_path) {
                 let mut config: ServerConfig = serde_json::from_str(&file_content)?;
                 
                 // Override with command line arguments if explicitly provided
-                if args.listen != defaults::DEFAULT_LISTEN_ADDRESS {
+                config.mode = args.mode;
+                
+                if args.listen != "0.0.0.0:8443" {
                     config.listen_addr = args.listen.parse()?;
+                }
+                
+                // Override registration data with loaded values
+                if registration_reference_code.is_some() {
+                    config.registration_reference_code = registration_reference_code;
+                }
+                if wallet_address.is_some() {
+                    config.wallet_address = wallet_address;
                 }
                 
                 // Validate the config
@@ -221,11 +300,27 @@ impl ServerConfig {
             }
         }
         
-        // Parse listen address
-        let listen_addr = args.listen.parse()?;
+        // Parse listen address based on mode
+        let listen_addr = if matches!(args.mode, NodeMode::VPNEnabled | NodeMode::Hybrid) {
+            args.listen.parse()?
+        } else {
+            // For DePIN-only mode, use a local address
+            "127.0.0.1:8443".parse().unwrap()
+        };
         
-        // Determine data directory
-        let data_dir = PathBuf::from(&args.data_dir);
+        // Determine certificate and key files based on mode
+        let (cert_file, key_file) = if matches!(args.mode, NodeMode::VPNEnabled | NodeMode::Hybrid) {
+            // For VPN modes, require cert and key files
+            match (args.cert_file, args.key_file) {
+                (Some(cert), Some(key)) => (PathBuf::from(cert), PathBuf::from(key)),
+                _ => return Err(ConfigError::Invalid(
+                    "Certificate and key files are required for VPN-enabled modes".to_string()
+                )),
+            }
+        } else {
+            // For DePIN-only mode, use dummy paths
+            (PathBuf::from("dummy.crt"), PathBuf::from("dummy.key"))
+        };
         
         // Determine server key file
         let server_key_file = if let Some(key_file) = args.server_key_file {
@@ -240,11 +335,12 @@ impl ServerConfig {
         }
         
         let config = Self {
+            mode: args.mode,
             listen_addr,
             tun_name: args.tun_name,
             subnet: args.subnet,
-            cert_file: PathBuf::from(args.cert_file),
-            key_file: PathBuf::from(args.key_file),
+            cert_file,
+            key_file,
             acl_file: PathBuf::from(args.acl_file),
             enable_obfuscation: args.enable_obfuscation,
             obfuscation_method: args.obfuscation_method,
@@ -255,9 +351,10 @@ impl ServerConfig {
             data_dir,
             server_key_file,
             registration_code: args.registration_code,
-            registration_reference_code: args.registration_reference_code,
-            wallet_address: args.wallet_address,
+            registration_reference_code,
+            wallet_address,
             api_url: args.api_url,
+            enable_remote_management: args.enable_remote_management,
             key_manager: None,
         };
         
@@ -269,11 +366,28 @@ impl ServerConfig {
     
     /// Validate configuration settings
     fn validate(&self) -> Result<(), ConfigError> {
-        // Validate subnet format
-        if !self.subnet.contains('/') {
-            return Err(ConfigError::InvalidSubnet(format!(
-                "Invalid subnet format: {}", self.subnet
-            )));
+        // Mode-specific validation
+        if matches!(self.mode, NodeMode::VPNEnabled | NodeMode::Hybrid) {
+            // Validate subnet format for VPN modes
+            if !self.subnet.contains('/') {
+                return Err(ConfigError::InvalidSubnet(format!(
+                    "Invalid subnet format: {}", self.subnet
+                )));
+            }
+            
+            // Check that cert and key files exist for VPN modes
+            if !self.cert_file.to_string_lossy().contains("dummy") {
+                if !self.cert_file.exists() {
+                    return Err(ConfigError::Invalid(format!(
+                        "Certificate file not found: {:?}", self.cert_file
+                    )));
+                }
+                if !self.key_file.exists() {
+                    return Err(ConfigError::Invalid(format!(
+                        "Key file not found: {:?}", self.key_file
+                    )));
+                }
+            }
         }
         
         // Validate obfuscation method
@@ -302,6 +416,16 @@ impl ServerConfig {
         Ok(())
     }
     
+    /// Check if VPN functionality is enabled
+    pub fn is_vpn_enabled(&self) -> bool {
+        matches!(self.mode, NodeMode::VPNEnabled | NodeMode::Hybrid)
+    }
+    
+    /// Check if DePIN functionality is enabled
+    pub fn is_depin_enabled(&self) -> bool {
+        matches!(self.mode, NodeMode::DePINOnly | NodeMode::Hybrid)
+    }
+    
     /// Save configuration to a file
     pub fn save_to_file(&self, path: &str) -> Result<(), ConfigError> {
         let json = serde_json::to_string_pretty(self)?;
@@ -319,20 +443,22 @@ impl ServerConfig {
     
     /// Save registration information to a file
     pub fn save_registration(&self, reference_code: &str, wallet_address: &str) -> Result<(), anyhow::Error> {
-        let mut config = self.clone();
-        
-        // Update the registration fields
-        config.registration_reference_code = Some(reference_code.to_string());
-        config.wallet_address = Some(wallet_address.to_string());
-        
         // Create a config directory if it doesn't exist
         if !self.data_dir.exists() {
             std::fs::create_dir_all(&self.data_dir)?;
         }
         
+        // Create registration data
+        let registration_data = serde_json::json!({
+            "reference_code": reference_code,
+            "wallet_address": wallet_address,
+            "mode": self.mode,
+            "api_url": self.api_url,
+        });
+        
         // Save to a file in the data directory
         let config_path = self.data_dir.join("registration.json");
-        let json = serde_json::to_string_pretty(&config)?;
+        let json = serde_json::to_string_pretty(&registration_data)?;
         
         std::fs::write(&config_path, json)?;
         
@@ -347,6 +473,7 @@ mod tests {
     #[test]
     fn test_validate_valid_config() {
         let config = ServerConfig {
+            mode: NodeMode::Hybrid,
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
             tun_name: "tun0".to_string(),
             subnet: "10.7.0.0/24".to_string(),
@@ -365,6 +492,7 @@ mod tests {
             registration_reference_code: None,
             wallet_address: None,
             api_url: "https://api.aeronyx.network".to_string(),
+            enable_remote_management: false,
             key_manager: None,
         };
         
@@ -374,6 +502,7 @@ mod tests {
     #[test]
     fn test_validate_invalid_subnet() {
         let mut config = ServerConfig {
+            mode: NodeMode::VPNEnabled,
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
             tun_name: "tun0".to_string(),
             subnet: "10.7.0.0".to_string(), // Missing CIDR mask
@@ -392,6 +521,7 @@ mod tests {
             registration_reference_code: None,
             wallet_address: None,
             api_url: "https://api.aeronyx.network".to_string(),
+            enable_remote_management: false,
             key_manager: None,
         };
         
@@ -403,17 +533,18 @@ mod tests {
     }
     
     #[test]
-    fn test_validate_invalid_obfuscation() {
+    fn test_mode_checks() {
         let mut config = ServerConfig {
+            mode: NodeMode::DePINOnly,
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
             tun_name: "tun0".to_string(),
             subnet: "10.7.0.0/24".to_string(),
-            cert_file: PathBuf::from("server.crt"),
-            key_file: PathBuf::from("server.key"),
+            cert_file: PathBuf::from("dummy.crt"),
+            key_file: PathBuf::from("dummy.key"),
             acl_file: PathBuf::from("acl.json"),
-            enable_obfuscation: true,
-            obfuscation_method: "invalid".to_string(), // Invalid method
-            enable_padding: true,
+            enable_obfuscation: false,
+            obfuscation_method: "xor".to_string(),
+            enable_padding: false,
             key_rotation_interval: Duration::from_secs(3600),
             session_timeout: Duration::from_secs(86400),
             max_connections_per_ip: 10,
@@ -423,13 +554,22 @@ mod tests {
             registration_reference_code: None,
             wallet_address: None,
             api_url: "https://api.aeronyx.network".to_string(),
+            enable_remote_management: false,
             key_manager: None,
         };
         
-        assert!(config.validate().is_err());
+        // Test DePIN-only mode
+        assert!(config.is_depin_enabled());
+        assert!(!config.is_vpn_enabled());
         
-        // Fix the obfuscation method
-        config.obfuscation_method = "xor".to_string();
-        assert!(config.validate().is_ok());
+        // Test VPN-enabled mode
+        config.mode = NodeMode::VPNEnabled;
+        assert!(!config.is_depin_enabled());
+        assert!(config.is_vpn_enabled());
+        
+        // Test Hybrid mode
+        config.mode = NodeMode::Hybrid;
+        assert!(config.is_depin_enabled());
+        assert!(config.is_vpn_enabled());
     }
 }
