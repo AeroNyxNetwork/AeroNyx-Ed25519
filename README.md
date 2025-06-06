@@ -158,12 +158,15 @@ Enhanced configuration with mode selection and remote management options.
 - `key_file: Option<PathBuf>` - TLS private key (required only for VPN modes)
 
 **NodeMode Enum:**
-```rust
+
+```
 pub enum NodeMode {
     DePINOnly,    // No certificates required
     VPNEnabled,   // Traditional VPN server
     Hybrid,       // Both functionalities
 }
+```
+
 5. Main Application Updates (src/main.rs)
 Refactored to support multiple operating modes.
 Key Functions:
