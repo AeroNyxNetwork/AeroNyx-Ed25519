@@ -372,10 +372,12 @@ impl VpnServer {
         if let Some(reg_manager) = &self.registration_manager {
             if let Some(reference_code) = &self.config.registration_reference_code {
                 info!("Starting WebSocket connection for registered node");
-                let mut ws_manager = (*reg_manager).clone();
+                let ws_manager = (*reg_manager).clone();  // Fixed: removed mut
                 let reference_code = reference_code.clone();
                 
                 let ws_handle = tokio::spawn(async move {
+                    // Create a mutable clone inside the async block
+                    let mut ws_manager = ws_manager;
                     // Keep trying to connect with exponential backoff
                     let mut retry_delay = Duration::from_secs(5);
                     loop {
