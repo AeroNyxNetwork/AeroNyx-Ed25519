@@ -98,15 +98,34 @@ async fn run_depin_only(config: ServerConfig) -> anyhow::Result<()> {
     reg_manager.set_data_dir(config.data_dir.clone());
     
     // Load registration data
-    if !reg_manager.load_from_config(&config).unwrap_or(false) {
-        error!("No registration found. Please run setup command first.");
-        error!("Usage: {} setup --registration-code <CODE>", env!("CARGO_PKG_NAME"));
-        return Err(anyhow::anyhow!("Not registered"));
+    match reg_manager.load_from_config(&config) {
+        Ok(true) => {
+            info!("Registration data loaded successfully");
+        }
+        Ok(false) => {
+            error!("No registration found. Please run setup command first.");
+            error!("Usage: {} setup --registration-code <CODE>", env!("CARGO_PKG_NAME"));
+            return Err(anyhow::anyhow!("Not registered"));
+        }
+        Err(e) => {
+            error!("Failed to load registration: {}", e);
+            error!("Your registration file may be corrupted or from an older version.");
+            error!("Please re-register using: {} setup --registration-code <CODE>", env!("CARGO_PKG_NAME"));
+            return Err(anyhow::anyhow!("Registration error: {}", e));
+        }
     }
     
     // Verify hardware fingerprint
     if let Err(e) = reg_manager.verify_hardware_fingerprint().await {
         error!("Hardware verification failed: {}", e);
+        error!("");
+        error!("This error occurs when:");
+        error!("1. The hardware has changed since registration");
+        error!("2. The registration file is missing hardware fingerprint data");
+        error!("");
+        error!("For security reasons, you must re-register this node.");
+        error!("Please obtain a new registration code and run:");
+        error!("{} setup --registration-code <NEW_CODE>", env!("CARGO_PKG_NAME"));
         return Err(anyhow::anyhow!("Hardware verification failed"));
     }
     
@@ -120,6 +139,8 @@ async fn run_depin_only(config: ServerConfig) -> anyhow::Result<()> {
     if config.enable_remote_management {
         info!("Remote management enabled");
         reg_manager.set_remote_management_enabled(true);
+        // Give the async task time to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
     
     // Run WebSocket connection
