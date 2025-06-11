@@ -5,7 +5,7 @@ use clap::Parser;
 use std::path::Path;
 use std::process;
 use tokio::signal;
-use tracing::{error, info, warn};  // Add warn import
+use tracing::{error, info, warn};
 
 mod auth;
 mod config;
@@ -15,9 +15,10 @@ mod protocol;
 mod server;
 mod utils;
 mod registration;
-mod hardware;  // Only declare once
+mod hardware;
+mod remote_management;  // Added remote management module
 
-use config::settings::{ServerConfig, ServerArgs, Command};
+use config::settings::{ServerConfig, ServerArgs, Command, NodeMode};
 use server::VpnServer;
 use registration::RegistrationManager;
 use hardware::HardwareInfo;
@@ -36,28 +37,102 @@ async fn main() -> anyhow::Result<()> {
         return handle_registration_setup(&registration_code, &args).await;
     }
     
-    info!("Starting AeroNyx Privacy Network Server v{}", env!("CARGO_PKG_VERSION"));
+    info!("Starting AeroNyx Node v{} in {:?} mode", 
+          env!("CARGO_PKG_VERSION"), 
+          args.mode);
     
-    // Check if running as root (required for TUN device management)
+    // Check root permission only for VPN mode
     #[cfg(target_family = "unix")]
-    if !utils::system::is_root() {
-        error!("This application must be run as root to manage TUN devices");
-        process::exit(1);
+    if matches!(args.mode, NodeMode::VPNEnabled | NodeMode::Hybrid) {
+        if !utils::system::is_root() {
+            error!("VPN mode requires root privileges to manage TUN devices");
+            process::exit(1);
+        }
     }
     
-    // Check if TLS certificate and key exist
-    if !Path::new(&args.cert_file).exists() || !Path::new(&args.key_file).exists() {
-        error!("TLS certificate or key file not found. Please ensure both files exist:");
-        error!("  - Certificate: {}", args.cert_file);
-        error!("  - Key file: {}", args.key_file);
-        error!("You can generate self-signed certificates with OpenSSL:");
-        error!("  openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes");
-        process::exit(1);
+    // Check certificates only for VPN mode
+    if matches!(args.mode, NodeMode::VPNEnabled | NodeMode::Hybrid) {
+        if args.cert_file.is_none() || args.key_file.is_none() {
+            error!("VPN mode requires TLS certificate and key files");
+            error!("Use --cert-file and --key-file options");
+            process::exit(1);
+        }
+        
+        let cert_file = args.cert_file.as_ref().unwrap();
+        let key_file = args.key_file.as_ref().unwrap();
+        
+        if !Path::new(cert_file).exists() || !Path::new(key_file).exists() {
+            error!("TLS certificate or key file not found:");
+            error!("  - Certificate: {}", cert_file);
+            error!("  - Key file: {}", key_file);
+            error!("You can generate self-signed certificates with OpenSSL:");
+            error!("  openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes");
+            process::exit(1);
+        }
     }
     
     // Create server configuration
     let config = ServerConfig::from_args(args.clone())?;
     
+    // Run based on mode
+    match config.mode {
+        NodeMode::DePINOnly => {
+            info!("Running in DePIN-only mode (no VPN server)");
+            run_depin_only(config).await
+        }
+        NodeMode::VPNEnabled => {
+            info!("Running in VPN-enabled mode");
+            run_with_vpn(config).await
+        }
+        NodeMode::Hybrid => {
+            info!("Running in hybrid mode (DePIN + VPN)");
+            run_with_vpn(config).await
+        }
+    }
+}
+
+/// Run in DePIN-only mode (no VPN server)
+async fn run_depin_only(config: ServerConfig) -> anyhow::Result<()> {
+    // Create registration manager
+    let mut reg_manager = RegistrationManager::new(&config.api_url);
+    reg_manager.set_data_dir(config.data_dir.clone());
+    
+    // Load registration data
+    if !reg_manager.load_from_config(&config).unwrap_or(false) {
+        error!("No registration found. Please run setup command first.");
+        error!("Usage: {} setup --registration-code <CODE>", env!("CARGO_PKG_NAME"));
+        return Err(anyhow::anyhow!("Not registered"));
+    }
+    
+    // Verify hardware fingerprint
+    if let Err(e) = reg_manager.verify_hardware_fingerprint().await {
+        error!("Hardware verification failed: {}", e);
+        return Err(anyhow::anyhow!("Hardware verification failed"));
+    }
+    
+    info!("Starting DePIN node with reference code: {}", 
+          reg_manager.reference_code.as_ref().unwrap());
+    
+    // Start WebSocket connection
+    let reference_code = reg_manager.reference_code.clone().unwrap();
+    
+    // Enable remote management in WebSocket connection
+    if config.enable_remote_management {
+        info!("Remote management enabled");
+        reg_manager.set_remote_management_enabled(true);
+    }
+    
+    // Run WebSocket connection
+    match reg_manager.start_websocket_connection(reference_code, None).await {
+        Ok(_) => info!("WebSocket connection closed"),
+        Err(e) => error!("WebSocket error: {}", e),
+    }
+    
+    Ok(())
+}
+
+/// Run with VPN server (VPN-enabled or Hybrid mode)
+async fn run_with_vpn(config: ServerConfig) -> anyhow::Result<()> {
     // Create and initialize VPN server
     let server = VpnServer::new(config).await?;
     info!("Server successfully initialized with military-grade security features");
@@ -141,7 +216,7 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
             info!("  CPU: {} cores, {}", info.cpu.cores, info.cpu.model);
             info!("  Memory: {} GB", info.memory.total / (1024 * 1024 * 1024));
             info!("  OS: {} {}", info.os.distribution, info.os.version);
-            info!("  Public IP: {}", info.network.public_ip);  // Fixed: access through network field
+            info!("  Public IP: {}", info.network.public_ip);
             info
         }
         Err(e) => {
@@ -182,7 +257,7 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
                 Some(registration_code.to_string())
             ).await {
                 Ok(_) => info!("WebSocket connection test successful"),
-                Err(e) => warn!("WebSocket connection test failed: {}", e),  // Fixed: use warn! macro
+                Err(e) => warn!("WebSocket connection test failed: {}", e),
             }
             
             info!("\nNext steps:");
