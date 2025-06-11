@@ -1,5 +1,5 @@
 // src/registration.rs
-use reqwest::{Client, header};  // Removed unused StatusCode
+use reqwest::{Client, header};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,11 +11,11 @@ use futures_util::{SinkExt, StreamExt};
 use std::path::PathBuf;
 use std::fs;
 
-// Removed unused import: use crate::server::core::ServerState;
 use crate::config::settings::ServerConfig;
 use crate::server::metrics::ServerMetricsCollector;
 use crate::utils;
 use crate::hardware::HardwareInfo;
+use crate::remote_management::{RemoteCommand, RemoteManagementHandler, CommandResponse};
 
 // API Response structures
 #[derive(Debug, Deserialize, Serialize)]
@@ -79,6 +79,11 @@ pub enum WebSocketMessage {
     Ping {
         timestamp: u64,
     },
+    #[serde(rename = "command_response")]
+    CommandResponse {
+        request_id: String,
+        response: CommandResponse,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,6 +116,8 @@ pub struct RegistrationManager {
     websocket_connected: Arc<RwLock<bool>>,
     start_time: std::time::Instant,
     data_dir: PathBuf,
+    remote_management_enabled: Arc<RwLock<bool>>,
+    remote_handler: Arc<RemoteManagementHandler>,
 }
 
 impl RegistrationManager {
@@ -137,7 +144,14 @@ impl RegistrationManager {
             websocket_connected: Arc::new(RwLock::new(false)),
             start_time: std::time::Instant::now(),
             data_dir: PathBuf::from("data"),
+            remote_management_enabled: Arc::new(RwLock::new(false)),
+            remote_handler: Arc::new(RemoteManagementHandler::new()),
         }
+    }
+
+    // Set remote management enabled status
+    pub fn set_remote_management_enabled(&mut self, enabled: bool) {
+        *self.remote_management_enabled.blocking_write() = enabled;
     }
 
     // Set data directory for storing registration info
@@ -162,9 +176,6 @@ impl RegistrationManager {
                             self.reference_code = Some(stored_reg.reference_code.clone());
                             self.wallet_address = Some(stored_reg.wallet_address.clone());
                             self.hardware_fingerprint = Some(stored_reg.hardware_fingerprint.clone());
-                            
-                            // Note: Hardware verification will be done asynchronously later
-                            // since this is not an async function
                             
                             return Ok(true);
                         }
@@ -443,10 +454,63 @@ impl RegistrationManager {
                                     }
                                     
                                     Some("command") => {
-                                        // Handle server commands
-                                        if let Some(command) = json.get("command").and_then(|c| c.as_str()) {
-                                            info!("Received server command: {}", command);
-                                            // TODO: Implement command handling
+                                        // Handle remote commands
+                                        if *self.remote_management_enabled.read().await {
+                                            let request_id = json.get("request_id")
+                                                .and_then(|id| id.as_str())
+                                                .unwrap_or("unknown")
+                                                .to_string();
+                                            
+                                            // Parse remote command from parameters
+                                            if let Some(params) = json.get("parameters") {
+                                                match serde_json::from_value::<RemoteCommand>(params.clone()) {
+                                                    Ok(remote_cmd) => {
+                                                        info!("Received remote command: {:?}", remote_cmd);
+                                                        
+                                                        // Execute command
+                                                        let response = self.remote_handler.handle_command(remote_cmd).await;
+                                                        
+                                                        // Send response back
+                                                        let response_msg = WebSocketMessage::CommandResponse {
+                                                            request_id,
+                                                            response,
+                                                        };
+                                                        
+                                                        let response_json = serde_json::to_string(&response_msg)
+                                                            .map_err(|e| format!("Failed to serialize response: {}", e))?;
+                                                        
+                                                        if let Err(e) = write.send(Message::Text(response_json)).await {
+                                                            error!("Failed to send command response: {}", e);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Invalid remote command format: {}", e);
+                                                        
+                                                        // Send error response
+                                                        let error_response = CommandResponse {
+                                                            success: false,
+                                                            message: format!("Invalid command format: {}", e),
+                                                            data: None,
+                                                        };
+                                                        
+                                                        let response_msg = WebSocketMessage::CommandResponse {
+                                                            request_id,
+                                                            response: error_response,
+                                                        };
+                                                        
+                                                        let response_json = serde_json::to_string(&response_msg)
+                                                            .map_err(|e| format!("Failed to serialize error response: {}", e))?;
+                                                        
+                                                        if let Err(e) = write.send(Message::Text(response_json)).await {
+                                                            error!("Failed to send error response: {}", e);
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                warn!("Remote command missing parameters");
+                                            }
+                                        } else {
+                                            warn!("Remote management is disabled, ignoring command");
                                         }
                                     }
                                     
@@ -538,7 +602,7 @@ impl RegistrationManager {
 
     async fn get_memory_usage(&self) -> f64 {
         if let Ok(Ok((total, available))) = tokio::task::spawn_blocking(|| utils::system::get_system_memory()).await {
-            (total - available) as f64 / total as f64 * 100.0  // Fixed: removed extra parentheses
+            ((total - available) as f64 / total as f64 * 100.0)
         } else {
             0.0
         }
@@ -546,7 +610,7 @@ impl RegistrationManager {
 
     async fn get_disk_usage(&self) -> f64 {
         if let Ok(Ok(usage)) = tokio::task::spawn_blocking(|| utils::system::get_disk_usage()).await {
-            usage as f64  // Fixed: convert u8 to f64
+            usage as f64
         } else {
             0.0
         }
