@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::info;
 
 use crate::config::defaults;
 use crate::crypto::keys::KeyManager;
@@ -246,8 +247,13 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// Create a new server configuration from command line arguments
     pub fn from_args(args: ServerArgs) -> Result<Self, ConfigError> {
-        // Load registration data if exists
-        let data_dir = PathBuf::from(&args.data_dir);
+        // Use platform-specific default data directory if not specified
+        let data_dir = if args.data_dir == defaults::DEFAULT_DATA_DIR {
+            defaults::default_data_dir()
+        } else {
+            PathBuf::from(&args.data_dir)
+        };
+        
         let reg_file = data_dir.join("registration.json");
         
         let (registration_reference_code, wallet_address) = if reg_file.exists() {
@@ -441,26 +447,36 @@ impl ServerConfig {
         Ok(config)
     }
     
-    /// Save registration information to a file
-    pub fn save_registration(&self, reference_code: &str, wallet_address: &str) -> Result<(), anyhow::Error> {
+    /// Save registration information to a file (updated to include hardware fingerprint)
+    pub fn save_registration(&self, reference_code: &str, wallet_address: &str, hardware_fingerprint: &str) -> Result<(), anyhow::Error> {
+        use crate::registration::StoredRegistration;
+        use chrono::Utc;
+        
         // Create a config directory if it doesn't exist
         if !self.data_dir.exists() {
             std::fs::create_dir_all(&self.data_dir)?;
         }
         
-        // Create registration data
-        let registration_data = serde_json::json!({
-            "reference_code": reference_code,
-            "wallet_address": wallet_address,
-            "mode": self.mode,
-            "api_url": self.api_url,
-        });
+        // Create registration data matching StoredRegistration structure
+        let registration_data = StoredRegistration {
+            reference_code: reference_code.to_string(),
+            wallet_address: wallet_address.to_string(),
+            hardware_fingerprint: hardware_fingerprint.to_string(),
+            registered_at: Utc::now().to_rfc3339(),
+            node_type: match self.mode {
+                NodeMode::DePINOnly => "depin",
+                NodeMode::VPNEnabled => "vpn",
+                NodeMode::Hybrid => "hybrid",
+            }.to_string(),
+        };
         
         // Save to a file in the data directory
         let config_path = self.data_dir.join("registration.json");
         let json = serde_json::to_string_pretty(&registration_data)?;
         
         std::fs::write(&config_path, json)?;
+        
+        info!("Registration data saved to {:?}", config_path);
         
         Ok(())
     }
@@ -571,5 +587,16 @@ mod tests {
         config.mode = NodeMode::Hybrid;
         assert!(config.is_depin_enabled());
         assert!(config.is_vpn_enabled());
+    }
+    
+    #[test]
+    fn test_platform_specific_data_dir() {
+        let default_dir = defaults::default_data_dir();
+        
+        #[cfg(target_os = "windows")]
+        assert!(default_dir.to_string_lossy().contains("AeroNyx"));
+        
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(default_dir, PathBuf::from("/var/lib/aeronyx"));
     }
 }
