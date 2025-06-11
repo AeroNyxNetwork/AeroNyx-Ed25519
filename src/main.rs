@@ -265,9 +265,10 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
                 info!("  Hardware fingerprint registered successfully");
             }
             
-            // Save registration data to config file (for backward compatibility)
+            // Save registration data to config file (with hardware fingerprint)
             let wallet_address = response.node.wallet_address.clone();
-            config.save_registration(&response.node.reference_code, &wallet_address)?;
+            let hardware_fingerprint_str = hardware_info.generate_fingerprint();
+            config.save_registration(&response.node.reference_code, &wallet_address, &hardware_fingerprint_str)?;
             
             info!("Registration data saved successfully");
             
