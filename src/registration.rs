@@ -150,8 +150,13 @@ impl RegistrationManager {
     }
 
     // Set remote management enabled status
-    pub fn set_remote_management_enabled(&mut self, enabled: bool) {
-        *self.remote_management_enabled.blocking_write() = enabled;
+    pub fn set_remote_management_enabled(&self, enabled: bool) {
+        tokio::spawn({
+            let remote_management_enabled = self.remote_management_enabled.clone();
+            async move {
+                *remote_management_enabled.write().await = enabled;
+            }
+        });
     }
 
     // Set data directory for storing registration info
@@ -181,6 +186,9 @@ impl RegistrationManager {
                         }
                         Err(e) => {
                             error!("Failed to parse registration data: {}", e);
+                            error!("Registration file is corrupted or incomplete");
+                            error!("Please re-register the node using: setup --registration-code <CODE>");
+                            return Err("Invalid registration file format".to_string());
                         }
                     }
                 }
@@ -222,6 +230,10 @@ impl RegistrationManager {
             }
             
             debug!("Hardware fingerprint verified successfully");
+        } else {
+            error!("No hardware fingerprint found in registration data");
+            error!("This node requires re-registration for security compliance");
+            return Err("Missing hardware fingerprint - re-registration required".to_string());
         }
         
         Ok(())
