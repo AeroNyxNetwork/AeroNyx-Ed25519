@@ -1,415 +1,146 @@
-# AeroNyx DePIN (Decentralized Physical Infrastructure Network) Privacy Computing Node Memory Document
+AeroNyx DePIN Node
+Created: May 10, 2025
 
-**Created:** May 10, 2025  
-**Updated:** June 7, 2025  
-**Version:** 0.2.0
+Updated: June 13, 2025 
 
-## Project Overview
+Version: 0.1.0
 
-AeroNyx is a decentralized privacy computing network node built on the Solana blockchain, implementing the Decentralized Physical Infrastructure (DePIN) paradigm to enable global peer-to-peer sharing of privacy-preserving computing resources. The project uses Solana keypairs for trustless authentication and end-to-end encryption, supporting AI and Web3 applications' access to decentralized computing resources while protecting user data privacy and network neutrality.
+1. Project Overview
+AeroNyx is a decentralized privacy computing network node built on the Solana blockchain. It leverages the Decentralized Physical Infrastructure (DePIN) paradigm to enable a global, peer-to-peer network for sharing privacy-preserving computing resources. The project uses Solana keypairs as its root of trust, enabling password-less, cryptographic authentication and end-to-end encrypted communication. It is designed to support AI and Web3 applications by providing access to decentralized compute resources while guaranteeing user data privacy and network neutrality.
 
-> *"AeroNyx is redefining the infrastructure layer of Web3 by tokenizing privacy computing resources, creating not just a decentralized resource network but a new asset class. This represents a significant step toward a truly distributed internet."*
+"AeroNyx is redefining the infrastructure layer of Web3 by tokenizing privacy computing resources, creating not just a decentralized resource network, but a new asset class. This represents a significant step toward a truly distributed internet."
 
-## Core Architecture
+2. Core Architecture & Module Deep Dive
+AeroNyx employs a highly modular, asynchronous Rust architecture built on tokio. This design promotes a strong separation of concerns, making the system scalable and maintainable.
 
-AeroNyx employs a modular architecture that combines blockchain and advanced cryptography to create a privacy-first decentralized computing network:
-
-1. **Node Core** - Decentralized node implementation managing lifecycle and compute resource allocation
-2. **Web3 Authentication** - Solana-based trustless identity verification and access control
-3. **Privacy Cryptography** - Advanced end-to-end encryption and zero-knowledge proof technologies
-4. **Resource Network** - Decentralized resource allocation and compute task routing
-5. **Protocol Layer** - Secure communication protocol and Web3 interaction standards
-6. **Registration System** - API-based node registration and network participation management
-7. **Remote Management** - Secure remote node control through WebSocket commands
-
-
-## Module Structure
-
-```
 src/
-├── main.rs              # Entry point with mode selection
-├── config/              # Configuration management
-│   ├── settings.rs      # Updated with NodeMode enum
-│   └── constants.rs     
-├── hardware.rs          # Hardware information collection
-├── registration.rs      # Node registration and WebSocket client
-├── remote_management.rs # NEW: Remote command execution
-├── server/              # VPN server components (optional)
-├── crypto/              # Encryption utilities
-├── auth/                # Authentication system
-├── network/             # Network management
-├── protocol/            # Communication protocols
-└── utils/               # Utility functions
-```
-
-
-## Recent Updates (Version 0.2.0 - June 2025)
-
-### 1. Modular Architecture
-- **Decoupled VPN and DePIN functionality** - Nodes can now run in three distinct modes
-- **No certificates required for DePIN-only mode** - Lowered barrier to entry for node operators
-- **Flexible deployment options** - Choose functionality based on your needs
-
-### 2. Remote Management System
-- **Web-based node control** - Manage your node through the AeroNyx platform
-- **Secure command execution** - Whitelisted commands with path restrictions
-- **File system operations** - List, read, delete, upload, and download files
-- **Real-time monitoring** - System metrics and process information
-
-### 3. Enhanced Security Features
-- **Hardware fingerprinting** - Prevents duplicate registrations from same hardware
-- **Persistent registration storage** - Survives node restarts
-- **Command whitelisting** - Only safe commands can be executed remotely
-- **Path restrictions** - Limited access to specific directories
-
-## Operating Modes
-
-### 1. DePIN-Only Mode (Recommended for Most Users)
-- **Purpose**: Participate in the decentralized network without VPN functionality
-- **Requirements**: No root access, no TLS certificates
-- **Use Case**: Ideal for users who want to contribute computing resources to the network
-
-### 2. VPN-Enabled Mode
-- **Purpose**: Traditional VPN server with Solana-based authentication
-- **Requirements**: Root access, TLS certificates
-- **Use Case**: For users who want to provide VPN services
-
-### 3. Hybrid Mode
-- **Purpose**: Both DePIN and VPN functionality
-- **Requirements**: Root access, TLS certificates
-- **Use Case**: Maximum functionality and earning potential
-
-## Key Components
-
-### 1. Hardware Module (`src/hardware.rs`)
-
-Collects and manages hardware information for node identification and anti-duplication.
-
-**Key Structures:**
-- `HardwareInfo` - Complete hardware profile of the node
-- `CpuInfo` - CPU specifications including cores, model, frequency
-- `MemoryInfo` - RAM total and available
-- `DiskInfo` - Storage capacity and filesystem type
-- `NetworkInfo` - Network interfaces and public IP
-- `OsInfo` - Operating system details
-
-**Key Methods:**
-- `HardwareInfo::collect() -> Result<Self, String>` - Gather all hardware information
-- `HardwareInfo::generate_fingerprint(&self) -> String` - Create unique hardware identifier
-- `HardwareInfo::get_network_interfaces() -> Result<Vec<NetworkInterface>, String>` - Enumerate network adapters
-- `HardwareInfo::get_public_ip() -> Result<String, String>` - Fetch public IP address
-
-### 2. Registration System (`src/registration.rs`)
-
-Enhanced registration manager with WebSocket support and hardware verification.
-
-**Key Structures:**
-- `RegistrationManager` - Manages node registration and WebSocket communication
-- `StoredRegistration` - Persistent registration data including hardware fingerprint
-- `WebSocketMessage` - Protocol messages for node-server communication
-- `HeartbeatMetrics` - System resource usage metrics
-
-**Key Methods:**
-- `RegistrationManager::confirm_registration_with_hardware(&mut self, registration_code: &str, hardware_info: &HardwareInfo)` - Register node with hardware fingerprint
-- `RegistrationManager::verify_hardware_fingerprint(&self) -> Result<(), String>` - Ensure hardware hasn't changed
-- `RegistrationManager::start_websocket_connection(&mut self, reference_code: String, registration_code: Option<String>)` - Establish WebSocket connection
-- `RegistrationManager::save_registration_data(&self, node_info: &NodeInfo, hardware_fingerprint: String)` - Persist registration locally
-
-**WebSocket Message Types:**
-- `Auth` - Authentication with reference code
-- `Heartbeat` - System metrics and status
-- `StatusUpdate` - Node state changes
-- `Command` - Remote management commands
-- `CommandResponse` - Results of remote commands
-
-### 3. Remote Management (`src/remote_management.rs`)
-
-Secure remote control system for node operations.
-
-**Key Structures:**
-- `RemoteManagementHandler` - Processes remote commands
-- `RemoteCommand` - Command types enumeration
-- `CommandResponse` - Standardized response format
-
-**Command Types:**
-- `ListDirectory` - Browse file system
-- `ReadFile` - View file contents (max 10MB)
-- `DeleteFile` - Remove files
-- `ExecuteCommand` - Run whitelisted shell commands
-- `GetSystemInfo` - Hardware and OS information
-- `GetProcessList` - Running processes
-- `UploadFile` - Transfer files to node
-- `DownloadFile` - Retrieve files from node
-
-**Security Features:**
-- **Path Restrictions**: Access limited to `/home`, `/tmp`, `/var/log`
-- **Command Whitelist**: Only safe commands like `ls`, `ps`, `df`, `free`
-- **Size Limits**: File operations capped at 10MB
-- **Authentication**: All commands require valid WebSocket authentication
-
-### 4. Configuration Updates (`src/config/settings.rs`)
-
-Enhanced configuration with mode selection and remote management options.
-
-**New Configuration Options:**
-- `mode: NodeMode` - Select between DePIN-only, VPN-enabled, or Hybrid
-- `enable_remote_management: bool` - Allow remote control via WebSocket
-- `cert_file: Option<PathBuf>` - TLS certificate (required only for VPN modes)
-- `key_file: Option<PathBuf>` - TLS private key (required only for VPN modes)
-
-**NodeMode Enum:**
-
-```
-pub enum NodeMode {
-    DePINOnly,    // No certificates required
-    VPNEnabled,   // Traditional VPN server
-    Hybrid,       // Both functionalities
-}
-```
-
-5. Main Application Updates (src/main.rs)
-Refactored to support multiple operating modes.
-Key Functions:
-
-run_depin_only(config: ServerConfig) - Run node without VPN functionality
-run_with_vpn(config: ServerConfig) - Run with VPN server enabled
-handle_registration_setup(registration_code: &str, args: &ServerArgs) - Enhanced with hardware fingerprinting
-
-Mode-Specific Behavior:
-
-DePIN-only: No root required, no certificates needed
-VPN modes: Requires root access and valid TLS certificates
-
-Authentication and Security Flow
-1. Multi-Layer Authentication
-Layer 1: Platform Authentication
-├── User logs into AeroNyx web platform
-├── Platform verifies wallet ownership
-└── Platform checks node ownership
-
-Layer 2: WebSocket Authentication  
-├── Node connects to wss://api.aeronyx.network
-├── Node sends Auth message with reference_code
-└── Server validates and establishes session
-
-Layer 3: Command Authorization
-├── Platform sends command via WebSocket
-├── Node verifies command origin
-└── Node checks if remote management enabled
-
-Layer 4: Execution Security
-├── Command type validation
-├── Path restriction enforcement
-└── Resource limit checks
-2. Hardware Fingerprint Verification
-Registration:
-├── Collect hardware information
-├── Generate SHA256 fingerprint
-├── Include: CPU model, MAC addresses, hostname
-└── Store fingerprint with registration
-
-Startup Verification:
-├── Recollect hardware information
-├── Generate current fingerprint
-├── Compare with stored fingerprint
-└── Reject if mismatch detected
-3. Remote Command Security
-Command Reception:
-├── Receive via authenticated WebSocket
-├── Parse command type and parameters
-├── Validate against whitelist
-└── Check path restrictions
-
-Execution:
-├── Run in restricted context
-├── Capture output and errors
-├── Enforce size limits
-└── Return sanitized results
-Data Flow
-1. Initial Node Registration
-Operator → Web Platform → Generate Registration Code
-    ↓
-Operator → Node Setup Command → Collect Hardware Info
-    ↓
-Node → API Server → Confirm Registration
-    ↓
-Node → Save Registration Data Locally
-    ↓
-Node → Establish WebSocket Connection
-2. Normal Operation (DePIN-Only Mode)
-Node Startup → Load Registration → Verify Hardware
-    ↓
-Connect WebSocket → Authenticate → Start Heartbeat
-    ↓
-Receive Commands → Execute Safely → Return Results
-3. Remote Management Flow
-User → Web Platform → Select Node → Send Command
-    ↓
-Platform → Verify Ownership → Forward via WebSocket
-    ↓
-Node → Validate Command → Execute → Return Response
-    ↓
-Platform → Display Results → User
-Installation and Usage
-Prerequisites
-
-Linux (Ubuntu 20.04+ recommended)
-Rust 1.70+
-Git
-
-Build from Source
-bashgit clone https://github.com/aeronyx/AeroNyx-Ed25519
-cd AeroNyx-Ed25519
-cargo build --release
-Node Registration
-bash# Get registration code from AeroNyx platform first
-sudo ./target/release/aeronyx-private-ed25519 setup --registration-code AERO-XXXXXXXXXXXX
-Running the Node
-DePIN-Only Mode (No Certificates Required)
-bash# Run without root, no certificates needed
-./target/release/aeronyx-private-ed25519 \
-  --mode depin-only \
-  --enable-remote-management
-VPN-Enabled Mode
-bash# Generate certificates first
-openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes
-
-# Run with root privileges
-sudo ./target/release/aeronyx-private-ed25519 \
-  --mode vpn-enabled \
-  --cert-file server.crt \
-  --key-file server.key \
-  --listen-addr 0.0.0.0:8443 \
-  --subnet 10.7.0.0/24
-Hybrid Mode
-bashsudo ./target/release/aeronyx-private-ed25519 \
-  --mode hybrid \
-  --cert-file server.crt \
-  --key-file server.key \
-  --enable-remote-management
-Systemd Service Configuration
-Create /etc/systemd/system/aeronyx-node.service:
-ini[Unit]
-Description=AeroNyx DePIN Node
-After=network.target
-
-[Service]
-Type=simple
-User=aeronyx
-Group=aeronyx
-WorkingDirectory=/opt/aeronyx
-ExecStart=/opt/aeronyx/aeronyx-private-ed25519 --mode depin-only --enable-remote-management
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/aeronyx/data
-
-[Install]
-WantedBy=multi-user.target
-Enable and start:
-bashsudo systemctl daemon-reload
-sudo systemctl enable aeronyx-node
-sudo systemctl start aeronyx-node
-sudo journalctl -u aeronyx-node -f
-Remote Management Commands
-File Operations
-bash# List directory
-{"type": "list_directory", "path": "/home/user"}
-
-# Read file (max 10MB)
-{"type": "read_file", "path": "/var/log/aeronyx.log"}
-
-# Delete file
-{"type": "delete_file", "path": "/tmp/old-file.txt"}
-
-# Upload file (base64 encoded)
-{"type": "upload_file", "path": "/home/user/data.txt", "content": "base64..."}
-
-# Download file
-{"type": "download_file", "path": "/home/user/report.pdf"}
-System Commands
-bash# Execute command
-{"type": "execute_command", "command": "df", "args": ["-h"]}
-
-# Get system info
-{"type": "get_system_info"}
-
-# Get process list
-{"type": "get_process_list"}
-Troubleshooting
-Common Issues
-Registration Failures
-
-Hardware fingerprint conflict: Hardware already registered
-Code expired: Registration codes valid for 24 hours
-Invalid code: Ensure correct code from platform
-
-Connection Issues
-
-Check network connectivity: ping api.aeronyx.network
-Verify registration: cat data/registration.json
-Check WebSocket connection in logs
-
-Remote Management Not Working
-
-Ensure --enable-remote-management flag is set
-Verify node ownership on web platform
-Check WebSocket authentication in logs
-
-Debug Commands
-bash# Check registration status
-cat data/registration.json | jq
-
-# Monitor logs
-journalctl -u aeronyx-node -f
-
-# Test API connectivity
-curl https://api.aeronyx.network/api/aeronyx/node-types/
-
-# Check system resources
-free -h && df -h && uptime
-Security Considerations
-Hardware Fingerprinting
-
-Prevents multiple registrations from same hardware
-Detects hardware changes that might indicate tampering
-Based on CPU, network interfaces, and system identifiers
-
-Remote Management Security
-
-All commands require authenticated WebSocket connection
-Path traversal prevented by canonicalization
-Command injection prevented by whitelist
-Resource exhaustion prevented by size limits
-
-Data Protection
-
-Registration data encrypted at rest
-WebSocket communication over TLS (WSS)
-Sensitive data never logged
-Hardware fingerprints are one-way hashes
-
-Contributing
-
-Fork the repository
-Create feature branch (git checkout -b feature/amazing-feature)
-Commit changes (git commit -m 'Add amazing feature')
-Push to branch (git push origin feature/amazing-feature)
-Open Pull Request
-
-Development Guidelines
-
-Follow Rust naming conventions
-Add tests for new features
-Update documentation
-Ensure backward compatibility
+├── main.rs              # Application entry point, handles startup arguments and mode selection
+├── config/              # Configuration management (settings, constants, defaults)
+├── hardware.rs          # Hardware information collection and fingerprinting
+├── registration.rs      # Node registration and WebSocket communication with the central API
+├── remote_management.rs # Remote command execution logic
+├── server/              # VPN server core components (core, session, routing, client, etc.)
+├── crypto/              # Cryptographic utilities (keys, encryption, session, flexible_encryption)
+├── auth/                # Authentication system (acl, challenge, manager)
+├── network/             # Network management (tun, ip_pool, monitor)
+├── protocol/            # Custom application-layer protocol (types, serialization, validation)
+└── utils/               # General-purpose utilities (system, security, logging)
+2.1. Configuration Module (src/config/)
+This module is responsible for the entire configuration lifecycle, from parsing command-line arguments to loading files and applying default values.
+
+settings.rs:
+
+ServerArgs struct: Defined using clap, this struct parses all command-line arguments, including the crucial --mode flag.
+NodeMode Enum: This enum is fundamental to the project's flexibility, allowing the node to run in one of three modes:
+DePINOnly: For contributing computing resources without VPN functionality. Does not require root privileges or TLS certificates.
+VPNEnabled: Runs as a traditional VPN server, requiring root access and certificates.
+Hybrid: Enables both DePIN and VPN functionalities concurrently.
+ServerConfig struct: This is the unified runtime configuration struct. Its from_args method intelligently aggregates settings from command-line arguments and an optional JSON configuration file. The validate method ensures all settings are coherent and valid before the server starts (e.g., checking that key files exist in VPN mode).
+constants.rs & defaults.rs:
+
+These files externalize all magic numbers and default settings, improving maintainability.
+constants.rs defines cryptographic and security parameters like SESSION_KEY_SIZE (32 bytes), NONCE_SIZE (12 bytes for ChaCha20-Poly1305), and AUTH_CHALLENGE_TIMEOUT (30 seconds).
+defaults.rs provides default values for user-configurable settings, including a platform-aware default_data_dir() function that correctly sets the data path for Windows and Unix-like systems.
+2.2. Authentication & Authorization Module (src/auth/)
+This module is the security gatekeeper of the node, verifying every client's identity and enforcing access rules.
+
+manager.rs:
+
+The AuthManager struct orchestrates the entire authentication process. It integrates the ChallengeManager and AccessControlManager to provide a single, unified interface for authenticating a client.
+It implements brute-force protection by tracking failed authentication attempts per IP address in a failed_attempts HashMap, locking out addresses that exceed MAX_AUTH_ATTEMPTS.
+challenge.rs:
+
+The ChallengeManager is responsible for the cryptographic challenge-response flow.
+Workflow:
+generate_challenge is called for a new client. It creates a Challenge struct containing CHALLENGE_SIZE (32) bytes of random data and sets a short expiry time based on timeout.
+The client signs this random data with its Solana Ed25519 private key.
+verify_challenge is called with the client's signature. It first checks for challenge expiry and IP address match, then uses KeyManager::verify_signature to perform the cryptographic verification. Upon success, the challenge is removed from memory.
+acl.rs:
+
+The AccessControlManager and AccessControlList structs implement a fine-grained, file-based access control system from a JSON file.
+AccessControlEntry: This struct defines the rules for each client public key, allowing for control over is_allowed, bandwidth_limit, max_session_duration, and even the assignment of a static_ip.
+The system supports a default_policy ("allow" or "deny"), which is applied to any client not explicitly listed in the entries.
+2.3. Cryptography Module (src/crypto/)
+This module is the heart of the node's privacy features, containing all core cryptographic implementations.
+
+keys.rs:
+
+KeyManager: Manages the node's master Ed25519 keypair, used for signing challenges and participating in key exchanges. It loads the key from the path specified in server_key_file or generates a new one on first startup.
+ECDH Key Derivation: This module contains the critical logic for secure key exchange. The generate_shared_secret function implements the full ECDH flow using X25519. It correctly converts the Ed25519 keys to their Curve25519 counterparts (ed25519_private_to_x25519, ed25519_public_to_x25519) before performing the Diffie-Hellman exchange. The result is then passed through an HKDF using SHA-256 to produce the final, cryptographically strong shared secret.
+SecretKeyCache: To optimize performance, a cache is implemented to store recently computed shared secrets. This avoids the expensive ECDH computation for every client reconnect, using a Time-To-Live (TTL) mechanism to expire old entries.
+session.rs:
+
+SessionKeyManager: Manages symmetric session keys for every active client connection. These keys are used for encrypting the actual data traffic.
+Key Lifecycle: Each SessionKeyEntry tracks its created_at timestamp and usage_count. The should_rotate method checks if a key has exceeded its configured age (rotation_interval) or usage limit (max_key_usages), signaling the need for a key rotation event. The cleanup_old_sessions function periodically removes keys for inactive clients.
+flexible_encryption.rs & encryption.rs:
+
+EncryptionAlgorithm Enum: Defines the supported AEAD (Authenticated Encryption with Associated Data) algorithms: ChaCha20Poly1305 and Aes256Gcm. This allows the client and server to negotiate the strongest commonly-supported cipher.
+Unified Interface: encrypt_flexible and decrypt_flexible provide a single point of entry for all symmetric encryption operations, dispatching the call to the correct underlying implementation (encrypt_chacha20, encrypt_aes_gcm, etc.).
+Fallback Logic: The decryption function includes a fallback boolean parameter. If set to true, and decryption with the primary algorithm fails, it will attempt to use the other supported algorithm. This provides a robust mechanism for handling clients with different capabilities or configurations without dropping the connection.
+2.4. Application Protocol Module (src/protocol/)
+This module defines the "language" spoken between the client and the node.
+
+types.rs:
+
+PacketType Enum: This is the cornerstone of the protocol, defining every possible message exchanged between client and server. It uses Serde's tag = "type" feature, making the resulting JSON self-describing and easy to parse. Key packets include:
+Auth: Client initiates authentication with its public key and capabilities.
+Challenge: Server responds with data for the client to sign.
+ChallengeResponse: Client returns the signature.
+IpAssign: Upon success, the server assigns an IP and provides the encrypted session key.
+Data: Carries the actual end-to-end encrypted traffic.
+Ping/Pong: For connection keep-alive and latency measurement.
+DataEnvelope Struct: This struct is a key innovation. It is nested inside a Data packet's encrypted payload, allowing the application to multiplex different types of data over the same secure channel. The payload_type field can be Ip (for VPN packets) or Json (for application-level messages like chat or remote commands), making the protocol highly extensible.
+serialization.rs & validation.rs:
+
+These modules provide the logic for converting PacketType objects to and from WebSocket messages.
+Crucially, validate_message is called during both serialization and deserialization. This function enforces strict rules on all packet fields (e.g., checking public key format with StringValidator::is_valid_solana_pubkey, ensuring nonce length is correct), which hardens the server against malformed or malicious packets.
+2.5. Server Core Module (src/server/)
+This module contains the main operational logic of the node, managing connections, state, and data flow.
+
+core.rs:
+
+VpnServer Struct: The primary struct that orchestrates the entire server. Its new method is responsible for initializing and wiring together all manager components (AuthManager, SessionManager, KeyManager, etc.).
+ServerState Enum: Manages the server's lifecycle (Created, Starting, Running, ShuttingDown, Stopped), ensuring operations are only performed in appropriate states.
+Background Task Management: The start method launches several background tasks using tokio::spawn for periodic maintenance, such as cleaning up expired sessions, IP leases, and authentication challenges. The JoinHandles for these tasks are stored so they can be gracefully aborted during shutdown.
+client.rs:
+
+The handle_client function manages the entire lifecycle of a single client connection, from the initial TCP handshake through TLS negotiation, WebSocket upgrade, and finally the full authentication flow.
+process_client_session contains the main message loop for an authenticated client, handling Data, Ping, Disconnect, and other in-session packets.
+session.rs:
+
+ClientSession Struct: Represents the state of a connected client. A key design choice is wrapping the WebSocket sender (ws_sender) and receiver (ws_receiver) in an Arc<Mutex<>>. This allows different tasks to safely interact with the same client connection—for example, a dedicated heartbeat task can send Ping messages while the main task is awaiting incoming data.
+SessionManager: A thread-safe manager for all active ClientSessions, providing quick lookups by session ID or IP address.
+routing.rs:
+
+PacketRouter: The central traffic director.
+Outbound Traffic: route_outbound_packet takes an IP packet from the tun device, uses the destination IP to look up the correct ClientSession, encrypts the packet with that session's key, and sends it.
+Inbound Traffic: handle_inbound_packet showcases a robust, forward-compatible design. It first attempts to parse decrypted data as a DataEnvelope. If successful, it routes the payload based on its payload_type (to the TUN device for Ip, or to the chat handler for Json). If parsing fails, it gracefully falls back to assuming the entire payload is a legacy IP packet. This allows for protocol upgrades without breaking older clients.
+globals.rs & packet.rs:
+
+process_tun_packets runs as a dedicated task, forming the bridge between the OS's network stack and the application. It continuously reads raw IP packets from the TUN device and feeds them to the PacketRouter.
+To facilitate clean architecture and avoid prop-drilling, the project uses once_cell to create global static references to shared components like the TUN_DEVICE and SESSION_MANAGER, allowing modules to access them safely where needed.
+2.6. DePIN & Remote Management (src/registration.rs & src/remote_management.rs)
+These modules handle the node's interaction with the broader DePIN ecosystem.
+
+registration.rs:
+
+RegistrationManager: Manages the node's identity and communication with the central AeroNyx API.
+Hardware Fingerprinting: On setup, HardwareInfo::collect() gathers unique system identifiers, and generate_fingerprint() creates a stable hash to prevent a single physical machine from being registered as multiple nodes. This fingerprint is verified on every startup.
+WebSocket Link: After registration, the manager establishes a persistent WebSocket connection to the API server. It handles authentication using the node's reference_code and sends periodic Heartbeat messages containing performance metrics. This link is also used to receive commands for remote management.
+remote_management.rs:
+
+RemoteManagementHandler: Processes commands received over the authenticated WebSocket channel.
+Secure by Design: The handler is built with a security-first approach:
+Command Whitelist: Only a predefined list of safe commands (ls, ps, df, etc.) can be executed via ExecuteCommand.
+Path Restriction: All file system operations are sandboxed to specific directories (/home, /tmp, /var/log) via the is_path_allowed check.
+Resource Limits: Operations like ReadFile have a built-in max file size to prevent DoS attacks.
+2.7. Deployment & Operations
+The repository is well-equipped for production deployments.
+
+main.rs: The application entry point cleanly separates logic based on the --mode flag, routing to run_depin_only or run_with_vpn as appropriate.
+setup.rs: Provides a comprehensive, interactive setup experience that guides the user through configuration, certificate generation, and system optimization.
+Containerization: The Dockerfile, docker-compose.yml, and docker-entrypoint.sh provide a robust, production-ready container setup. The entrypoint script correctly handles creating the /dev/net/tun device and configuring IP forwarding inside the container.
+Deployment Script: The scripts/optimize_deploy.sh script automates best practices for deploying on a bare-metal Linux server, including kernel parameter tuning (sysctl), setting file descriptor limits, configuring the UFW firewall, and creating a systemd service with security hardening options (PrivateTmp, ProtectSystem, NoNewPrivileges).
 
 Additional Notes
 
