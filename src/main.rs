@@ -274,20 +274,45 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
             
             // Test WebSocket connection
             info!("Testing WebSocket connection...");
-            match reg_manager.start_websocket_connection(
-                response.node.reference_code.clone(),
-                Some(registration_code.to_string())
-            ).await {
-                Ok(_) => info!("WebSocket connection test successful"),
-                Err(e) => warn!("WebSocket connection test failed: {}", e),
+            let test_duration = tokio::time::Duration::from_secs(5);
+            let ws_test = tokio::time::timeout(
+                test_duration,
+                reg_manager.start_websocket_connection(
+                    response.node.reference_code.clone(),
+                    Some(registration_code.to_string())
+                )
+            ).await;
+            
+            match ws_test {
+                Ok(Ok(_)) => info!("WebSocket connection test completed successfully"),
+                Ok(Err(e)) => warn!("WebSocket connection test failed: {}", e),
+                Err(_) => info!("WebSocket connection test completed (timeout)"),
             }
+            
+            info!("\n================================================================================");
+            info!("Registration completed successfully! Your node is now registered.");
+            info!("================================================================================");
             
             info!("\nNext steps:");
             for (i, step) in response.next_steps.iter().enumerate() {
                 info!("  {}. {}", i + 1, step);
             }
             
-            info!("\nRegistration completed successfully! You can now start the node normally.");
+            info!("\nTo start your node, use one of the following commands:");
+            info!("");
+            info!("  For DePIN-only mode (recommended for compute nodes):");
+            info!("    {} --mode depin-only", env!("CARGO_PKG_NAME"));
+            info!("");
+            info!("  For VPN-only mode (requires root and certificates):");
+            info!("    sudo {} --mode vpn-enabled --cert-file <cert> --key-file <key>", env!("CARGO_PKG_NAME"));
+            info!("");
+            info!("  For Hybrid mode (both DePIN and VPN):");
+            info!("    sudo {} --mode hybrid --cert-file <cert> --key-file <key>", env!("CARGO_PKG_NAME"));
+            info!("");
+            info!("  To enable remote management, add: --enable-remote-management");
+            info!("");
+            info!("Your reference code: {}", response.node.reference_code);
+            info!("================================================================================");
         }
         Err(e) => {
             error!("Registration failed: {}", e);
