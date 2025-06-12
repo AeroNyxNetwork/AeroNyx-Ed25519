@@ -348,9 +348,12 @@ impl RegistrationManager {
         
         info!("Connecting to WebSocket: {}", ws_url);
 
+        // For registration setup, only do a single connection attempt
+        let is_setup_mode = self.registration_code.is_some();
+        let max_retries = if is_setup_mode { 1 } else { 5 };
+        
         // Connect with retry logic
         let mut retry_count = 0;
-        let max_retries = 5;
         
         loop {
             match self.connect_and_run_websocket(&ws_url).await {
@@ -363,7 +366,12 @@ impl RegistrationManager {
                     retry_count += 1;
                     
                     if retry_count >= max_retries {
-                        return Err(format!("Failed to establish WebSocket connection after {} attempts", max_retries));
+                        if is_setup_mode {
+                            // During setup, this is not critical
+                            return Ok(());
+                        } else {
+                            return Err(format!("Failed to establish WebSocket connection after {} attempts", max_retries));
+                        }
                     }
                     
                     let backoff = Duration::from_secs(2u64.pow(retry_count));
@@ -433,6 +441,12 @@ impl RegistrationManager {
                                         // Get heartbeat interval from server
                                         if let Some(interval_secs) = json.get("heartbeat_interval").and_then(|v| v.as_u64()) {
                                             heartbeat_interval = time::interval(Duration::from_secs(interval_secs));
+                                        }
+                                        
+                                        // If this is a setup/registration test, close after successful auth
+                                        if self.registration_code.is_some() {
+                                            info!("Registration test successful, closing connection");
+                                            break;
                                         }
                                     }
                                     
