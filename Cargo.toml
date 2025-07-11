@@ -80,6 +80,9 @@ bytes = "1.4"
 crossbeam-channel = "0.5"
 # Network interface enumeration
 pnet = "0.34"
+# Added missing dependencies
+flate2 = "1.0"
+tokio-stream = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.26", features = ["user"] }
