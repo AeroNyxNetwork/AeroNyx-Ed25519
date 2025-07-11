@@ -18,6 +18,7 @@ use tokio::io::AsyncReadExt;
 use tracing::{info, warn};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use futures::future::BoxFuture;
 
 // Add missing import for Unix permissions
 #[cfg(unix)]
@@ -470,82 +471,84 @@ impl RemoteManagementHandler {
     }
     
     /// Recursively list directory contents
-    async fn list_directory_recursive(
-        &self,
-        path: &Path,
+    fn list_directory_recursive<'a>(
+        &'a self,
+        path: &'a Path,
         recursive: bool,
         include_hidden: bool,
         depth: u32,
-    ) -> Result<Vec<serde_json::Value>, String> {
-        // Limit recursion depth
-        if depth > 5 {
-            return Ok(vec![]);
-        }
-        
-        let mut entries = Vec::new();
-        let mut dir_stream = fs::read_dir(path).await
-            .map_err(|e| format!("Failed to read directory: {}", e))?;
-        
-        while let Ok(Some(entry)) = dir_stream.next_entry().await {
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            
-            // Skip hidden files if requested
-            if !include_hidden && file_name.starts_with('.') {
-                continue;
+    ) -> futures::future::BoxFuture<'a, Result<Vec<serde_json::Value>, String>> {
+        Box::pin(async move {
+            // Limit recursion depth
+            if depth > 5 {
+                return Ok(vec![]);
             }
             
-            if let Ok(metadata) = entry.metadata().await {
-                let mut entry_info = serde_json::json!({
-                    "name": file_name,
-                    "path": entry.path().to_string_lossy(),
-                    "is_dir": metadata.is_dir(),
-                    "is_file": metadata.is_file(),
-                    "size": metadata.len(),
-                    "modified": metadata.modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs()),
-                });
+            let mut entries = Vec::new();
+            let mut dir_stream = fs::read_dir(path).await
+                .map_err(|e| format!("Failed to read directory: {}", e))?;
+            
+            while let Ok(Some(entry)) = dir_stream.next_entry().await {
+                let file_name = entry.file_name().to_string_lossy().to_string();
                 
-                // Add permissions on Unix systems
-                #[cfg(unix)]
-                {
-                    entry_info["permissions"] = serde_json::json!(
-                        format!("{:o}", metadata.permissions().mode() & 0o777)
-                    );
+                // Skip hidden files if requested
+                if !include_hidden && file_name.starts_with('.') {
+                    continue;
                 }
                 
-                // Add children for directories if recursive
-                if recursive && metadata.is_dir() {
-                    if let Ok(children) = self.list_directory_recursive(
-                        &entry.path(),
-                        recursive,
-                        include_hidden,
-                        depth + 1
-                    ).await {
-                        entry_info["children"] = serde_json::json!(children);
+                if let Ok(metadata) = entry.metadata().await {
+                    let mut entry_info = serde_json::json!({
+                        "name": file_name,
+                        "path": entry.path().to_string_lossy(),
+                        "is_dir": metadata.is_dir(),
+                        "is_file": metadata.is_file(),
+                        "size": metadata.len(),
+                        "modified": metadata.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs()),
+                    });
+                    
+                    // Add permissions on Unix systems
+                    #[cfg(unix)]
+                    {
+                        entry_info["permissions"] = serde_json::json!(
+                            format!("{:o}", metadata.permissions().mode() & 0o777)
+                        );
                     }
+                    
+                    // Add children for directories if recursive
+                    if recursive && metadata.is_dir() {
+                        if let Ok(children) = self.list_directory_recursive(
+                            &entry.path(),
+                            recursive,
+                            include_hidden,
+                            depth + 1
+                        ).await {
+                            entry_info["children"] = serde_json::json!(children);
+                        }
+                    }
+                    
+                    entries.push(entry_info);
                 }
-                
-                entries.push(entry_info);
             }
-        }
-        
-        // Sort entries: directories first, then by name
-        entries.sort_by(|a, b| {
-            let a_is_dir = a["is_dir"].as_bool().unwrap_or(false);
-            let b_is_dir = b["is_dir"].as_bool().unwrap_or(false);
-            let a_name = a["name"].as_str().unwrap_or("");
-            let b_name = b["name"].as_str().unwrap_or("");
             
-            match (a_is_dir, b_is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a_name.cmp(b_name),
-            }
-        });
-        
-        Ok(entries)
+            // Sort entries: directories first, then by name
+            entries.sort_by(|a, b| {
+                let a_is_dir = a["is_dir"].as_bool().unwrap_or(false);
+                let b_is_dir = b["is_dir"].as_bool().unwrap_or(false);
+                let a_name = a["name"].as_str().unwrap_or("");
+                let b_name = b["name"].as_str().unwrap_or("");
+                
+                match (a_is_dir, b_is_dir) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a_name.cmp(b_name),
+                }
+            });
+            
+            Ok(entries)
+        })
     }
     
     /// Read file content
@@ -1149,8 +1152,11 @@ impl RemoteManagementHandler {
             }
         }
         
+        // Clone sort_by before using it in closure to avoid partial move
+        let sort_by_clone = sort_by.clone();
+        
         // Sort if requested
-        if let Some(sort_field) = sort_by {
+        if let Some(sort_field) = sort_by_clone {
             processes.sort_by(|a, b| {
                 match sort_field.as_str() {
                     "cpu" => {
