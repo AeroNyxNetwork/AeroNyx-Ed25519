@@ -15,9 +15,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// Add missing import for Unix permissions
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// Remote command types supported by the management interface
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -501,8 +505,15 @@ impl RemoteManagementHandler {
                         .ok()
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs()),
-                    "permissions": format!("{:o}", metadata.permissions().mode() & 0o777),
                 });
+                
+                // Add permissions on Unix systems
+                #[cfg(unix)]
+                {
+                    entry_info["permissions"] = serde_json::json!(
+                        format!("{:o}", metadata.permissions().mode() & 0o777)
+                    );
+                }
                 
                 // Add children for directories if recursive
                 if recursive && metadata.is_dir() {
@@ -604,7 +615,8 @@ impl RemoteManagementHandler {
                         "offset": offset.unwrap_or(0),
                     })
                 } else {
-                    match String::from_utf8(content) {
+                    // Clone content before moving it
+                    match String::from_utf8(content.clone()) {
                         Ok(text) => serde_json::json!({
                             "content": text,
                             "encoding": "utf8",
@@ -834,12 +846,14 @@ impl RemoteManagementHandler {
         
         let start_time = std::time::Instant::now();
         
+        // Spawn command (sync)
+        let output_result = cmd.output();
+        
         match tokio::time::timeout(timeout, async {
-            cmd.spawn()
-                .map_err(|e| format!("Failed to spawn command: {}", e))?
-                .wait_with_output()
+            tokio::task::spawn_blocking(move || output_result)
                 .await
-                .map_err(|e| format!("Failed to execute command: {}", e))
+                .map_err(|e| format!("Failed to execute command: {}", e))?
+                .map_err(|e| format!("Command execution failed: {}", e))
         }).await {
             Ok(Ok(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -915,7 +929,7 @@ impl RemoteManagementHandler {
         // Process count (if requested)
         if include_processes {
             if let Ok(proc_count) = self.get_process_count().await {
-                info["process_count"] = proc_count;
+                info["process_count"] = proc_count.into();
             }
         }
         
@@ -1016,31 +1030,26 @@ impl RemoteManagementHandler {
         
         #[cfg(target_os = "linux")]
         {
-            if let Ok(entries) = fs::read_dir("/sys/class/net").await {
-                let mut stream = tokio_stream::wrappers::ReadDirStream::new(entries);
-                use futures_util::StreamExt;
-                
-                while let Some(entry) = stream.next().await {
-                    if let Ok(entry) = entry {
-                        let if_name = entry.file_name().to_string_lossy().to_string();
-                        let mut if_info = serde_json::json!({
-                            "name": if_name,
-                        });
-                        
-                        // Try to read interface state
-                        let state_path = entry.path().join("operstate");
-                        if let Ok(state) = fs::read_to_string(state_path).await {
-                            if_info["state"] = serde_json::Value::String(state.trim().to_string());
-                        }
-                        
-                        // Try to read MAC address
-                        let addr_path = entry.path().join("address");
-                        if let Ok(addr) = fs::read_to_string(addr_path).await {
-                            if_info["mac_address"] = serde_json::Value::String(addr.trim().to_string());
-                        }
-                        
-                        interfaces.push(if_info);
+            if let Ok(mut entries) = fs::read_dir("/sys/class/net").await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let if_name = entry.file_name().to_string_lossy().to_string();
+                    let mut if_info = serde_json::json!({
+                        "name": if_name,
+                    });
+                    
+                    // Try to read interface state
+                    let state_path = entry.path().join("operstate");
+                    if let Ok(state) = fs::read_to_string(state_path).await {
+                        if_info["state"] = serde_json::Value::String(state.trim().to_string());
                     }
+                    
+                    // Try to read MAC address
+                    let addr_path = entry.path().join("address");
+                    if let Ok(addr) = fs::read_to_string(addr_path).await {
+                        if_info["mac_address"] = serde_json::Value::String(addr.trim().to_string());
+                    }
+                    
+                    interfaces.push(if_info);
                 }
             }
         }
@@ -1054,19 +1063,14 @@ impl RemoteManagementHandler {
     async fn get_process_count(&self) -> Result<u32, String> {
         #[cfg(target_os = "linux")]
         {
-            if let Ok(entries) = fs::read_dir("/proc").await {
-                let mut stream = tokio_stream::wrappers::ReadDirStream::new(entries);
-                use futures_util::StreamExt;
-                
+            if let Ok(mut entries) = fs::read_dir("/proc").await {
                 let mut count = 0;
-                while let Some(entry) = stream.next().await {
-                    if let Ok(entry) = entry {
-                        if entry.file_name()
-                            .to_str()
-                            .map(|name| name.chars().all(|c| c.is_digit(10)))
-                            .unwrap_or(false) {
-                            count += 1;
-                        }
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    if entry.file_name()
+                        .to_str()
+                        .map(|name| name.chars().all(|c| c.is_digit(10)))
+                        .unwrap_or(false) {
+                        count += 1;
                     }
                 }
                 
@@ -1080,13 +1084,12 @@ impl RemoteManagementHandler {
     /// Get process list with optional filtering
     async fn get_process_list(&self, filter: Option<String>, sort_by: Option<String>) -> CommandResponse {
         // Use ps command for process listing
-        let mut args = vec!["aux".to_string()];
+        let args = vec!["aux".to_string()];
         
-        // Execute ps command
+        // Execute ps command (sync)
         let output = match Command::new("ps")
             .args(&args)
-            .output()
-            .await {
+            .output() {
             Ok(output) => output,
             Err(e) => {
                 return CommandResponse {
@@ -1113,9 +1116,6 @@ impl RemoteManagementHandler {
         }
         
         // Parse ps output
-        let header = lines[0];
-        let header_parts: Vec<&str> = header.split_whitespace().collect();
-        
         let mut processes = Vec::new();
         
         for line in lines.iter().skip(1) {
@@ -1434,47 +1434,48 @@ impl RemoteManagementHandler {
         
         args.push("--no-pager".to_string());
         
-        // Execute journalctl
-        match Command::new("journalctl")
+        // Execute journalctl (sync)
+        let output = match Command::new("journalctl")
             .args(&args)
-            .output()
-            .await {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                
-                if output.status.success() {
-                    // Parse log lines
-                    let log_lines: Vec<&str> = stdout.lines().collect();
-                    
-                    CommandResponse {
-                        success: true,
-                        message: format!("Retrieved {} log lines", log_lines.len()),
-                        data: Some(serde_json::json!({
-                            "service": service_name,
-                            "logs": log_lines,
-                            "line_count": log_lines.len(),
-                        })),
-                        error_code: None,
-                        execution_time_ms: None,
-                    }
-                } else {
-                    CommandResponse {
-                        success: false,
-                        message: format!("Failed to get logs: {}", stderr),
-                        data: None,
-                        error_code: Some("LOGS_ERROR".to_string()),
-                        execution_time_ms: None,
-                    }
-                }
+            .output() {
+            Ok(output) => output,
+            Err(e) => {
+                return CommandResponse {
+                    success: false,
+                    message: format!("Failed to execute journalctl: {}", e),
+                    data: None,
+                    error_code: Some("COMMAND_ERROR".to_string()),
+                    execution_time_ms: None,
+                };
             }
-            Err(e) => CommandResponse {
-                success: false,
-                message: format!("Failed to execute journalctl: {}", e),
-                data: None,
-                error_code: Some("COMMAND_ERROR".to_string()),
+        };
+        
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        
+        if output.status.success() {
+            // Parse log lines
+            let log_lines: Vec<&str> = stdout.lines().collect();
+            
+            CommandResponse {
+                success: true,
+                message: format!("Retrieved {} log lines", log_lines.len()),
+                data: Some(serde_json::json!({
+                    "service": service_name,
+                    "logs": log_lines,
+                    "line_count": log_lines.len(),
+                })),
+                error_code: None,
                 execution_time_ms: None,
-            },
+            }
+        } else {
+            CommandResponse {
+                success: false,
+                message: format!("Failed to get logs: {}", stderr),
+                data: None,
+                error_code: Some("LOGS_ERROR".to_string()),
+                execution_time_ms: None,
+            }
         }
     }
     
@@ -1510,43 +1511,44 @@ impl RemoteManagementHandler {
         
         let action = if force { "restart" } else { "reload" };
         
-        // Execute systemctl
-        match Command::new("systemctl")
+        // Execute systemctl (sync)
+        let output = match Command::new("systemctl")
             .args(&[action, service_name])
-            .output()
-            .await {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("Service {} {}ed successfully", service_name, action);
-                    
-                    CommandResponse {
-                        success: true,
-                        message: format!("Service {} {}ed successfully", service_name, action),
-                        data: Some(serde_json::json!({
-                            "service": service_name,
-                            "action": action,
-                        })),
-                        error_code: None,
-                        execution_time_ms: None,
-                    }
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    CommandResponse {
-                        success: false,
-                        message: format!("Failed to {} service: {}", action, stderr),
-                        data: None,
-                        error_code: Some("SERVICE_ERROR".to_string()),
-                        execution_time_ms: None,
-                    }
-                }
+            .output() {
+            Ok(output) => output,
+            Err(e) => {
+                return CommandResponse {
+                    success: false,
+                    message: format!("Failed to execute systemctl: {}", e),
+                    data: None,
+                    error_code: Some("COMMAND_ERROR".to_string()),
+                    execution_time_ms: None,
+                };
             }
-            Err(e) => CommandResponse {
-                success: false,
-                message: format!("Failed to execute systemctl: {}", e),
-                data: None,
-                error_code: Some("COMMAND_ERROR".to_string()),
+        };
+        
+        if output.status.success() {
+            info!("Service {} {}ed successfully", service_name, action);
+            
+            CommandResponse {
+                success: true,
+                message: format!("Service {} {}ed successfully", service_name, action),
+                data: Some(serde_json::json!({
+                    "service": service_name,
+                    "action": action,
+                })),
+                error_code: None,
                 execution_time_ms: None,
-            },
+            }
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            CommandResponse {
+                success: false,
+                message: format!("Failed to {} service: {}", action, stderr),
+                data: None,
+                error_code: Some("SERVICE_ERROR".to_string()),
+                execution_time_ms: None,
+            }
         }
     }
     
@@ -1555,7 +1557,7 @@ impl RemoteManagementHandler {
         &self,
         config_section: &str,
         values: HashMap<String, serde_json::Value>,
-        restart_required: bool,
+        _restart_required: bool,
     ) -> CommandResponse {
         // This is a placeholder for future configuration management
         warn!("Configuration update requested for section: {}", config_section);
