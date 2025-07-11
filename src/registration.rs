@@ -899,6 +899,8 @@ impl RegistrationManager {
                                 success: false,
                                 message: "Remote management is disabled".to_string(),
                                 data: None,
+                                error_code: Some("REMOTE_MANAGEMENT_DISABLED".to_string()),
+                                execution_time_ms: None,
                             };
                             
                             let response_msg = WebSocketMessage::CommandResponse {
@@ -992,6 +994,8 @@ impl RegistrationManager {
                             success: false,
                             message: "Command execution timed out".to_string(),
                             data: None,
+                            error_code: Some("TIMEOUT".to_string()),
+                            execution_time_ms: None,
                         }
                     };
                     
@@ -1015,6 +1019,8 @@ impl RegistrationManager {
                         success: false,
                         message: format!("Invalid command format: {}", e),
                         data: None,
+                        error_code: Some("INVALID_COMMAND".to_string()),
+                        execution_time_ms: None,
                     };
                     
                     let response_msg = WebSocketMessage::CommandResponse {
