@@ -468,6 +468,8 @@ impl ServerConfig {
                 NodeMode::VPNEnabled => "vpn",
                 NodeMode::Hybrid => "hybrid",
             }.to_string(),
+            version: 2,
+            hardware_components: None,
         };
         
         // Save to a file in the data directory
