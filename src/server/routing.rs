@@ -515,7 +515,7 @@ async fn handle_delete_chat_request(
     async fn process_ip_payload(
         &self,
         payload: serde_json::Value,
-        session: &ClientSession,
+        _session: &ClientSession,
     ) -> Result<usize, RoutingError> {
         // Extract Base64 string from the payload
         let base64_ip = payload.as_str()
