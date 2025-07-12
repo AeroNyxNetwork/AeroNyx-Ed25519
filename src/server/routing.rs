@@ -745,7 +745,7 @@ async fn handle_delete_chat_request(
     async fn handle_webrtc_signal(
         &self,
         payload: serde_json::Value,
-        session: &ClientSession,
+        _session: &ClientSession,
     ) -> Result<(), RoutingError> {
         // Extract required fields
         let peer_id = payload.get("peerId")
