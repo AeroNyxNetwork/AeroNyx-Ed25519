@@ -572,9 +572,22 @@ impl RegistrationManager {
     }
 
     /// Create a deterministic serialization for ZKP circuit input
+    
+/// Create a deterministic serialization for ZKP circuit input
     pub fn to_zkp_bytes(&self) -> Result<Vec<u8>, String> {
-        // Use the commitment generation method which already handles serialization
-        Ok(self.generate_zkp_commitment())
+        // Load the stored registration data to get the commitment
+        let reg_data = self.load_registration_file()
+            .map_err(|e| format!("Failed to load registration data: {}", e))?;
+        
+        // Get the stored commitment
+        let commitment_hex = reg_data.hardware_commitment
+            .ok_or("No hardware commitment found in registration")?;
+        
+        // Decode the hex commitment
+        let commitment = hex::decode(&commitment_hex)
+            .map_err(|e| format!("Invalid commitment format: {}", e))?;
+        
+        Ok(commitment)
     }
 
     /// Generate and store hardware commitment during registration
