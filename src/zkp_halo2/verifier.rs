@@ -1,16 +1,12 @@
 use tracing::{info, debug};
 use halo2_proofs::{
-    plonk::{verify_proof, keygen_vk},
-    poly::{
-        commitment::Params,
-        ipa::{
-            commitment::{IPACommitmentScheme, ParamsIPA},
-            multiopen::VerifierIPA,
-            strategy::SingleStrategy,
-        },
-        VerificationStrategy,
+    plonk::{verify_proof, keygen_vk, VerificationStrategy},
+    poly::kzg::{
+        commitment::{KZGCommitmentScheme, ParamsKZG},
+        multiopen::VerifierGWC,
+        strategy::SingleStrategy,
     },
-    transcript::{Blake2bRead, Challenge255, TranscriptRead},
+    transcript::{Blake2bRead, Challenge255, TranscriptReadBuffer},
 };
 use pasta_curves::{pallas, vesta};
 use ff::PrimeField;
@@ -74,15 +70,14 @@ impl HardwareVerifier {
         proof: &Proof,
         commitment: &[u8],
     ) -> Result<bool, String> {
-        // Regenerate params from k
-        let k: u32 = bincode::deserialize(&self.params.srs)
-            .map_err(|e| format!("Failed to deserialize k: {}", e))?;
-        let params = ParamsIPA::<vesta::Affine>::new(k);
+        use halo2_proofs::poly::commitment::Params;
         
-        // Generate verification key (we need to recreate it)
-        let empty_circuit = CpuCircuit::default();
-        let vk = keygen_vk(&params, &empty_circuit)
-            .map_err(|e| format!("Failed to generate vk: {:?}", e))?;
+        // Deserialize parameters
+        let params: ParamsKZG<vesta::Affine> = bincode::deserialize(&self.params.srs)
+            .map_err(|e| format!("Failed to deserialize params: {}", e))?;
+        
+        let vk = bincode::deserialize(&self.params.verifying_key)
+            .map_err(|e| format!("Failed to deserialize vk: {}", e))?;
         
         // Convert commitment to field element
         let commitment_field = self.commitment_to_field_element(commitment)?;
@@ -93,13 +88,12 @@ impl HardwareVerifier {
         // Create verification strategy
         let strategy = SingleStrategy::new(&params);
         
-        // Verify the proof
+        // Verify the proof (4 type parameters for verify_proof in halo2_proofs 0.3.0)
         let result = verify_proof::<
-            IPACommitmentScheme<vesta::Affine>,
-            VerifierIPA<vesta::Affine>,
+            KZGCommitmentScheme<vesta::Affine>,
+            VerifierGWC<vesta::Affine>,
             Challenge255<vesta::Affine>,
             Blake2bRead<_, _, Challenge255<_>>,
-            SingleStrategy<vesta::Affine>,
         >(
             &params,
             &vk,
