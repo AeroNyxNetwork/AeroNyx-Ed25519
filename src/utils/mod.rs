@@ -35,7 +35,7 @@ pub fn random_string(length: usize) -> String {
 
 /// Generate a random delay for jitter
 pub fn random_jitter(max_ms: u64) -> Duration {
-    let millis = thread_rng().gen_range(0, max_ms);
+    let millis = thread_rng().gen_range(0..max_ms);
     Duration::from_millis(millis)
 }
 
