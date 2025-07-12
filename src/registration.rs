@@ -603,13 +603,13 @@ impl RegistrationManager {
     ) -> Result<Vec<u8>, String> {
         info!("Generating hardware commitment for ZKP");
         
+        // Use the hardware info's method to generate commitment
         let commitment = hardware_info.generate_zkp_commitment();
         let commitment_hex = hex::encode(&commitment);
         
-        info!("Hardware commitment generated: {}...", &commitment_hex[..16]);
+        info!("Hardware commitment generated: {}...", &commitment_hex[..16.min(commitment_hex.len())]);
         Ok(commitment)
     }
-
     /// Save registration data locally with enhanced hardware tracking
     fn save_registration_data(&self, node_info: &NodeInfo, hw_info: &HardwareInfo) -> Result<(), String> {
         let hardware_components = Self::extract_hardware_components(hw_info);
