@@ -35,7 +35,7 @@ pub fn random_string(length: usize) -> String {
 
 /// Generate a random delay for jitter
 pub fn random_jitter(max_ms: u64) -> Duration {
-    let millis = thread_rng().gen_range(0..max_ms);
+    let millis = thread_rng().gen_range(0, max_ms);
     Duration::from_millis(millis)
 }
 
@@ -51,7 +51,7 @@ pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, hex::FromHexError> {
 
 /// Generate random padding bytes
 pub fn generate_padding(min_size: usize, max_size: usize) -> Vec<u8> {
-    let size = thread_rng().gen_range(min_size..=max_size);
+    let size = thread_rng().gen_range(min_size, max_size + 1);
     let mut padding = vec![0u8; size];
     thread_rng().fill(&mut padding[..]);
     padding
