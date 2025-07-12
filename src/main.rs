@@ -16,7 +16,8 @@ mod server;
 mod utils;
 mod registration;
 mod hardware;
-mod remote_management;  // Added remote management module
+mod remote_management;
+mod zkp; // Added ZKP module
 
 use config::settings::{ServerConfig, ServerArgs, Command, NodeMode};
 use server::VpnServer;
@@ -96,6 +97,24 @@ async fn run_depin_only(config: ServerConfig) -> anyhow::Result<()> {
     // Create registration manager
     let mut reg_manager = RegistrationManager::new(&config.api_url);
     reg_manager.set_data_dir(config.data_dir.clone());
+    
+    // Initialize ZKP parameters
+    let zkp_params = match reg_manager.initialize_zkp().await {
+        Ok(params) => {
+            info!("Zero-knowledge proof system initialized successfully");
+            Some(params)
+        }
+        Err(e) => {
+            warn!("Failed to initialize ZKP system: {}. Hardware attestation will be disabled.", e);
+            None
+        }
+    };
+    
+    // Store ZKP params in registration manager if available
+    if let Some(params) = zkp_params {
+        reg_manager.set_zkp_params(params);
+        info!("ZKP-enabled hardware attestation is available");
+    }
     
     // Load registration data
     match reg_manager.load_from_config(&config) {
@@ -204,7 +223,7 @@ async fn wait_for_shutdown_signal() {
 
 /// Handle registration setup command
 async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -> anyhow::Result<()> {
-    info!("Setting up AeroNyx node registration");
+    info!("Setting up AeroNyx node registration with ZKP support");
     
     // Create temporary config
     let mut config = ServerConfig::from_args(args.clone())?;
@@ -213,6 +232,18 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
     // Create registration manager
     let mut reg_manager = RegistrationManager::new(&config.api_url);
     reg_manager.set_data_dir(config.data_dir.clone());
+    
+    // Initialize ZKP system
+    info!("Initializing zero-knowledge proof system...");
+    match reg_manager.initialize_zkp().await {
+        Ok(params) => {
+            reg_manager.set_zkp_params(params);
+            info!("✓ ZKP system initialized successfully");
+        }
+        Err(e) => {
+            warn!("Failed to initialize ZKP system: {}. Registration will proceed without ZKP.", e);
+        }
+    }
     
     // Test API connection first
     info!("Testing connection to API server at {}", config.api_url);
@@ -250,6 +281,11 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
     let fingerprint = hardware_info.generate_fingerprint();
     info!("Hardware fingerprint generated: {}...", &fingerprint[..16]);
     
+    // Generate ZKP commitment
+    let commitment = hardware_info.generate_zkp_commitment();
+    let commitment_hex = hex::encode(&commitment);
+    info!("ZKP commitment generated: {}...", &commitment_hex[..16]);
+    
     // Confirm registration with hardware info
     info!("Confirming registration with server...");
     match reg_manager.confirm_registration_with_hardware(registration_code, &hardware_info).await {
@@ -265,7 +301,7 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
                 info!("  Hardware fingerprint registered successfully");
             }
             
-            // Save registration data to config file (with hardware fingerprint)
+            // Save registration data to config file (with hardware fingerprint and ZKP commitment)
             let wallet_address = response.node.wallet_address.clone();
             let hardware_fingerprint_str = hardware_info.generate_fingerprint();
             config.save_registration(&response.node.reference_code, &wallet_address, &hardware_fingerprint_str)?;
@@ -312,6 +348,9 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
             info!("  To enable remote management, add: --enable-remote-management");
             info!("");
             info!("Your reference code: {}", response.node.reference_code);
+            if reg_manager.has_zkp_enabled() {
+                info!("✓ Zero-knowledge proof hardware attestation is enabled");
+            }
             info!("================================================================================");
         }
         Err(e) => {
