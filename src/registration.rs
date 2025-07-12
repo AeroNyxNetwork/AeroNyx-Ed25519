@@ -29,6 +29,7 @@ use crate::server::metrics::ServerMetricsCollector;
 use crate::utils;
 use crate::hardware::HardwareInfo;
 use crate::remote_management::{RemoteCommand, RemoteManagementHandler, CommandResponse};
+use crate::zkp::{generate_hardware_proof, verify_hardware_proof, SetupParams, Proof};
 
 /// Generic API response wrapper
 #[derive(Debug, Deserialize, Serialize)]
@@ -117,6 +118,21 @@ pub enum WebSocketMessage {
         changed_components: Vec<String>,
         reason: String,
     },
+    
+    /// Request for hardware attestation proof
+    #[serde(rename = "hardware_attestation_request")]
+    HardwareAttestationRequest {
+        challenge: Vec<u8>,
+        nonce: String,
+    },
+    
+    /// Hardware attestation proof response
+    #[serde(rename = "hardware_attestation_proof")]
+    HardwareAttestationProof {
+        commitment: String,
+        proof: Vec<u8>,
+        nonce: String,
+    },
 }
 
 /// System metrics included in heartbeat messages
@@ -144,6 +160,9 @@ pub struct StoredRegistration {
     pub version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hardware_components: Option<HardwareComponents>,
+    /// Zero-knowledge proof commitment (added for ZKP)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware_commitment: Option<String>,
 }
 
 /// Individual hardware components for granular tracking
@@ -209,6 +228,8 @@ pub struct RegistrationManager {
     remote_handler: Arc<RemoteManagementHandler>,
     /// Hardware tolerance configuration
     tolerance_config: HardwareToleranceConfig,
+    /// ZKP setup parameters
+    zkp_params: Option<Arc<SetupParams>>,
 }
 
 impl RegistrationManager {
@@ -240,7 +261,24 @@ impl RegistrationManager {
             remote_management_enabled: Arc::new(RwLock::new(false)),
             remote_handler: Arc::new(RemoteManagementHandler::new()),
             tolerance_config: HardwareToleranceConfig::default(),
+            zkp_params: None,
         }
+    }
+
+    /// Initialize ZKP parameters (call this during startup)
+    pub async fn initialize_zkp(&self) -> Result<SetupParams, String> {
+        info!("Initializing zero-knowledge proof parameters");
+        crate::zkp::initialize().await
+    }
+
+    /// Set ZKP parameters
+    pub fn set_zkp_params(&mut self, params: SetupParams) {
+        self.zkp_params = Some(Arc::new(params));
+    }
+
+    /// Check if ZKP is enabled
+    pub fn has_zkp_enabled(&self) -> bool {
+        self.zkp_params.is_some()
     }
 
     /// Set hardware tolerance configuration
@@ -290,6 +328,10 @@ impl RegistrationManager {
                             self.wallet_address = Some(stored_reg.wallet_address.clone());
                             self.hardware_fingerprint = Some(stored_reg.hardware_fingerprint.clone());
                             self.hardware_components = stored_reg.hardware_components.clone();
+                            
+                            if let Some(commitment) = stored_reg.hardware_commitment {
+                                info!("ZKP commitment found: {}...", &commitment[..16.min(commitment.len())]);
+                            }
                             
                             return Ok(true);
                         }
@@ -529,10 +571,28 @@ impl RegistrationManager {
         }
     }
 
+    /// Generate and store hardware commitment during registration
+    pub async fn generate_hardware_commitment(
+        &mut self,
+        hardware_info: &HardwareInfo,
+    ) -> Result<Vec<u8>, String> {
+        info!("Generating hardware commitment for ZKP");
+        
+        let commitment = hardware_info.generate_zkp_commitment();
+        let commitment_hex = hex::encode(&commitment);
+        
+        info!("Hardware commitment generated: {}...", &commitment_hex[..16]);
+        Ok(commitment)
+    }
+
     /// Save registration data locally with enhanced hardware tracking
     fn save_registration_data(&self, node_info: &NodeInfo, hw_info: &HardwareInfo) -> Result<(), String> {
         let hardware_components = Self::extract_hardware_components(hw_info);
         let hardware_fingerprint = hw_info.generate_fingerprint();
+        
+        // Generate ZKP commitment
+        let commitment = hw_info.generate_zkp_commitment();
+        let commitment_hex = hex::encode(&commitment);
         
         let stored_reg = StoredRegistration {
             reference_code: node_info.reference_code.clone(),
@@ -542,6 +602,7 @@ impl RegistrationManager {
             node_type: node_info.node_type.clone(),
             version: 2, // Registration format version
             hardware_components: Some(hardware_components),
+            hardware_commitment: Some(commitment_hex),
         };
         
         // Ensure data directory exists
@@ -570,10 +631,16 @@ impl RegistrationManager {
         registration_code: &str,
         hardware_info: &HardwareInfo,
     ) -> Result<RegistrationConfirmResponse, String> {
-        info!("Confirming node registration with hardware fingerprint");
+        info!("Confirming node registration with hardware fingerprint and ZKP commitment");
 
         let hardware_fingerprint = hardware_info.generate_fingerprint();
         info!("Generated hardware fingerprint: {}...", &hardware_fingerprint[..16]);
+        
+        // Generate ZKP commitment
+        let commitment = self.generate_hardware_commitment(hardware_info).await?;
+        let commitment_hex = hex::encode(&commitment);
+        
+        info!("Generated ZKP commitment: {}...", &commitment_hex[..16]);
         info!("Hardware details: {}", hardware_info.generate_fingerprint_summary());
 
         // Detect cloud provider if possible
@@ -593,6 +660,7 @@ impl RegistrationManager {
             "node_info": node_info,
             "node_signature": format!("node-sig-{}", utils::random_string(32)),
             "client_version": env!("CARGO_PKG_VERSION"),
+            "hardware_commitment": commitment_hex, // Add ZKP commitment
             "tolerance_config": {
                 "allow_minor_changes": self.tolerance_config.allow_minor_changes,
                 "max_change_percentage": self.tolerance_config.max_change_percentage,
@@ -647,6 +715,94 @@ impl RegistrationManager {
                 Err(format!("Registration failed with status {}: {}", status, text))
             }
         }
+    }
+
+    /// Handle hardware attestation request
+    pub async fn handle_attestation_request(
+        &self,
+        challenge: Vec<u8>,
+        nonce: String,
+    ) -> Result<WebSocketMessage, String> {
+        info!("Handling hardware attestation request");
+        
+        // Check if ZKP is enabled
+        let zkp_params = self.zkp_params.as_ref()
+            .ok_or("ZKP not initialized")?;
+        
+        // Collect current hardware info
+        let current_hw = HardwareInfo::collect().await
+            .map_err(|e| format!("Failed to collect hardware info: {}", e))?;
+        
+        // Load stored commitment
+        let reg_data = self.load_registration_file()
+            .map_err(|e| format!("Failed to load registration data: {}", e))?;
+        
+        let commitment_hex = reg_data.hardware_commitment
+            .ok_or("No hardware commitment found in registration")?;
+        
+        let commitment = hex::decode(&commitment_hex)
+            .map_err(|e| format!("Invalid commitment format: {}", e))?;
+        
+        // Verify hardware hasn't changed
+        if !current_hw.verify_commitment(&commitment) {
+            warn!("Hardware has changed since registration");
+            // In production, this might trigger a re-registration flow
+        }
+        
+        // Generate ZKP proof
+        let proof = generate_hardware_proof(&current_hw, &commitment, zkp_params)
+            .await
+            .map_err(|e| format!("Failed to generate proof: {}", e))?;
+        
+        Ok(WebSocketMessage::HardwareAttestationProof {
+            commitment: commitment_hex,
+            proof: proof.data,
+            nonce,
+        })
+    }
+
+    /// Verify hardware attestation proof (for server-side verification)
+    pub fn verify_attestation_proof(
+        &self,
+        proof_data: Vec<u8>,
+        commitment_hex: &str,
+    ) -> Result<bool, String> {
+        info!("Verifying hardware attestation proof");
+        
+        let zkp_params = self.zkp_params.as_ref()
+            .ok_or("ZKP not initialized")?;
+        
+        let commitment = hex::decode(commitment_hex)
+            .map_err(|e| format!("Invalid commitment format: {}", e))?;
+        
+        let proof = Proof {
+            data: proof_data,
+            public_inputs: commitment.clone(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+        
+        verify_hardware_proof(&proof, &commitment, zkp_params)
+            .map_err(|e| format!("Proof verification failed: {}", e))
+    }
+
+    // Helper methods for file operations
+    fn load_registration_file(&self) -> Result<StoredRegistration, String> {
+        let reg_file = self.data_dir.join("registration.json");
+        let content = fs::read_to_string(&reg_file)
+            .map_err(|e| format!("Failed to read registration file: {}", e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse registration data: {}", e))
+    }
+
+    fn save_registration_file(&self, data: &StoredRegistration) -> Result<(), String> {
+        let reg_file = self.data_dir.join("registration.json");
+        let json = serde_json::to_string_pretty(data)
+            .map_err(|e| format!("Failed to serialize registration data: {}", e))?;
+        fs::write(&reg_file, json)
+            .map_err(|e| format!("Failed to write registration file: {}", e))
     }
 
     /// Start WebSocket connection for real-time communication
@@ -854,6 +1010,40 @@ impl RegistrationManager {
                     // Update next heartbeat interval if provided
                     if let Some(next_interval) = json.get("next_interval").and_then(|v| v.as_u64()) {
                         *heartbeat_interval = time::interval(Duration::from_secs(next_interval));
+                    }
+                }
+                
+                Some("hardware_attestation_request") => {
+                    // Handle ZKP attestation request
+                    if self.zkp_params.is_some() {
+                        info!("Received hardware attestation request");
+                        
+                        let challenge = json.get("challenge")
+                            .and_then(|c| c.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect::<Vec<u8>>())
+                            .unwrap_or_default();
+                        
+                        let nonce = json.get("nonce")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        
+                        match self.handle_attestation_request(challenge, nonce).await {
+                            Ok(response_msg) => {
+                                let response_json = serde_json::to_string(&response_msg)
+                                    .map_err(|e| format!("Failed to serialize attestation response: {}", e))?;
+                                
+                                write.send(Message::Text(response_json)).await
+                                    .map_err(|e| format!("Failed to send attestation proof: {}", e))?;
+                                
+                                info!("Hardware attestation proof sent successfully");
+                            }
+                            Err(e) => {
+                                error!("Failed to generate attestation proof: {}", e);
+                            }
+                        }
+                    } else {
+                        warn!("Received hardware attestation request but ZKP is not enabled");
                     }
                 }
                 
@@ -1253,6 +1443,17 @@ mod tests {
         assert!(json.contains("\"type\":\"heartbeat\""));
         assert!(json.contains("\"cpu\":25.5"));
         assert!(json.contains("\"temperature\":65.0"));
+        
+        // Test ZKP attestation message
+        let attestation = WebSocketMessage::HardwareAttestationProof {
+            commitment: "abc123".to_string(),
+            proof: vec![1, 2, 3, 4],
+            nonce: "nonce123".to_string(),
+        };
+        
+        let json = serde_json::to_string(&attestation).unwrap();
+        assert!(json.contains("\"type\":\"hardware_attestation_proof\""));
+        assert!(json.contains("\"commitment\":\"abc123\""));
     }
     
     #[test]
@@ -1333,5 +1534,6 @@ mod tests {
         assert!(manager.wallet_address.is_none());
         assert!(!manager.is_connected().await);
         assert_eq!(manager.api_url, "https://api.aeronyx.com");
+        assert!(!manager.has_zkp_enabled());
     }
 }
