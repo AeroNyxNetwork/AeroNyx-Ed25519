@@ -1280,7 +1280,7 @@ impl RegistrationManager {
     async fn get_memory_usage(&self) -> f64 {
         if let Ok(Ok((total, available))) = tokio::task::spawn_blocking(|| utils::system::get_system_memory()).await {
             let used = total.saturating_sub(available);
-            (used as f64 / total as f64 * 100.0)
+            used as f64 / total as f64 * 100.0
         } else {
             0.0
         }
