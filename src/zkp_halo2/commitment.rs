@@ -112,7 +112,10 @@ impl PoseidonCommitment {
     /// 
     /// Packs bytes into field elements, using 31 bytes per element to ensure
     /// the value is less than the field modulus.
-    pub fn encode_bytes_to_field_elements<F: PrimeField>(bytes: &[u8]) -> Vec<F> {
+    pub fn encode_bytes_to_field_elements<F: PrimeField>(bytes: &[u8]) -> Vec<F> 
+    where
+        <F as PrimeField>::Repr: From<[u8; 32]>,
+    {
         const BYTES_PER_ELEMENT: usize = 31;
         
         bytes.chunks(BYTES_PER_ELEMENT)
@@ -122,7 +125,7 @@ impl PoseidonCommitment {
                 padded[1..chunk.len() + 1].copy_from_slice(chunk);
                 
                 // Convert to field element
-                F::from_repr(padded).unwrap()
+                F::from_repr(padded.into()).unwrap()
             })
             .collect()
     }
