@@ -6,8 +6,8 @@
 // SPDX-License-Identifier: MIT
 //
 // This module implements zero-knowledge proofs for hardware attestation
-// using Halo2, enabling nodes to prove hardware ownership without
-// revealing sensitive hardware details.
+// using a mathematically sound approach based on commitment schemes and
+// discrete logarithm problems.
 
 pub mod circuit;
 pub mod prover;
@@ -47,30 +47,30 @@ pub async fn initialize() -> Result<SetupParams, String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::hardware::HardwareInfo;
+    use crate::hardware::{HardwareInfo, CpuInfo, MemoryInfo, DiskInfo, NetworkInfo, NetworkInterface, OsInfo};
 
     pub fn create_mock_hardware_info() -> HardwareInfo {
         HardwareInfo {
             hostname: "test-node".to_string(),
-            cpu: crate::hardware::CpuInfo {
+            cpu: CpuInfo {
                 cores: 4,
                 model: "Test CPU".to_string(),
                 frequency: 2400000000,
                 architecture: "x86_64".to_string(),
                 vendor_id: Some("TestVendor".to_string()),
             },
-            memory: crate::hardware::MemoryInfo {
+            memory: MemoryInfo {
                 total: 8000000000,
                 available: 4000000000,
             },
-            disk: crate::hardware::DiskInfo {
+            disk: DiskInfo {
                 total: 500000000000,
                 available: 250000000000,
                 filesystem: "ext4".to_string(),
             },
-            network: crate::hardware::NetworkInfo {
+            network: NetworkInfo {
                 interfaces: vec![
-                    crate::hardware::NetworkInterface {
+                    NetworkInterface {
                         name: "eth0".to_string(),
                         ip_address: "192.168.1.100".to_string(),
                         mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
@@ -80,14 +80,14 @@ pub(crate) mod tests {
                 ],
                 public_ip: "1.2.3.4".to_string(),
             },
-            os: crate::hardware::OsInfo {
+            os: OsInfo {
                 os_type: "linux".to_string(),
                 version: "22.04".to_string(),
                 distribution: "Ubuntu".to_string(),
                 kernel: "5.15.0".to_string(),
             },
-            system_uuid: Some("test-uuid".to_string()),
-            machine_id: Some("test-machine-id".to_string()),
+            system_uuid: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            machine_id: Some("1234567890abcdef".to_string()),
             bios_info: None,
         }
     }
@@ -113,5 +113,7 @@ pub(crate) mod tests {
             .unwrap();
         
         assert!(is_valid);
+        assert!(proof.timestamp > 0);
+        assert_eq!(proof.public_inputs, commitment.to_bytes());
     }
 }
