@@ -603,7 +603,7 @@ impl RegistrationManager {
     ) -> Result<Vec<u8>, String> {
         info!("Generating hardware commitment for ZKP");
         
-        // Use the hardware info's method to generate commitment
+        // Use the hardware info parameter to generate commitment
         let commitment = hardware_info.generate_zkp_commitment();
         let commitment_hex = hex::encode(&commitment);
         
