@@ -29,14 +29,15 @@ impl PoseidonCommitment {
     }
     
     /// Encode string to field elements (for compatibility)
-    pub fn encode_string_to_field_elements<F: ff::PrimeField>(s: &str) -> Vec<F> 
-    where
-        F::Repr: From<[u8; 32]>,
-    {
+    pub fn encode_string_to_field_elements<F: ff::PrimeField>(s: &str) -> Vec<F> {
+        Self::encode_bytes_to_field_elements(s.as_bytes())
+    }
+    
+    /// Encode bytes to field elements
+    pub fn encode_bytes_to_field_elements<F: ff::PrimeField>(bytes: &[u8]) -> Vec<F> {
         use sha2::{Sha256, Digest};
         
         const BYTES_PER_ELEMENT: usize = 31;
-        let bytes = s.as_bytes();
         
         bytes.chunks(BYTES_PER_ELEMENT)
             .enumerate()
@@ -50,19 +51,8 @@ impl PoseidonCommitment {
                 let mut padded = [0u8; 32];
                 padded[1..32].copy_from_slice(&hash[..31]);
                 
-                F::from_repr(padded.into()).unwrap()
+                F::from_repr(padded).unwrap()
             })
             .collect()
-    }
-    
-    /// Encode bytes to field elements
-    pub fn encode_bytes_to_field_elements<F>(bytes: &[u8]) -> Vec<F> 
-    where
-        F: ff::PrimeField,
-        F::Repr: From<[u8; 32]>,
-    {
-        Self::encode_string_to_field_elements(
-            &String::from_utf8_lossy(bytes)
-        )
     }
 }
