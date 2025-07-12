@@ -224,8 +224,8 @@ impl HardwareInfo {
     
     /// Create a deterministic serialization for ZKP circuit input
     pub fn to_zkp_bytes(&self) -> Result<Vec<u8>, String> {
-        bincode::serialize(self)
-            .map_err(|e| format!("Failed to serialize hardware info for ZKP: {}", e))
+    // Use the commitment generation method which already handles serialization
+        Ok(self.generate_zkp_commitment())
     }
     
     /// Verify that this hardware matches a given commitment
