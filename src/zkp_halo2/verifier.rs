@@ -1,17 +1,22 @@
 use tracing::{info, debug};
 use halo2_proofs::{
-    plonk::verify_proof,
-    poly::kzg::{
-        commitment::{KZGCommitmentScheme, ParamsKZG},
-        multiopen::VerifierSHPLONK,
-        strategy::SingleStrategy,
+    plonk::{verify_proof, keygen_vk},
+    poly::{
+        commitment::Params,
+        ipa::{
+            commitment::{IPACommitmentScheme, ParamsIPA},
+            multiopen::VerifierIPA,
+            strategy::SingleStrategy,
+        },
+        VerificationStrategy,
     },
-    transcript::{Blake2bRead, Challenge255, TranscriptReadBuffer},
+    transcript::{Blake2bRead, Challenge255, TranscriptRead},
 };
 use pasta_curves::{pallas, vesta};
 use ff::PrimeField;
 
 use crate::zkp_halo2::types::{Proof, SetupParams};
+use crate::zkp_halo2::circuit::CpuCircuit;
 
 /// Hardware proof verifier
 pub struct HardwareVerifier {
@@ -69,14 +74,15 @@ impl HardwareVerifier {
         proof: &Proof,
         commitment: &[u8],
     ) -> Result<bool, String> {
-        use halo2_proofs::poly::commitment::Params;
+        // Regenerate params from k
+        let k: u32 = bincode::deserialize(&self.params.srs)
+            .map_err(|e| format!("Failed to deserialize k: {}", e))?;
+        let params = ParamsIPA::<vesta::Affine>::new(k);
         
-        // Deserialize parameters
-        let params = ParamsKZG::<vesta::Affine>::read(&mut &self.params.srs[..])
-            .map_err(|e| format!("Failed to read params: {}", e))?;
-        
-        let vk = halo2_proofs::plonk::VerifyingKey::<vesta::Affine>::read(&mut &self.params.verifying_key[..])
-            .map_err(|e| format!("Failed to read vk: {:?}", e))?;
+        // Generate verification key (we need to recreate it)
+        let empty_circuit = CpuCircuit::default();
+        let vk = keygen_vk(&params, &empty_circuit)
+            .map_err(|e| format!("Failed to generate vk: {:?}", e))?;
         
         // Convert commitment to field element
         let commitment_field = self.commitment_to_field_element(commitment)?;
@@ -89,10 +95,11 @@ impl HardwareVerifier {
         
         // Verify the proof
         let result = verify_proof::<
-            KZGCommitmentScheme<vesta::Affine>,
-            VerifierSHPLONK<vesta::Affine>,
+            IPACommitmentScheme<vesta::Affine>,
+            VerifierIPA<vesta::Affine>,
             Challenge255<vesta::Affine>,
             Blake2bRead<_, _, Challenge255<_>>,
+            SingleStrategy<vesta::Affine>,
         >(
             &params,
             &vk,
