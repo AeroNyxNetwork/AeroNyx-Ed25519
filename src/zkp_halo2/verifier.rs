@@ -9,6 +9,7 @@ use halo2_proofs::{
     transcript::{Blake2bRead, Challenge255, TranscriptReadBuffer},
 };
 use pasta_curves::{pallas, vesta};
+use ff::PrimeField;
 
 use crate::zkp_halo2::types::{Proof, SetupParams};
 
@@ -68,12 +69,14 @@ impl HardwareVerifier {
         proof: &Proof,
         commitment: &[u8],
     ) -> Result<bool, String> {
-        // Deserialize parameters
-        let params: ParamsKZG<vesta::Affine> = bincode::deserialize(&self.params.srs)
-            .map_err(|e| format!("Failed to deserialize params: {}", e))?;
+        use halo2_proofs::poly::commitment::Params;
         
-        let vk = bincode::deserialize(&self.params.verifying_key)
-            .map_err(|e| format!("Failed to deserialize vk: {}", e))?;
+        // Deserialize parameters
+        let params = ParamsKZG::<vesta::Affine>::read(&mut &self.params.srs[..])
+            .map_err(|e| format!("Failed to read params: {}", e))?;
+        
+        let vk = halo2_proofs::plonk::VerifyingKey::<vesta::Affine>::read(&mut &self.params.verifying_key[..])
+            .map_err(|e| format!("Failed to read vk: {:?}", e))?;
         
         // Convert commitment to field element
         let commitment_field = self.commitment_to_field_element(commitment)?;
@@ -90,7 +93,6 @@ impl HardwareVerifier {
             VerifierSHPLONK<vesta::Affine>,
             Challenge255<vesta::Affine>,
             Blake2bRead<_, _, Challenge255<_>>,
-            SingleStrategy<vesta::Affine>,
         >(
             &params,
             &vk,
@@ -121,7 +123,7 @@ impl HardwareVerifier {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(commitment);
         
-        pallas::Base::from_repr(bytes)
+        Option::from(pallas::Base::from_repr(bytes))
             .ok_or_else(|| "Failed to convert commitment to field element".to_string())
     }
 }
