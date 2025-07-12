@@ -8,7 +8,7 @@ use ed25519_dalek::{Keypair, SecretKey, Signature, Signer};
 use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize};
 use rand::{Rng, RngCore};
-use rand_core::OsRng;
+use rand::rngs::OsRng;
 
 use crate::hardware::HardwareInfo;
 use crate::zkp::{
@@ -191,11 +191,12 @@ impl HardwareProver {
         
         // Generate cryptographic nonce
         let mut nonce = [0u8; 32];
-        OsRng.fill_bytes(&mut nonce);
+        let mut rng = OsRng;
+        rng.fill_bytes(&mut nonce);
         
         // Generate blinding factor for zero-knowledge property
         let mut blinding_factor = [0u8; 32];
-        OsRng.fill_bytes(&mut blinding_factor);
+        rng.fill_bytes(&mut blinding_factor);
         
         // Create metadata hash
         let metadata_hash = Self::compute_metadata_hash(&hardware_data, &nonce);
