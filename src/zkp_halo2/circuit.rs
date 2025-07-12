@@ -1,368 +1,174 @@
 // src/zkp_halo2/circuit.rs
-// AeroNyx Privacy Network - Zero-Knowledge Proof Circuit
-// Version: 2.0.0
-//
-// This module implements a production-ready ZKP circuit for hardware attestation
-// using Halo2 with proper Poseidon hash and IPA commitment scheme.
+// AeroNyx Privacy Network - Secure Zero-Knowledge Proof Circuit
+// Version: 5.0.0 - Production-ready with audited Poseidon hash
 
 use ff::{Field, PrimeField};
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
-    plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Fixed, Instance, Selector,
-        Expression, Constraints,
-    },
-    poly::Rotation,
+    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance},
+};
+use halo2_gadgets::poseidon::{
+    primitives::{self as poseidon_primitives, ConstantLength, P128Pow5T3},
+    Hash, Pow5Chip, Pow5Config,
 };
 use pasta_curves::pallas;
 
 /// Circuit configuration for hardware attestation
 #[derive(Debug, Clone)]
-pub struct HardwareConfig {
-    /// Advice columns for private inputs
-    input: Column<Advice>,
-    hash_input: Column<Advice>,
-    hash_output: Column<Advice>,
-    
-    /// Fixed column for constants
-    constant: Column<Fixed>,
-    
-    /// Instance column for public inputs (commitment)
-    instance: Column<Instance>,
-    
-    /// Selectors for gates
-    s_input: Selector,
-    s_hash: Selector,
+pub struct HardwareCircuitConfig {
+    /// Columns for private inputs (CPU model and MAC address)
+    input_columns: [Column<Advice>; 2],
+    /// Public input column for the commitment
+    instance_column: Column<Instance>,
+    /// Poseidon hash configuration with secure parameters
+    poseidon_config: Pow5Config<pallas::Base, 3, 2>,
 }
 
-/// Hardware attestation circuit
-#[derive(Clone)]
+/// Hardware attestation circuit proving knowledge of CPU and MAC
+#[derive(Clone, Default)]
 pub struct HardwareCircuit {
-    /// CPU model string (private input)
-    cpu_model: Value<pallas::Base>,
-    /// MAC address (private input)  
-    mac_address: Value<pallas::Base>,
+    /// Private: CPU model encoded as field element
+    pub cpu_model: Value<pallas::Base>,
+    /// Private: MAC address encoded as field element
+    pub mac_address: Value<pallas::Base>,
 }
 
 impl HardwareCircuit {
-    /// Create a new hardware circuit with private inputs
+    /// Create new circuit with private witnesses
     pub fn new(cpu_model: &str, mac_address: &str) -> Self {
-        // Convert inputs to field elements
-        let cpu_field = Self::string_to_field(cpu_model);
-        let mac_field = Self::mac_to_field(mac_address);
+        use crate::zkp_halo2::commitment::{string_to_field, mac_to_field};
         
         Self {
-            cpu_model: Value::known(cpu_field),
-            mac_address: Value::known(mac_field),
+            cpu_model: Value::known(string_to_field(cpu_model)),
+            mac_address: Value::known(mac_to_field(mac_address)),
         }
     }
     
-    /// Create circuit without witnesses for key generation
+    /// Create circuit without witnesses (for key generation)
     pub fn without_witnesses() -> Self {
-        Self {
-            cpu_model: Value::unknown(),
-            mac_address: Value::unknown(),
-        }
-    }
-    
-    /// Convert string to field element using deterministic encoding
-    fn string_to_field(s: &str) -> pallas::Base {
-        use sha2::{Sha256, Digest};
-        
-        let mut hasher = Sha256::new();
-        hasher.update(b"CPU_MODEL_ENCODE");
-        hasher.update(s.as_bytes());
-        let hash = hasher.finalize();
-        
-        // Take first 31 bytes to ensure it fits in field
-        let mut bytes = [0u8; 32];
-        bytes[1..32].copy_from_slice(&hash[..31]);
-        
-        pallas::Base::from_repr(bytes).unwrap()
-    }
-    
-    /// Convert MAC address to field element
-    fn mac_to_field(mac: &str) -> pallas::Base {
-        // Normalize MAC address
-        let normalized = mac.to_lowercase()
-            .replace(":", "")
-            .replace("-", "");
-        
-        let bytes = hex::decode(&normalized)
-            .expect("Invalid MAC address format");
-        
-        // Pad to 32 bytes
-        let mut padded = [0u8; 32];
-        padded[1..7].copy_from_slice(&bytes);
-        
-        pallas::Base::from_repr(padded).unwrap()
+        Self::default()
     }
 }
 
 impl Circuit<pallas::Base> for HardwareCircuit {
-    type Config = HardwareConfig;
+    type Config = HardwareCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
-    
+
     fn without_witnesses(&self) -> Self {
         Self::without_witnesses()
     }
-    
+
     fn configure(meta: &mut ConstraintSystem<pallas::Base>) -> Self::Config {
-        // Configure columns
-        let input = meta.advice_column();
-        let hash_input = meta.advice_column();
-        let hash_output = meta.advice_column();
-        let constant = meta.fixed_column();
-        let instance = meta.instance_column();
+        // Configure advice columns for inputs
+        let input_columns = [
+            meta.advice_column(),
+            meta.advice_column(),
+        ];
+        
+        // Configure instance column for public commitment
+        let instance_column = meta.instance_column();
         
         // Enable equality constraints
-        meta.enable_equality(input);
-        meta.enable_equality(hash_input);
-        meta.enable_equality(hash_output);
-        meta.enable_equality(instance);
-        meta.enable_constant(constant);
+        for &col in &input_columns {
+            meta.enable_equality(col);
+        }
+        meta.enable_equality(instance_column);
         
-        // Configure selectors
-        let s_input = meta.selector();
-        let s_hash = meta.selector();
+        // Configure Poseidon hash with width 3
+        let state = [
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(),
+        ];
         
-        // Input loading gate
-        meta.create_gate("load inputs", |meta| {
-            let s = meta.query_selector(s_input);
-            let input_val = meta.query_advice(input, Rotation::cur());
-            let hash_in = meta.query_advice(hash_input, Rotation::cur());
-            
-            Constraints::with_selector(s, vec![
-                input_val - hash_in,
-            ])
-        });
+        let rc_a = [
+            meta.fixed_column(),
+            meta.fixed_column(),
+            meta.fixed_column(),
+        ];
         
-        // Simplified hash gate (x^5 S-box for demonstration)
-        meta.create_gate("hash", |meta| {
-            let s = meta.query_selector(s_hash);
-            let x = meta.query_advice(hash_input, Rotation::cur());
-            let y = meta.query_advice(hash_output, Rotation::cur());
-            
-            let x2 = x.clone() * x.clone();
-            let x4 = x2.clone() * x2;
-            let x5 = x4 * x.clone();
-            
-            Constraints::with_selector(s, vec![
-                y - x5,
-            ])
-        });
+        let rc_b = [
+            meta.fixed_column(),
+            meta.fixed_column(),
+            meta.fixed_column(),
+        ];
         
-        HardwareConfig {
-            input,
-            hash_input,
-            hash_output,
-            constant,
-            instance,
-            s_input,
-            s_hash,
+        // Use P128Pow5T3: secure parameters for 128-bit security
+        let poseidon_config = Pow5Chip::configure::<P128Pow5T3>(
+            meta,
+            state,
+            rc_a,
+            rc_b,
+        );
+        
+        HardwareCircuitConfig {
+            input_columns,
+            instance_column,
+            poseidon_config,
         }
     }
-    
+
     fn synthesize(
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<pallas::Base>,
     ) -> Result<(), Error> {
-        // Load CPU model
+        // Instantiate Poseidon chip
+        let poseidon_chip = Pow5Chip::construct(config.poseidon_config);
+        
+        // Step 1: Load private inputs
         let cpu_cell = layouter.assign_region(
-            || "load cpu",
+            || "load cpu model",
             |mut region| {
-                config.s_input.enable(&mut region, 0)?;
-                
-                let input_cell = region.assign_advice(
-                    || "cpu input",
-                    config.input,
-                    0,
-                    || self.cpu_model,
-                )?;
-                
-                let hash_cell = region.assign_advice(
-                    || "cpu hash input",
-                    config.hash_input,
-                    0,
-                    || self.cpu_model,
-                )?;
-                
-                region.constrain_equal(input_cell.cell(), hash_cell.cell())?;
-                
-                Ok(hash_cell)
-            },
-        )?;
-        
-        // Load MAC address
-        let mac_cell = layouter.assign_region(
-            || "load mac",
-            |mut region| {
-                config.s_input.enable(&mut region, 0)?;
-                
-                let input_cell = region.assign_advice(
-                    || "mac input",
-                    config.input,
-                    0,
-                    || self.mac_address,
-                )?;
-                
-                let hash_cell = region.assign_advice(
-                    || "mac hash input", 
-                    config.hash_input,
-                    0,
-                    || self.mac_address,
-                )?;
-                
-                region.constrain_equal(input_cell.cell(), hash_cell.cell())?;
-                
-                Ok(hash_cell)
-            },
-        )?;
-        
-        // Hash CPU model
-        let cpu_hash = layouter.assign_region(
-            || "hash cpu",
-            |mut region| {
-                config.s_hash.enable(&mut region, 0)?;
-                
-                cpu_cell.copy_advice(
-                    || "copy cpu",
-                    &mut region,
-                    config.hash_input,
-                    0,
-                )?;
-                
-                let hash = region.assign_advice(
-                    || "cpu hash output",
-                    config.hash_output,
-                    0,
-                    || {
-                        self.cpu_model.map(|x| {
-                            let x2 = x.square();
-                            let x4 = x2.square();
-                            x4 * x
-                        })
-                    },
-                )?;
-                
-                Ok(hash)
-            },
-        )?;
-        
-        // Hash MAC address
-        let mac_hash = layouter.assign_region(
-            || "hash mac",
-            |mut region| {
-                config.s_hash.enable(&mut region, 0)?;
-                
-                mac_cell.copy_advice(
-                    || "copy mac",
-                    &mut region,
-                    config.hash_input,
-                    0,
-                )?;
-                
-                let hash = region.assign_advice(
-                    || "mac hash output",
-                    config.hash_output,
-                    0,
-                    || {
-                        self.mac_address.map(|x| {
-                            let x2 = x.square();
-                            let x4 = x2.square();
-                            x4 * x
-                        })
-                    },
-                )?;
-                
-                Ok(hash)
-            },
-        )?;
-        
-        // Combine hashes
-        let combined = layouter.assign_region(
-            || "combine",
-            |mut region| {
-                let cpu_val = cpu_hash.value();
-                let mac_val = mac_hash.value();
-                
-                let combined = cpu_val.and_then(|c| {
-                    mac_val.map(|m| c + m)
-                });
-                
                 region.assign_advice(
-                    || "combined",
-                    config.hash_output,
+                    || "cpu_model",
+                    config.input_columns[0],
                     0,
-                    || combined,
+                    || self.cpu_model,
                 )
             },
         )?;
         
-        // Final hash
-        let commitment = layouter.assign_region(
-            || "final hash",
+        let mac_cell = layouter.assign_region(
+            || "load mac address",
             |mut region| {
-                config.s_hash.enable(&mut region, 0)?;
-                
-                combined.copy_advice(
-                    || "copy combined",
-                    &mut region,
-                    config.hash_input,
+                region.assign_advice(
+                    || "mac_address",
+                    config.input_columns[1],
                     0,
-                )?;
-                
-                let final_hash = region.assign_advice(
-                    || "commitment",
-                    config.hash_output,
-                    0,
-                    || {
-                        combined.value().map(|x| {
-                            let x2 = x.square();
-                            let x4 = x2.square();
-                            x4 * x
-                        })
-                    },
-                )?;
-                
-                Ok(final_hash)
+                    || self.mac_address,
+                )
             },
         )?;
         
-        // Expose commitment as public input
-        layouter.constrain_instance(commitment.cell(), config.instance, 0)?;
+        // Step 2: Hash the inputs using secure Poseidon
+        let message = vec![cpu_cell, mac_cell];
+        let commitment_cell = poseidon_chip.hash(
+            layouter.namespace(|| "poseidon hash"),
+            message,
+        )?;
+        
+        // Step 3: Constrain hash output to public input
+        layouter.constrain_instance(
+            commitment_cell.cell(),
+            config.instance_column,
+            0,
+        )?;
         
         Ok(())
     }
 }
 
-/// Compute expected commitment for verification
+/// Compute commitment outside circuit (for verification)
 pub fn compute_commitment(cpu_model: &str, mac_address: &str) -> pallas::Base {
-    let cpu_field = HardwareCircuit::string_to_field(cpu_model);
-    let mac_field = HardwareCircuit::mac_to_field(mac_address);
+    use crate::zkp_halo2::commitment::{string_to_field, mac_to_field};
     
-    // Hash CPU
-    let cpu_hash = {
-        let x2 = cpu_field.square();
-        let x4 = x2.square();
-        x4 * cpu_field
-    };
+    let cpu_field = string_to_field(cpu_model);
+    let mac_field = mac_to_field(mac_address);
     
-    // Hash MAC
-    let mac_hash = {
-        let x2 = mac_field.square();
-        let x4 = x2.square();
-        x4 * mac_field
-    };
-    
-    // Combine
-    let combined = cpu_hash + mac_hash;
-    
-    // Final hash
-    let x2 = combined.square();
-    let x4 = x2.square();
-    x4 * combined
+    // Use the same Poseidon parameters as the circuit
+    poseidon_primitives::Hash::<_, _, P128Pow5T3, ConstantLength<2>, 3, 2>::init()
+        .hash([cpu_field, mac_field])
 }
 
 #[cfg(test)]
@@ -372,7 +178,7 @@ mod tests {
     
     #[test]
     fn test_hardware_circuit() {
-        let k = 4; // 2^4 = 16 rows
+        let k = 7; // 2^7 = 128 rows
         
         let cpu = "Intel Core i7-9700K";
         let mac = "aa:bb:cc:dd:ee:ff";
@@ -388,5 +194,16 @@ mod tests {
         
         // Verify
         assert_eq!(prover.verify(), Ok(()));
+    }
+    
+    #[test]
+    fn test_commitment_determinism() {
+        let cpu = "AMD Ryzen 9 5950X";
+        let mac = "11:22:33:44:55:66";
+        
+        let c1 = compute_commitment(cpu, mac);
+        let c2 = compute_commitment(cpu, mac);
+        
+        assert_eq!(c1, c2, "Commitment should be deterministic");
     }
 }
