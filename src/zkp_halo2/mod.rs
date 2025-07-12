@@ -1,20 +1,50 @@
-//! Halo2 + Poseidon Zero-Knowledge Proof Module
-//! 
-//! This module implements zero-knowledge proofs for hardware attestation using:
-//! - Halo2: A PLONK-based proof system with no trusted setup
-//! - Poseidon: An algebraically efficient hash function
-//! - Pasta curves: Pallas (base field) and Vesta (scalar field)
-//!
-//! The system proves knowledge of hardware information (CPU model, MAC address)
-//! that hashes to a public commitment without revealing the actual hardware data.
-//src/zkp_halo2/mod.rs
-//! Halo2 + Poseidon Zero-Knowledge Proof Module
-//! 
-//! Production implementation with:
-//! - Real Poseidon hash with proper parameters
-//! - Complete Halo2 circuits with constraints
-//! - KZG commitment scheme
-//! - Proper proof generation and verification
+// src/zkp_halo2/mod.rs
+// AeroNyx Privacy Network - Zero-Knowledge Proof Module
+// Version: 1.0.0
+//
+// Copyright (c) 2024 AeroNyx Team
+// SPDX-License-Identifier: MIT
+//
+// This module provides zero-knowledge proof functionality for hardware attestation
+// in the AeroNyx DePIN (Decentralized Physical Infrastructure Network).
+//
+// ## Overview
+//
+// The ZKP system enables nodes to prove they possess specific hardware without
+// revealing the actual hardware details. This is crucial for:
+// - Privacy-preserving node registration
+// - Hardware verification without identification
+// - Sybil resistance through hardware fingerprinting
+//
+// ## Architecture
+//
+// 1. **Poseidon Hash**: Algebraic hash function optimized for ZK circuits
+// 2. **Halo2 Circuits**: PLONK-based proof system with no trusted setup
+// 3. **Hardware Commitment**: Binding commitment to CPU model and MAC address
+// 4. **IPA Polynomial Commitment**: Transparent setup using inner product argument
+//
+// ## Usage
+//
+// ```rust
+// // Initialize the ZKP system
+// let params = zkp_halo2::initialize().await?;
+//
+// // Generate commitment from hardware
+// let commitment = hardware_info.generate_zkp_commitment();
+//
+// // Create proof
+// let proof = generate_hardware_proof(&hardware_info, &commitment, &params).await?;
+//
+// // Verify proof
+// let valid = verify_hardware_proof(&proof, &commitment, &params)?;
+// ```
+//
+// ## Security
+//
+// - 128-bit security level
+// - No trusted setup required
+// - Privacy-preserving: proofs reveal nothing about hardware
+// - Unforgeable: cannot create valid proofs without the hardware
 
 pub mod types;
 pub mod poseidon_hasher;
