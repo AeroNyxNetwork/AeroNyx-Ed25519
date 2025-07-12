@@ -1,4 +1,3 @@
-//src/zkp_halo2/commitment.rs
 use ff::PrimeField;
 use pasta_curves::pallas;
 use crate::zkp_halo2::types::{HardwareCommitment, CommitmentMetadata, ProofType};
@@ -105,7 +104,7 @@ impl PoseidonCommitment {
     /// 
     /// Strings are encoded as UTF-8 bytes, then packed into field elements.
     /// Each field element can hold up to 31 bytes to ensure it fits in the field.
-    fn encode_string_to_field_elements<F: PrimeField>(s: &str) -> Vec<F> {
+    pub fn encode_string_to_field_elements<F: PrimeField>(s: &str) -> Vec<F> {
         Self::encode_bytes_to_field_elements(s.as_bytes())
     }
     
@@ -113,17 +112,17 @@ impl PoseidonCommitment {
     /// 
     /// Packs bytes into field elements, using 31 bytes per element to ensure
     /// the value is less than the field modulus.
-    fn encode_bytes_to_field_elements<F: PrimeField>(bytes: &[u8]) -> Vec<F> {
+    pub fn encode_bytes_to_field_elements<F: PrimeField>(bytes: &[u8]) -> Vec<F> {
         const BYTES_PER_ELEMENT: usize = 31;
         
         bytes.chunks(BYTES_PER_ELEMENT)
             .map(|chunk| {
                 // Pad chunk to 32 bytes (with leading zero)
-                let mut padded = vec![0u8; 32];
+                let mut padded = [0u8; 32];
                 padded[1..chunk.len() + 1].copy_from_slice(chunk);
                 
                 // Convert to field element
-                F::from_repr(padded.try_into().unwrap()).unwrap()
+                F::from_repr(padded).unwrap()
             })
             .collect()
     }
