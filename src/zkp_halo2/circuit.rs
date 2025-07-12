@@ -1,19 +1,13 @@
 use halo2_proofs::{
     arithmetic::Field,
-    circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
+    circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
         Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector,
-        keygen_pk, keygen_vk, create_proof, verify_proof,
     },
-    poly::{
-        Rotation,
-        commitment::{Params, ParamsProver},
-    },
-    transcript::{Blake2bRead, Blake2bWrite, Challenge255, TranscriptRead, TranscriptWrite},
+    poly::Rotation,
 };
 use ff::PrimeField;
-use pasta_curves::{pallas, vesta};
-use rand_core::OsRng;
+use pasta_curves::pallas;
 
 use crate::zkp_halo2::types::{constants::*, SetupParams};
 
@@ -117,7 +111,7 @@ pub mod poseidon {
         ) -> Result<AssignedCell<F, F>, Error> {
             layouter.assign_region(
                 || "poseidon hash",
-                |mut region| {
+                || region| {
                     // Simplified: just return the first input
                     Ok(inputs[0].clone())
                 },
@@ -247,7 +241,7 @@ impl Circuit<pallas::Base> for CpuCircuit {
         mut layouter: impl Layouter<pallas::Base>,
     ) -> Result<(), Error> {
         // Assign private inputs
-        let input_cells = layouter.assign_region(
+        let _input_cells = layouter.assign_region(
             || "assign CPU inputs",
             |mut region| {
                 let mut cells = Vec::new();
@@ -343,7 +337,7 @@ impl Circuit<pallas::Base> for MacCircuit {
         mut layouter: impl Layouter<pallas::Base>,
     ) -> Result<(), Error> {
         // Assign MAC input
-        let mac_cell = layouter.assign_region(
+        let _mac_cell = layouter.assign_region(
             || "assign MAC",
             |mut region| {
                 region.assign_advice(
