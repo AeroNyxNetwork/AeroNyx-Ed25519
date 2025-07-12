@@ -17,8 +17,9 @@ mod utils;
 mod registration;
 mod hardware;
 mod remote_management;
-use zkp_halo2::{initialize, SetupParams};
+mod zkp_halo2;
 
+use zkp_halo2::{initialize, SetupParams};
 use config::settings::{ServerConfig, ServerArgs, Command, NodeMode};
 use server::VpnServer;
 use registration::RegistrationManager;
