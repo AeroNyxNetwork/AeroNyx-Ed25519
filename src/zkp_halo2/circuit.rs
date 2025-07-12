@@ -1,13 +1,12 @@
 // src/zkp_halo2/circuit.rs
 // AeroNyx Privacy Network - Zero-Knowledge Proof Circuit
-// Version: 1.0.1
+// Version: 2.0.0
 //
 // This module implements a production-ready ZKP circuit for hardware attestation
 // using Halo2 with proper Poseidon hash and IPA commitment scheme.
 
-use ff::Field;
+use ff::{Field, PrimeField};
 use halo2_proofs::{
-    arithmetic::CurveAffine,
     circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
     plonk::{
         Advice, Circuit, Column, ConstraintSystem, Error, Fixed, Instance, Selector,
