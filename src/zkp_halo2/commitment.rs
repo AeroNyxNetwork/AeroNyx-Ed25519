@@ -89,8 +89,12 @@ impl PoseidonCommitment {
         Self::encode_bytes_to_field_elements(s.as_bytes())
     }
     
-    /// Encode bytes to field elements
-    pub fn encode_bytes_to_field_elements<F: PrimeField>(bytes: &[u8]) -> Vec<F> {
+    /// Encode bytes to field elements with proper type constraint
+    pub fn encode_bytes_to_field_elements<F>(bytes: &[u8]) -> Vec<F> 
+    where
+        F: PrimeField,
+        F::Repr: From<[u8; 32]>,
+    {
         const BYTES_PER_ELEMENT: usize = 31;
         
         bytes.chunks(BYTES_PER_ELEMENT)
