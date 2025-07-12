@@ -174,7 +174,7 @@ impl HardwareProver {
     fn generate_proof_blocking(
         hardware_data: Vec<u8>,
         commitment: Vec<u8>,
-        params: SetupParams,
+        _params: SetupParams,
         zkp_params: ZkpParams,
     ) -> Result<Vec<u8>, String> {
         debug!("Starting proof generation (CPU intensive)");
