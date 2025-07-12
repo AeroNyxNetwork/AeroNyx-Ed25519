@@ -29,7 +29,6 @@
 // implementation.
 
 use ff::PrimeField;
-use pasta_curves::pallas;
 use crate::zkp_halo2::{
     types::{HardwareCommitment, CommitmentMetadata, ProofType},
     hardware_circuit::compute_expected_commitment,
@@ -43,7 +42,10 @@ impl PoseidonCommitment {
     pub fn commit_combined(cpu_model: &str, mac: &str) -> [u8; 32] {
         // Use the circuit's commitment function for consistency
         let commitment = compute_expected_commitment(cpu_model, mac);
-        commitment.to_bytes()
+        let repr = commitment.to_repr();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(repr.as_ref());
+        bytes
     }
     
     pub fn commit_cpu_model(cpu_model: &str) -> [u8; 32] {
@@ -93,11 +95,11 @@ impl PoseidonCommitment {
         
         bytes.chunks(BYTES_PER_ELEMENT)
             .map(|chunk| {
-                let mut padded = vec![0u8; 32];
+                let mut padded = [0u8; 32];
                 padded[1..chunk.len() + 1].copy_from_slice(chunk);
                 
                 // Convert bytes to field element
-                F::from_bytes(&padded.try_into().unwrap()).unwrap()
+                F::from_repr(padded.into()).unwrap()
             })
             .collect()
     }
