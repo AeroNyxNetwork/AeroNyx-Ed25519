@@ -130,30 +130,39 @@ pub struct BiosInfo {
 }
 
 impl HardwareInfo {
-    /// Collect all hardware information from the system
-    pub async fn collect() -> Result<Self, String> {
-        info!("Starting hardware information collection");
+    /// Generate a zero-knowledge commitment for this hardware
+    pub fn generate_zkp_commitment(&self) -> Vec<u8> {
+        use crate::zkp_halo2::commitment::PoseidonCommitment;
         
-        let mut hw_info = HardwareInfo {
-            hostname: gethostname::gethostname().to_string_lossy().to_string(),
-            cpu: Self::collect_cpu_info()?,
-            memory: Self::collect_memory_info()?,
-            disk: Self::collect_disk_info()?,
-            network: Self::collect_network_info().await?,
-            os: Self::collect_os_info()?,
-            system_uuid: None,
-            machine_id: None,
-            bios_info: None,
-        };
+        // Get the first physical MAC address
+        let default_mac = "00:00:00:00:00:00".to_string();
+        let mac = self.network.interfaces
+            .iter()
+            .find(|iface| iface.is_physical && iface.mac_address != "00:00:00:00:00:00")
+            .map(|iface| &iface.mac_address)
+            .unwrap_or(&default_mac);
         
-        // Collect additional stable identifiers
-        hw_info.system_uuid = Self::get_system_uuid();
-        hw_info.machine_id = Self::get_machine_id();
-        hw_info.bios_info = Self::collect_bios_info();
+        // Generate combined commitment (CPU + MAC)
+        let commitment = PoseidonCommitment::commit_combined(
+            &self.cpu.model,
+            mac
+        );
         
-        debug!("Hardware information collection completed");
-        Ok(hw_info)
+        commitment.to_vec()
     }
+    
+    /// Create a deterministic serialization for ZKP circuit input
+    pub fn to_zkp_bytes(&self) -> Result<Vec<u8>, String> {
+        // Use the commitment generation method which already handles serialization
+        Ok(self.generate_zkp_commitment())
+    }
+    
+    /// Verify that this hardware matches a given commitment
+    pub fn verify_commitment(&self, commitment: &[u8]) -> bool {
+        let computed = self.generate_zkp_commitment();
+        computed == commitment
+    }
+}
     
     /// Generate a stable hardware fingerprint for node identification
     /// This fingerprint uses only stable hardware characteristics that rarely change
