@@ -4,14 +4,14 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, debug};
+use ff::PrimeField;
 use pasta_curves::pallas;
 use halo2_proofs::{
     plonk::{
         create_proof, keygen_pk, keygen_vk, verify_proof,
-        ProvingKey, VerifyingKey, SingleVerifier,
+        ProvingKey, VerifyingKey,
     },
     poly::{
-        commitment::{Params, ParamsProver},
         ipa::{
             commitment::{IPACommitmentScheme, ParamsIPA},
             multiopen::{ProverIPA, VerifierIPA},
@@ -187,8 +187,7 @@ pub fn verify_hardware_proof(
     // Parse commitment
     let mut comm_bytes = [0u8; 32];
     comm_bytes.copy_from_slice(commitment);
-    let commitment_point = pallas::Base::from_repr(comm_bytes)
-        .ok_or("Invalid commitment format")?;
+    let commitment_point = pallas::Base::from_repr(comm_bytes).unwrap();
     
     // Deserialize parameters
     let ipa_params = ParamsIPA::<pallas::Affine>::read(&mut &params.srs[..])
