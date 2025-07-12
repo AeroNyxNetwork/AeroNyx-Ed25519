@@ -1,12 +1,15 @@
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tracing::{info, debug};
 use halo2_proofs::{
-    plonk::{create_proof, keygen_pk},
-    poly::kzg::{
-        commitment::{KZGCommitmentScheme, ParamsKZG},
-        multiopen::ProverSHPLONK,
+    plonk::{create_proof, keygen_pk, keygen_vk},
+    poly::{
+        commitment::{Params, ParamsProver},
+        ipa::{
+            commitment::{IPACommitmentScheme, ParamsIPA},
+            multiopen::ProverIPA,
+        },
     },
-    transcript::{Blake2bWrite, Challenge255, TranscriptWriterBuffer},
+    transcript::{Blake2bWrite, Challenge255, TranscriptWrite},
 };
 use pasta_curves::{pallas, vesta};
 use rand_core::OsRng;
@@ -111,23 +114,24 @@ impl HardwareProver {
         let start = Instant::now();
         info!("Starting proof generation for {:?}", proof_type);
         
-        // Deserialize parameters
-        let params = ParamsKZG::<vesta::Affine>::read(&mut &setup.srs[..])
-            .map_err(|e| format!("Failed to read params: {}", e))?;
+        // For simplified version, regenerate params from k
+        let k: u32 = bincode::deserialize(&setup.srs)
+            .map_err(|e| format!("Failed to deserialize k: {}", e))?;
+        let params = ParamsIPA::<vesta::Affine>::new(k);
         
-        // Create appropriate circuit
+        // Create appropriate circuit and generate proof
         let proof_bytes = match proof_type {
             ProofType::CpuModel => {
                 let circuit = CpuCircuit::new(cpu_model);
-                Self::create_proof_for_circuit(circuit, &params, setup)?
+                Self::create_proof_for_circuit(circuit, &params)?
             }
             ProofType::MacAddress => {
                 let circuit = MacCircuit::new(mac_address);
-                Self::create_proof_for_circuit(circuit, &params, setup)?
+                Self::create_proof_for_circuit(circuit, &params)?
             }
             ProofType::Combined => {
                 let circuit = CombinedCircuit::new(cpu_model, mac_address);
-                Self::create_proof_for_circuit(circuit, &params, setup)?
+                Self::create_proof_for_circuit(circuit, &params)?
             }
         };
         
@@ -140,29 +144,20 @@ impl HardwareProver {
     /// Create proof for a specific circuit
     fn create_proof_for_circuit<C>(
         circuit: C,
-        params: &ParamsKZG<vesta::Affine>,
-        setup: &SetupParams,
+        params: &ParamsIPA<vesta::Affine>,
     ) -> Result<Vec<u8>, String>
     where
         C: halo2_proofs::plonk::Circuit<pallas::Base>,
     {
-        use halo2_proofs::poly::commitment::Params;
+        // Generate verification key
+        let vk = keygen_vk(params, &circuit)
+            .map_err(|e| format!("Failed to generate vk: {:?}", e))?;
         
-        // Get or generate proving key
-        let pk = if let Some(pk_bytes) = &setup.proving_key {
-            debug!("Using cached proving key");
-            halo2_proofs::plonk::ProvingKey::<vesta::Affine>::read(&mut &pk_bytes[..])
-                .map_err(|e| format!("Failed to read pk: {:?}", e))?
-        } else {
-            debug!("Generating proving key");
-            let vk = halo2_proofs::plonk::VerifyingKey::<vesta::Affine>::read(&mut &setup.verifying_key[..])
-                .map_err(|e| format!("Failed to read vk: {:?}", e))?;
-            keygen_pk(params, vk, &circuit)
-                .map_err(|e| format!("Failed to generate pk: {:?}", e))?
-        };
+        // Generate proving key
+        let pk = keygen_pk(params, vk.clone(), &circuit)
+            .map_err(|e| format!("Failed to generate pk: {:?}", e))?;
         
         // Calculate public inputs (commitment)
-        // In a real implementation, this would be computed from the circuit
         let public_inputs = vec![pallas::Base::zero()];
         
         // Create proof transcript
@@ -170,10 +165,11 @@ impl HardwareProver {
         
         // Generate the proof
         create_proof::<
-            KZGCommitmentScheme<vesta::Affine>,
-            ProverSHPLONK<vesta::Affine>,
+            IPACommitmentScheme<vesta::Affine>,
+            ProverIPA<vesta::Affine>,
             Challenge255<vesta::Affine>,
             _,
+            Blake2bWrite<_, _, Challenge255<_>>,
             _,
         >(
             params,
