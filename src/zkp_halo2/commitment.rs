@@ -104,7 +104,10 @@ impl PoseidonCommitment {
     /// 
     /// Strings are encoded as UTF-8 bytes, then packed into field elements.
     /// Each field element can hold up to 31 bytes to ensure it fits in the field.
-    pub fn encode_string_to_field_elements<F: PrimeField>(s: &str) -> Vec<F> {
+    pub fn encode_string_to_field_elements<F: PrimeField>(s: &str) -> Vec<F> 
+    where
+        F::Repr: From<[u8; 32]>,
+    {
         Self::encode_bytes_to_field_elements(s.as_bytes())
     }
     
