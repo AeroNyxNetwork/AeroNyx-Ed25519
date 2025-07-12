@@ -1,5 +1,36 @@
 // src/zkp_halo2/tests.rs
-// Complete integration test for the ZKP system
+// AeroNyx Privacy Network - Zero-Knowledge Proof Test Suite
+// Version: 1.0.0
+//
+// Copyright (c) 2024 AeroNyx Team
+// SPDX-License-Identifier: MIT
+//
+// This module contains comprehensive tests for the zero-knowledge proof system.
+// Tests verify the correctness, security properties, and performance of the
+// hardware attestation implementation.
+//
+// ## Test Categories
+//
+// 1. **Unit Tests**: Individual component functionality
+// 2. **Integration Tests**: End-to-end proof generation and verification
+// 3. **Security Tests**: Soundness and zero-knowledge properties
+// 4. **Performance Tests**: Benchmarking proof operations
+//
+// ## Running Tests
+//
+// ```bash
+// # Run all ZKP tests
+// cargo test --package AeroNyx-Private-Ed25519 zkp_halo2
+//
+// # Run with output for debugging
+// cargo test --package AeroNyx-Private-Ed25519 zkp_halo2 -- --nocapture
+//
+// # Run specific test
+// cargo test test_full_zkp_flow -- --nocapture
+// ```
+//
+// These tests ensure the ZKP system meets the security and performance
+// requirements of the AeroNyx DePIN network.
 
 #[cfg(test)]
 mod tests {
