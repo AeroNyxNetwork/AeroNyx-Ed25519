@@ -11,7 +11,7 @@
 // change in cloud environments, avoiding volatile attributes like disk size or memory.
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, warn, info};
+use tracing::{debug, warn, info};
 use sha2::{Sha256, Digest};
 use std::collections::BTreeSet;
 
@@ -161,7 +161,7 @@ impl HardwareInfo {
         let mut hasher = Sha256::new();
         
         // 1. Primary identifier: MAC addresses (very stable)
-        let mut mac_addresses: BTreeSet<String> = self.network.interfaces
+        let mac_addresses: BTreeSet<String> = self.network.interfaces
             .iter()
             .filter(|iface| {
                 iface.is_physical && 
@@ -212,6 +212,26 @@ impl HardwareInfo {
         
         let result = hasher.finalize();
         hex::encode(result)
+    }
+    
+    /// Generate a zero-knowledge commitment for this hardware
+    pub fn generate_zkp_commitment(&self) -> Vec<u8> {
+        use crate::zkp::circuit::HardwareCommitment;
+        
+        let commitment = HardwareCommitment::from_hardware_info(self);
+        commitment.to_bytes()
+    }
+    
+    /// Create a deterministic serialization for ZKP circuit input
+    pub fn to_zkp_bytes(&self) -> Result<Vec<u8>, String> {
+        bincode::serialize(self)
+            .map_err(|e| format!("Failed to serialize hardware info for ZKP: {}", e))
+    }
+    
+    /// Verify that this hardware matches a given commitment
+    pub fn verify_commitment(&self, commitment: &[u8]) -> bool {
+        let computed = self.generate_zkp_commitment();
+        computed == commitment
     }
     
     /// Generate a human-readable summary of the fingerprint components
@@ -755,6 +775,13 @@ mod tests {
         let fingerprint = info.generate_fingerprint();
         assert_eq!(fingerprint.len(), 64); // SHA256 hex string length
         
+        // Test ZKP commitment generation
+        let commitment = info.generate_zkp_commitment();
+        assert_eq!(commitment.len(), 32); // SHA256 bytes
+        
+        // Test commitment verification
+        assert!(info.verify_commitment(&commitment));
+        
         // Test fingerprint summary
         let summary = info.generate_fingerprint_summary();
         assert!(!summary.is_empty());
@@ -821,13 +848,22 @@ mod tests {
         assert_eq!(fingerprint1, fingerprint2, 
                    "Fingerprint changed despite only volatile attributes changing");
         
+        // Test ZKP commitments also remain stable
+        let commitment1 = hw_info1.generate_zkp_commitment();
+        let commitment2 = hw_info2.generate_zkp_commitment();
+        assert_eq!(commitment1, commitment2,
+                   "ZKP commitment changed despite only volatile attributes changing");
+        
         // Now change a stable attribute
         hw_info2.network.interfaces[0].mac_address = "11:22:33:44:55:66".to_string();
         let fingerprint3 = hw_info2.generate_fingerprint();
+        let commitment3 = hw_info2.generate_zkp_commitment();
         
-        // Fingerprint should change when MAC address changes
+        // Fingerprint and commitment should change when MAC address changes
         assert_ne!(fingerprint1, fingerprint3, 
                    "Fingerprint didn't change when MAC address changed");
+        assert_ne!(commitment1, commitment3,
+                   "ZKP commitment didn't change when MAC address changed");
     }
     
     #[test]
@@ -848,5 +884,46 @@ mod tests {
         assert_eq!(HardwareInfo::determine_interface_type("docker0"), "bridge");
         assert_eq!(HardwareInfo::determine_interface_type("tun0"), "tunnel");
         assert_eq!(HardwareInfo::determine_interface_type("weird0"), "other");
+    }
+    
+    #[test]
+    fn test_zkp_serialization() {
+        let hw_info = HardwareInfo {
+            hostname: "test".to_string(),
+            cpu: CpuInfo {
+                cores: 4,
+                model: "Test CPU".to_string(),
+                frequency: 2400000000,
+                architecture: "x86_64".to_string(),
+                vendor_id: None,
+            },
+            memory: MemoryInfo {
+                total: 8000000000,
+                available: 4000000000,
+            },
+            disk: DiskInfo {
+                total: 500000000000,
+                available: 250000000000,
+                filesystem: "ext4".to_string(),
+            },
+            network: NetworkInfo {
+                interfaces: vec![],
+                public_ip: "1.2.3.4".to_string(),
+            },
+            os: OsInfo {
+                os_type: "linux".to_string(),
+                version: "22.04".to_string(),
+                distribution: "Ubuntu".to_string(),
+                kernel: "5.15.0".to_string(),
+            },
+            system_uuid: None,
+            machine_id: None,
+            bios_info: None,
+        };
+        
+        // Test serialization
+        let zkp_bytes = hw_info.to_zkp_bytes();
+        assert!(zkp_bytes.is_ok());
+        assert!(!zkp_bytes.unwrap().is_empty());
     }
 }
