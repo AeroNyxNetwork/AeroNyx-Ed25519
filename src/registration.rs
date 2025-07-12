@@ -591,7 +591,7 @@ impl RegistrationManager {
     }
 
     /// Generate and store hardware commitment during registration
-    pub async fn generate_hardware_commitment(
+     pub async fn generate_hardware_commitment(
         &mut self,
         hardware_info: &HardwareInfo,
     ) -> Result<Vec<u8>, String> {
