@@ -1,6 +1,6 @@
 // src/zkp_halo2/prover.rs
 // AeroNyx Privacy Network - Zero-Knowledge Proof Generation
-// Version: 2.0.0
+// Version: 3.0.0
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, debug};
@@ -9,15 +9,13 @@ use pasta_curves::pallas;
 use halo2_proofs::{
     plonk::{
         create_proof, keygen_pk, keygen_vk, verify_proof,
-        ProvingKey, VerifyingKey,
     },
     poly::{
         ipa::{
             commitment::{IPACommitmentScheme, ParamsIPA},
             multiopen::{ProverIPA, VerifierIPA},
-            strategy::AccumulatorStrategy,
+            strategy::SingleStrategy,
         },
-        VerificationStrategy,
     },
     transcript::{
         Blake2bRead, Blake2bWrite, Challenge255,
@@ -39,36 +37,20 @@ pub fn generate_setup_params(k: u32) -> Result<SetupParams, String> {
     // Generate IPA parameters (no trusted setup needed)
     let params = ParamsIPA::<pallas::Affine>::new(k);
     
-    // Create empty circuit for key generation
-    let empty_circuit = HardwareCircuit::without_witnesses();
-    
-    // Generate verification key
-    let vk = keygen_vk(&params, &empty_circuit)
-        .map_err(|e| format!("Failed to generate verification key: {:?}", e))?;
-    
-    // Generate proving key
-    let pk = keygen_pk(&params, vk.clone(), &empty_circuit)
-        .map_err(|e| format!("Failed to generate proving key: {:?}", e))?;
-    
-    // Serialize parameters
+    // Serialize parameters only
     let mut srs_bytes = Vec::new();
     params.write(&mut srs_bytes)
         .map_err(|e| format!("Failed to serialize params: {:?}", e))?;
     
-    // Serialize keys using bincode
-    let vk_bytes = bincode::serialize(&vk)
-        .map_err(|e| format!("Failed to serialize vk: {:?}", e))?;
+    // Store k value and param size for later reconstruction
+    let metadata = format!("IPA_PARAMS_K{}_SIZE{}", k, srs_bytes.len());
     
-    let pk_bytes = bincode::serialize(&pk)
-        .map_err(|e| format!("Failed to serialize pk: {:?}", e))?;
-    
-    info!("Setup complete - SRS: {} bytes, VK: {} bytes, PK: {} bytes", 
-          srs_bytes.len(), vk_bytes.len(), pk_bytes.len());
+    info!("Setup complete - SRS: {} bytes", srs_bytes.len());
     
     Ok(SetupParams {
         srs: srs_bytes,
-        verifying_key: vk_bytes,
-        proving_key: Some(pk_bytes),
+        verifying_key: metadata.into_bytes(), // Store metadata instead of serialized key
+        proving_key: Some(vec![k as u8]), // Just store k value
     })
 }
 
@@ -116,15 +98,24 @@ fn generate_proof_sync(
         return Err("Commitment mismatch - hardware changed".to_string());
     }
     
+    // Extract k from metadata
+    let k = params.proving_key.as_ref()
+        .and_then(|pk| pk.first())
+        .map(|&k| k as u32)
+        .unwrap_or(10);
+    
     // Deserialize parameters
     let ipa_params = ParamsIPA::<pallas::Affine>::read(&mut &params.srs[..])
         .map_err(|e| format!("Failed to deserialize params: {:?}", e))?;
     
-    let pk: ProvingKey<pallas::Affine> = bincode::deserialize(&params.proving_key.as_ref().unwrap())
-        .map_err(|e| format!("Failed to deserialize pk: {:?}", e))?;
-    
     // Create circuit with witnesses
     let circuit = HardwareCircuit::new(cpu_model, mac_address);
+    
+    // Generate fresh keys for this proof
+    let vk = keygen_vk(&ipa_params, &circuit)
+        .map_err(|e| format!("Failed to generate vk: {:?}", e))?;
+    let pk = keygen_pk(&ipa_params, vk, &circuit)
+        .map_err(|e| format!("Failed to generate pk: {:?}", e))?;
     
     // Create proof
     let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
@@ -193,11 +184,13 @@ pub fn verify_hardware_proof(
     let ipa_params = ParamsIPA::<pallas::Affine>::read(&mut &params.srs[..])
         .map_err(|e| format!("Failed to deserialize params: {:?}", e))?;
     
-    let vk: VerifyingKey<pallas::Affine> = bincode::deserialize(&params.verifying_key)
-        .map_err(|e| format!("Failed to deserialize vk: {:?}", e))?;
+    // Generate verification key (we need the circuit structure)
+    let empty_circuit = HardwareCircuit::without_witnesses();
+    let vk = keygen_vk(&ipa_params, &empty_circuit)
+        .map_err(|e| format!("Failed to generate vk: {:?}", e))?;
     
     // Create verifier
-    let strategy = AccumulatorStrategy::new(&ipa_params);
+    let strategy = SingleStrategy::new(&ipa_params);
     let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof.data[..]);
     
     // Verify proof
@@ -206,7 +199,7 @@ pub fn verify_hardware_proof(
         VerifierIPA<'_, pallas::Affine>,
         Challenge255<pallas::Affine>,
         Blake2bRead<&[u8], pallas::Affine, Challenge255<pallas::Affine>>,
-        AccumulatorStrategy<'_, pallas::Affine>,
+        SingleStrategy<'_, pallas::Affine>,
     >(
         &ipa_params,
         &vk,
@@ -216,21 +209,12 @@ pub fn verify_hardware_proof(
     );
     
     match result {
-        Ok(strategy) => {
-            // Finalize verification
-            match strategy.finalize() {
-                Ok(()) => {
-                    info!("Proof verified successfully");
-                    Ok(true)
-                }
-                Err(e) => {
-                    debug!("Verification failed: {:?}", e);
-                    Ok(false)
-                }
-            }
+        Ok(()) => {
+            info!("Proof verified successfully");
+            Ok(true)
         }
         Err(e) => {
-            debug!("Proof verification error: {:?}", e);
+            debug!("Proof verification failed: {:?}", e);
             Ok(false)
         }
     }
