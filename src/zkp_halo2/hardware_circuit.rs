@@ -49,8 +49,9 @@ impl HardwareAttestationCircuit {
                 let mut padded = [0u8; 32];
                 padded[1..chunk.len() + 1].copy_from_slice(chunk);
                 
-                // Use from_repr for proper field element conversion
-                let fe = pallas::Base::from_repr(padded.into()).unwrap();
+                // Use from_repr with proper type hint
+                let fe = pallas::Base::from_repr(padded.into())
+                    .expect("Invalid field element");
                 Value::known(fe)
             })
             .collect()
@@ -68,7 +69,9 @@ impl HardwareAttestationCircuit {
         let mut padded = [0u8; 32];
         padded[1..7].copy_from_slice(&bytes);
         
-        Value::known(pallas::Base::from_repr(padded.into()).unwrap())
+        let fe = pallas::Base::from_repr(padded.into())
+            .expect("Invalid MAC address encoding");
+        Value::known(fe)
     }
 }
 
@@ -261,5 +264,7 @@ pub fn compute_expected_commitment(cpu_model: &str, mac_address: &str) -> pallas
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&hash);
     
-    pallas::Base::from_repr(bytes.into()).unwrap_or(pallas::Base::ZERO)
+    let fe = pallas::Base::from_repr(bytes.into())
+        .unwrap_or(pallas::Base::ZERO);
+    fe
 }
