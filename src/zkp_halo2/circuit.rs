@@ -4,18 +4,13 @@ use halo2_proofs::{
         Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector,
         keygen_pk, keygen_vk,
     },
-    poly::{
-        commitment::{Params, ParamsProver},
-        ipa::{
-            commitment::{IPACommitmentScheme, ParamsIPA},
-            multiopen::ProverIPA,
-            strategy::SingleStrategy,
-        },
-        VerificationStrategy,
+    poly::kzg::{
+        commitment::{KZGCommitmentScheme, ParamsKZG},
+        multiopen::ProverGWC,
     },
     transcript::{
         Blake2bRead, Blake2bWrite, Challenge255,
-        TranscriptRead, TranscriptWrite,
+        TranscriptReadBuffer, TranscriptWriterBuffer,
     },
 };
 use ff::{Field, PrimeField};
@@ -65,17 +60,18 @@ pub mod poseidon {
                 })
                 .collect();
             
-            // Create uninitialized arrays - they will be configured later
-            let state = [(); WIDTH].map(|_| Column::<Advice>::new());
+            // We can't create Columns here, they must come from configure
+            // So we'll use a dummy representation
+            let state = [(); WIDTH].map(|_| unsafe { std::mem::zeroed() });
             
             Self {
                 state,
-                partial_sbox: Column::<Advice>::new(),
+                partial_sbox: unsafe { std::mem::zeroed() },
                 round_constants,
                 mds_matrix,
                 full_rounds,
                 partial_rounds,
-                selector: Selector::new(),
+                selector: unsafe { std::mem::zeroed() },
             }
         }
         
@@ -567,9 +563,10 @@ impl Circuit<pallas::Base> for CombinedCircuit {
 
 /// Generate setup parameters for the proof system
 pub fn generate_setup_params() -> Result<SetupParams, String> {
-    // For halo2 0.2.0, we use IPA commitment scheme instead of KZG
-    // Generate trusted setup parameters
-    let params = ParamsIPA::<vesta::Affine>::new(CIRCUIT_DEGREE);
+    use halo2_proofs::poly::commitment::Params;
+    
+    // Generate trusted setup parameters using KZG
+    let params = ParamsKZG::<vesta::Affine>::setup(CIRCUIT_DEGREE, OsRng);
     
     // Generate verification keys for each circuit type
     let cpu_circuit = CpuCircuit::default();
@@ -580,15 +577,15 @@ pub fn generate_setup_params() -> Result<SetupParams, String> {
     let pk = keygen_pk(&params, vk.clone(), &cpu_circuit)
         .map_err(|e| format!("Failed to generate pk: {:?}", e))?;
     
-    // Serialize parameters - for halo2 0.2.0 we need to implement custom serialization
-    // Since the keys don't have built-in serialization, we'll use a simplified approach
-    let srs = bincode::serialize(&params.k())
-        .map_err(|e| format!("Failed to serialize k: {}", e))?;
+    // Serialize parameters using bincode
+    let srs = bincode::serialize(&params)
+        .map_err(|e| format!("Failed to serialize params: {}", e))?;
     
-    // For now, we'll store empty bytes for keys and regenerate them when needed
-    // In production, you'd implement proper serialization
-    let verifying_key = vec![1u8; 32]; // Placeholder
-    let proving_key = vec![2u8; 32]; // Placeholder
+    let verifying_key = bincode::serialize(&vk)
+        .map_err(|e| format!("Failed to serialize VK: {}", e))?;
+    
+    let proving_key = bincode::serialize(&pk)
+        .map_err(|e| format!("Failed to serialize PK: {}", e))?;
     
     Ok(SetupParams {
         srs,
