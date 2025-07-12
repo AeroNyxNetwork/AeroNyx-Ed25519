@@ -1,4 +1,3 @@
-//src/zkp_halo2/circuit.rs
 use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
@@ -67,14 +66,17 @@ pub mod poseidon {
                 })
                 .collect();
             
+            // Create empty arrays for state
+            let state = std::array::from_fn(|_| Column::<Advice>::default());
+            
             Self {
-                state: Default::default(),
-                partial_sbox: Default::default(),
+                state,
+                partial_sbox: Column::<Advice>::default(),
                 round_constants,
                 mds_matrix,
                 full_rounds,
                 partial_rounds,
-                selector: Default::default(),
+                selector: Selector::default(),
             }
         }
         
@@ -295,7 +297,7 @@ impl Circuit<pallas::Base> for CpuCircuit {
         
         // Configure Poseidon constraints
         let partial_sbox = meta.advice_column();
-        let _poseidon_config = poseidon::PoseidonConfig::configure(
+        let _poseidon_config = poseidon::PoseidonConfig::<pallas::Base, 3, 2>::configure(
             meta,
             state,
             partial_sbox,
@@ -358,7 +360,7 @@ impl Circuit<pallas::Base> for CpuCircuit {
         )?;
         
         // Constrain hash to public input
-        layouter.constrain_instance(hash_cell, config.instance, 0)?;
+        layouter.constrain_instance(hash_cell.cell(), config.instance, 0)?;
         
         Ok(())
     }
@@ -440,7 +442,7 @@ impl Circuit<pallas::Base> for MacCircuit {
         )?;
         
         // Constrain to public input
-        layouter.constrain_instance(hash_cell, config.instance, 0)?;
+        layouter.constrain_instance(hash_cell.cell(), config.instance, 0)?;
         
         Ok(())
     }
@@ -558,7 +560,7 @@ impl Circuit<pallas::Base> for CombinedCircuit {
         )?;
         
         // Constrain to public input
-        layouter.constrain_instance(hash_cell, config.instance, 0)?;
+        layouter.constrain_instance(hash_cell.cell(), config.instance, 0)?;
         
         Ok(())
     }
@@ -580,20 +582,23 @@ pub fn generate_setup_params() -> Result<SetupParams, String> {
     let pk = keygen_pk(&params, vk.clone(), &cpu_circuit)
         .map_err(|e| format!("Failed to generate pk: {:?}", e))?;
     
-    // Serialize parameters
-    let srs = bincode::serialize(&params)
-        .map_err(|e| format!("Failed to serialize SRS: {}", e))?;
+    // Serialize parameters using write/read methods
+    let mut srs_bytes = Vec::new();
+    params.write(&mut srs_bytes)
+        .map_err(|e| format!("Failed to write SRS: {}", e))?;
     
-    let verifying_key = bincode::serialize(&vk)
-        .map_err(|e| format!("Failed to serialize VK: {}", e))?;
+    let mut vk_bytes = Vec::new();
+    vk.write(&mut vk_bytes)
+        .map_err(|e| format!("Failed to write VK: {}", e))?;
     
-    let proving_key = bincode::serialize(&pk)
-        .map_err(|e| format!("Failed to serialize PK: {}", e))?;
+    let mut pk_bytes = Vec::new();
+    pk.write(&mut pk_bytes)
+        .map_err(|e| format!("Failed to write PK: {}", e))?;
     
     Ok(SetupParams {
-        srs,
-        verifying_key,
-        proving_key: Some(proving_key),
+        srs: srs_bytes,
+        verifying_key: vk_bytes,
+        proving_key: Some(pk_bytes),
     })
 }
 
