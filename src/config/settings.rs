@@ -459,17 +459,14 @@ impl ServerConfig {
         
         // Create registration data matching StoredRegistration structure
         let registration_data = StoredRegistration {
-            reference_code: reference_code.to_string(),
-            wallet_address: wallet_address.to_string(),
-            hardware_fingerprint: hardware_fingerprint.to_string(),
-            registered_at: Utc::now().to_rfc3339(),
-            node_type: match self.mode {
-                NodeMode::DePINOnly => "depin",
-                NodeMode::VPNEnabled => "vpn",
-                NodeMode::Hybrid => "hybrid",
-            }.to_string(),
+            reference_code,
+            wallet_address,
+            hardware_fingerprint,
+            registered_at: chrono::Utc::now().to_rfc3339(),
+            node_type: "DePIN".to_string(),
             version: 2,
             hardware_components: None,
+            hardware_commitment: None,  // Add this line
         };
         
         // Save to a file in the data directory
