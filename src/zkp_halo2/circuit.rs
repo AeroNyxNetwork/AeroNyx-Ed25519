@@ -1,10 +1,8 @@
 use halo2_proofs::{
-    arithmetic::Field,
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
         Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector,
     },
-    poly::Rotation,
 };
 use ff::PrimeField;
 use pasta_curves::pallas;
@@ -111,7 +109,7 @@ pub mod poseidon {
         ) -> Result<AssignedCell<F, F>, Error> {
             layouter.assign_region(
                 || "poseidon hash",
-                || region| {
+                |_region| {
                     // Simplified: just return the first input
                     Ok(inputs[0].clone())
                 },
