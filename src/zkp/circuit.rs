@@ -5,7 +5,7 @@ use sha2::{Sha256, Digest};
 use crate::hardware::HardwareInfo;
 use serde::{Serialize, Deserialize};
 use ed25519_dalek::{Keypair, PublicKey, SecretKey};
-use rand_core::OsRng;
+use rand::rngs::OsRng;
 use std::collections::BTreeMap;
 
 /// Hardware commitment structure representing a cryptographic commitment to hardware state
