@@ -790,7 +790,7 @@ async fn handle_delete_chat_request(
     /// Add random padding to a packet
     fn add_padding(&self, packet: &[u8]) -> Vec<u8> {
         let mut rng = thread_rng();
-        let padding_len = rng.gen_range(MIN_PADDING_SIZE..=MAX_PADDING_SIZE);
+        let padding_len = rng.gen_range(MIN_PADDING_SIZE, MAX_PADDING_SIZE + 1);
 
         let mut result = Vec::with_capacity(packet.len() + padding_len + 2);
 
