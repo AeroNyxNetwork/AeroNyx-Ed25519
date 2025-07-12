@@ -421,7 +421,7 @@ pub fn derive_session_key(shared_secret: &[u8], salt: &[u8]) -> Result<Vec<u8>, 
 /// Add padding to a packet
 pub fn add_padding(packet: &[u8], min_padding: usize, max_padding: usize) -> Vec<u8> {
     let mut rng = rand::thread_rng();
-    let padding_len = rng.gen_range(min_padding, max_padding + 1);
+    let padding_len = rng.gen_range(min_padding..=max_padding);
 
     let mut result = Vec::with_capacity(packet.len() + padding_len + 2);
 
