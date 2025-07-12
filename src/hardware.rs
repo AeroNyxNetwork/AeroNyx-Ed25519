@@ -219,11 +219,12 @@ impl HardwareInfo {
         use crate::zkp_halo2::commitment::PoseidonCommitment;
         
         // Get the first physical MAC address
+        let default_mac = "00:00:00:00:00:00".to_string();
         let mac = self.network.interfaces
             .iter()
             .find(|iface| iface.is_physical && iface.mac_address != "00:00:00:00:00:00")
             .map(|iface| &iface.mac_address)
-            .unwrap_or(&"00:00:00:00:00:00".to_string());
+            .unwrap_or(&default_mac);
         
         // Generate combined commitment (CPU + MAC)
         let commitment = PoseidonCommitment::commit_combined(
