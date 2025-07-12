@@ -5,7 +5,7 @@ use sha2::{Sha256, Digest};
 use crate::hardware::HardwareInfo;
 use serde::{Serialize, Deserialize};
 use ed25519_dalek::{Keypair, PublicKey, SecretKey};
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use std::collections::BTreeMap;
 
 /// Hardware commitment structure representing a cryptographic commitment to hardware state
@@ -242,7 +242,7 @@ pub struct HardwareCircuitConfig {
 }
 
 /// Parameters for the circuit
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitParams {
     /// Security parameter (bits of security)
     pub security_bits: usize,
