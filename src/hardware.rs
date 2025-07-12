@@ -216,10 +216,22 @@ impl HardwareInfo {
     
     /// Generate a zero-knowledge commitment for this hardware
     pub fn generate_zkp_commitment(&self) -> Vec<u8> {
-        use crate::zkp::circuit::HardwareCommitment;
+        use crate::zkp_halo2::commitment::PoseidonCommitment;
         
-        let commitment = HardwareCommitment::from_hardware_info(self);
-        commitment.to_bytes()
+        // Get the first physical MAC address
+        let mac = self.network.interfaces
+            .iter()
+            .find(|iface| iface.is_physical && iface.mac_address != "00:00:00:00:00:00")
+            .map(|iface| &iface.mac_address)
+            .unwrap_or(&"00:00:00:00:00:00".to_string());
+        
+        // Generate combined commitment (CPU + MAC)
+        let commitment = PoseidonCommitment::commit_combined(
+            &self.cpu.model,
+            mac
+        );
+        
+        commitment.to_vec()
     }
     
     /// Create a deterministic serialization for ZKP circuit input
