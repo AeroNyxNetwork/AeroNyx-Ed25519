@@ -34,7 +34,7 @@ use crate::zkp_halo2::types::{Proof, SetupParams};
 
 /// Re-export the verification function from the prover module
 /// to maintain API compatibility
-pub use crate::zkp_halo2::prover::{verify_hardware_proof, HardwareVerifier};
+pub use crate::zkp_halo2::prover::verify_hardware_proof;
 
 /// Batch verification functionality for efficiency
 /// 
