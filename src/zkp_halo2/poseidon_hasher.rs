@@ -322,12 +322,13 @@ impl<F: Field> PoseidonChip<F> {
             tmp.pow(&[self.params.alpha, 0, 0, 0])
         });
         
-        region.assign_advice(
-            || "partial_sbox",
-            self.config.partial_sbox,
-            *row,
-            || sbox_0,
-        )?;
+            // Assign S-box output
+            let sbox_5 = region.assign_advice(
+                || "partial_sbox",
+                self.config.partial_sbox,
+                *row,
+                || sbox_0,
+            )?;
         
         let mut next_state = [Value::unknown(); 3];
         for i in 0..3 {
