@@ -23,13 +23,13 @@ use futures_util::{SinkExt, StreamExt};
 use std::path::PathBuf;
 use std::fs;
 use std::collections::HashSet;
+use crate::zkp_halo2::{generate_hardware_proof, verify_hardware_proof, SetupParams, Proof};
 
 use crate::config::settings::ServerConfig;
 use crate::server::metrics::ServerMetricsCollector;
 use crate::utils;
 use crate::hardware::HardwareInfo;
 use crate::remote_management::{RemoteCommand, RemoteManagementHandler, CommandResponse};
-use crate::zkp::{generate_hardware_proof, verify_hardware_proof, SetupParams, Proof};
 
 /// Generic API response wrapper
 #[derive(Debug, Deserialize, Serialize)]
@@ -267,8 +267,8 @@ impl RegistrationManager {
 
     /// Initialize ZKP parameters (call this during startup)
     pub async fn initialize_zkp(&self) -> Result<SetupParams, String> {
-        info!("Initializing zero-knowledge proof parameters");
-        crate::zkp::initialize().await
+        info!("Initializing Halo2 zero-knowledge proof parameters");
+        crate::zkp_halo2::initialize().await
     }
 
     /// Set ZKP parameters
@@ -569,6 +569,31 @@ impl RegistrationManager {
             cpu_model: hw.cpu.model.clone(),
             bios_info,
         }
+    }
+
+    /// Create a deterministic serialization for ZKP circuit input
+    pub fn to_zkp_bytes(&self) -> Result<Vec<u8>, String> {
+        // Use the commitment generation method which already handles serialization
+        Ok(self.generate_zkp_commitment())
+    }
+
+    pub fn generate_zkp_commitment(&self) -> Vec<u8> {
+        use crate::zkp_halo2::commitment::PoseidonCommitment;
+        
+        // Get first physical MAC address
+        let mac = self.network.interfaces
+            .iter()
+            .find(|iface| iface.is_physical && iface.mac_address != "00:00:00:00:00:00")
+            .map(|iface| &iface.mac_address)
+            .unwrap_or(&"00:00:00:00:00:00".to_string());
+        
+        // Generate combined commitment (CPU + MAC)
+        let commitment = PoseidonCommitment::commit_combined(
+            &self.cpu.model,
+            mac
+        );
+        
+        commitment.to_vec()
     }
 
     /// Generate and store hardware commitment during registration
