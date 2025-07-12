@@ -51,7 +51,7 @@ pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, hex::FromHexError> {
 
 /// Generate random padding bytes
 pub fn generate_padding(min_size: usize, max_size: usize) -> Vec<u8> {
-    let size = thread_rng().gen_range(min_size, max_size + 1);
+    let size = thread_rng().gen_range(min_size..=max_size);
     let mut padding = vec![0u8; size];
     thread_rng().fill(&mut padding[..]);
     padding
