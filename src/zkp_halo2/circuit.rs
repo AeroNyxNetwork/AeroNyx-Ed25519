@@ -1,5 +1,4 @@
 use halo2_proofs::{
-    arithmetic::Field,
     circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
     plonk::{
         Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector,
@@ -28,8 +27,7 @@ use crate::zkp_halo2::types::{constants::*, SetupParams};
 pub mod poseidon {
     use ff::PrimeField;
     use halo2_proofs::{
-        arithmetic::Field,
-        circuit::{AssignedCell, Chip, Layouter, Region, Value},
+        circuit::{AssignedCell, Layouter, Region, Value},
         plonk::{Advice, Column, ConstraintSystem, Error, Expression, Selector},
         poly::Rotation,
     };
