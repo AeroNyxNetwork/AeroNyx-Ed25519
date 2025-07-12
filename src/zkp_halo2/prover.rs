@@ -112,8 +112,8 @@ impl HardwareProver {
         info!("Starting proof generation for {:?}", proof_type);
         
         // Deserialize parameters
-        let params: ParamsKZG<vesta::Affine> = bincode::deserialize(&setup.srs)
-            .map_err(|e| format!("Failed to deserialize params: {}", e))?;
+        let params = ParamsKZG::<vesta::Affine>::read(&mut &setup.srs[..])
+            .map_err(|e| format!("Failed to read params: {}", e))?;
         
         // Create appropriate circuit
         let proof_bytes = match proof_type {
@@ -146,15 +146,17 @@ impl HardwareProver {
     where
         C: halo2_proofs::plonk::Circuit<pallas::Base>,
     {
+        use halo2_proofs::poly::commitment::Params;
+        
         // Get or generate proving key
         let pk = if let Some(pk_bytes) = &setup.proving_key {
             debug!("Using cached proving key");
-            bincode::deserialize(pk_bytes)
-                .map_err(|e| format!("Failed to deserialize pk: {}", e))?
+            halo2_proofs::plonk::ProvingKey::<vesta::Affine>::read(&mut &pk_bytes[..])
+                .map_err(|e| format!("Failed to read pk: {:?}", e))?
         } else {
             debug!("Generating proving key");
-            let vk = bincode::deserialize(&setup.verifying_key)
-                .map_err(|e| format!("Failed to deserialize vk: {}", e))?;
+            let vk = halo2_proofs::plonk::VerifyingKey::<vesta::Affine>::read(&mut &setup.verifying_key[..])
+                .map_err(|e| format!("Failed to read vk: {:?}", e))?;
             keygen_pk(params, vk, &circuit)
                 .map_err(|e| format!("Failed to generate pk: {:?}", e))?
         };
@@ -172,7 +174,6 @@ impl HardwareProver {
             ProverSHPLONK<vesta::Affine>,
             Challenge255<vesta::Affine>,
             _,
-            Blake2bWrite<_, _, Challenge255<_>>,
             _,
         >(
             params,
