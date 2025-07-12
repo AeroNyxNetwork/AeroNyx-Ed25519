@@ -2,14 +2,11 @@ use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tracing::{info, debug};
 use halo2_proofs::{
     plonk::{create_proof, keygen_pk, keygen_vk},
-    poly::{
-        commitment::{Params, ParamsProver},
-        ipa::{
-            commitment::{IPACommitmentScheme, ParamsIPA},
-            multiopen::ProverIPA,
-        },
+    poly::kzg::{
+        commitment::{KZGCommitmentScheme, ParamsKZG},
+        multiopen::ProverGWC,
     },
-    transcript::{Blake2bWrite, Challenge255, TranscriptWrite},
+    transcript::{Blake2bWrite, Challenge255, TranscriptWriterBuffer},
 };
 use pasta_curves::{pallas, vesta};
 use rand_core::OsRng;
@@ -114,24 +111,23 @@ impl HardwareProver {
         let start = Instant::now();
         info!("Starting proof generation for {:?}", proof_type);
         
-        // For simplified version, regenerate params from k
-        let k: u32 = bincode::deserialize(&setup.srs)
-            .map_err(|e| format!("Failed to deserialize k: {}", e))?;
-        let params = ParamsIPA::<vesta::Affine>::new(k);
+        // Deserialize parameters
+        let params: ParamsKZG<vesta::Affine> = bincode::deserialize(&setup.srs)
+            .map_err(|e| format!("Failed to deserialize params: {}", e))?;
         
         // Create appropriate circuit and generate proof
         let proof_bytes = match proof_type {
             ProofType::CpuModel => {
                 let circuit = CpuCircuit::new(cpu_model);
-                Self::create_proof_for_circuit(circuit, &params)?
+                Self::create_proof_for_circuit(circuit, &params, setup)?
             }
             ProofType::MacAddress => {
                 let circuit = MacCircuit::new(mac_address);
-                Self::create_proof_for_circuit(circuit, &params)?
+                Self::create_proof_for_circuit(circuit, &params, setup)?
             }
             ProofType::Combined => {
                 let circuit = CombinedCircuit::new(cpu_model, mac_address);
-                Self::create_proof_for_circuit(circuit, &params)?
+                Self::create_proof_for_circuit(circuit, &params, setup)?
             }
         };
         
@@ -144,18 +140,24 @@ impl HardwareProver {
     /// Create proof for a specific circuit
     fn create_proof_for_circuit<C>(
         circuit: C,
-        params: &ParamsIPA<vesta::Affine>,
+        params: &ParamsKZG<vesta::Affine>,
+        setup: &SetupParams,
     ) -> Result<Vec<u8>, String>
     where
         C: halo2_proofs::plonk::Circuit<pallas::Base>,
     {
-        // Generate verification key
-        let vk = keygen_vk(params, &circuit)
-            .map_err(|e| format!("Failed to generate vk: {:?}", e))?;
-        
-        // Generate proving key
-        let pk = keygen_pk(params, vk.clone(), &circuit)
-            .map_err(|e| format!("Failed to generate pk: {:?}", e))?;
+        // Get or generate proving key
+        let pk = if let Some(pk_bytes) = &setup.proving_key {
+            debug!("Using cached proving key");
+            bincode::deserialize(pk_bytes)
+                .map_err(|e| format!("Failed to deserialize pk: {}", e))?
+        } else {
+            debug!("Generating proving key");
+            let vk = bincode::deserialize(&setup.verifying_key)
+                .map_err(|e| format!("Failed to deserialize vk: {}", e))?;
+            keygen_pk(params, vk, &circuit)
+                .map_err(|e| format!("Failed to generate pk: {:?}", e))?
+        };
         
         // Calculate public inputs (commitment)
         let public_inputs = vec![pallas::Base::zero()];
@@ -163,14 +165,13 @@ impl HardwareProver {
         // Create proof transcript
         let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
         
-        // Generate the proof
+        // Generate the proof (5 type parameters for halo2_proofs 0.3.0)
         create_proof::<
-            IPACommitmentScheme<vesta::Affine>,
-            ProverIPA<vesta::Affine>,
+            KZGCommitmentScheme<vesta::Affine>,
+            ProverGWC<vesta::Affine>,
             Challenge255<vesta::Affine>,
             _,
             Blake2bWrite<_, _, Challenge255<_>>,
-            _,
         >(
             params,
             &pk,
