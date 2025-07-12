@@ -8,6 +8,7 @@ use ed25519_dalek::{Keypair, SecretKey, Signature, Signer};
 use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize};
 use rand::{Rng, RngCore};
+use rand_core::OsRng;
 
 use crate::hardware::HardwareInfo;
 use crate::zkp::{
@@ -45,7 +46,8 @@ pub struct HardwareProofData {
     /// Challenge value
     challenge: [u8; 32],
     /// Response to challenge (signature)
-    response: [u8; 64],
+    #[serde(with = "serde_bytes")]
+    response: Vec<u8>,
     /// Auxiliary data for verification
     aux_data: ProofAuxData,
 }
@@ -189,11 +191,11 @@ impl HardwareProver {
         
         // Generate cryptographic nonce
         let mut nonce = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        OsRng.fill_bytes(&mut nonce);
         
         // Generate blinding factor for zero-knowledge property
         let mut blinding_factor = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut blinding_factor);
+        OsRng.fill_bytes(&mut blinding_factor);
         
         // Create metadata hash
         let metadata_hash = Self::compute_metadata_hash(&hardware_data, &nonce);
@@ -225,7 +227,7 @@ impl HardwareProver {
             version: 1,
             commitment: commitment_array,
             challenge,
-            response: signature.to_bytes(),
+            response: signature.to_bytes().to_vec(),
             aux_data: ProofAuxData {
                 nonce,
                 blinding_factor,
@@ -373,6 +375,7 @@ mod tests {
         let data = proof_data.unwrap();
         assert_eq!(data.version, 1);
         assert_eq!(data.commitment, commitment.value);
+        assert_eq!(data.response.len(), 64); // Ed25519 signature length
     }
     
     #[tokio::test]
