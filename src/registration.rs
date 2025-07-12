@@ -577,25 +577,6 @@ impl RegistrationManager {
         Ok(self.generate_zkp_commitment())
     }
 
-    pub fn generate_zkp_commitment(&self) -> Vec<u8> {
-        use crate::zkp_halo2::commitment::PoseidonCommitment;
-        
-        // Get first physical MAC address
-        let mac = self.network.interfaces
-            .iter()
-            .find(|iface| iface.is_physical && iface.mac_address != "00:00:00:00:00:00")
-            .map(|iface| &iface.mac_address)
-            .unwrap_or(&"00:00:00:00:00:00".to_string());
-        
-        // Generate combined commitment (CPU + MAC)
-        let commitment = PoseidonCommitment::commit_combined(
-            &self.cpu.model,
-            mac
-        );
-        
-        commitment.to_vec()
-    }
-
     /// Generate and store hardware commitment during registration
     pub async fn generate_hardware_commitment(
         &mut self,
