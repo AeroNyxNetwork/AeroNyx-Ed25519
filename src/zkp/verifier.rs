@@ -37,7 +37,8 @@ struct HardwareProofData {
     version: u8,
     commitment: [u8; 32],
     challenge: [u8; 32],
-    response: [u8; 64],
+    #[serde(with = "serde_bytes")]
+    response: Vec<u8>,
     aux_data: ProofAuxData,
 }
 
@@ -231,7 +232,13 @@ impl HardwareVerifier {
         }
         
         // Verify signature
-        let signature = Signature::from_bytes(&proof_data.response)
+        if proof_data.response.len() != 64 {
+            return Err(VerifierError::InvalidFormat("Invalid signature length".to_string()));
+        }
+        
+        let mut signature_bytes = [0u8; 64];
+        signature_bytes.copy_from_slice(&proof_data.response);
+        let signature = Signature::from_bytes(&signature_bytes)
             .map_err(|e| VerifierError::InvalidFormat(
                 format!("Invalid signature format: {}", e)
             ))?;
