@@ -5,6 +5,7 @@
 use ff::PrimeField;
 use pasta_curves::pallas;
 use sha2::{Digest, Sha256};
+use blake2b_simd::Params as Blake2bParams;
 
 /// Domain separation tags for different input types
 const DOMAIN_CPU: &[u8] = b"AERONYX_CPU_V1";
@@ -82,7 +83,7 @@ pub fn mac_to_field(mac: &str) -> pallas::Base {
 
 /// Generic hash-to-field function with domain separation
 fn hash_to_field(data: &[u8], domain: &[u8]) -> pallas::Base {
-    let hash = Params::new()
+    let hash = Blake2bParams::new()
         .hash_length(32)
         .personal(domain)
         .to_state()
@@ -93,7 +94,7 @@ fn hash_to_field(data: &[u8], domain: &[u8]) -> pallas::Base {
     bytes.copy_from_slice(hash.as_bytes());
     
     // Try direct conversion first
-    pallas::Base::from_repr(bytes).unwrap_or_else(|| {
+    Option::from(pallas::Base::from_repr(bytes)).unwrap_or_else(|| {
         // If it fails (very unlikely), use modular reduction
         reduce_bytes_to_field(&bytes)
     })
@@ -147,11 +148,19 @@ impl PoseidonCommitment {
             return Self::commit_combined(components[0], components[1]);
         }
         
-        // For other cases, use extended commitment
-        let commitment = crate::zkp_halo2::circuit::compute_extended_commitment(components);
-        let repr = commitment.to_repr();
+        // For other cases, use SHA256 to combine all components
+        let mut hasher = Sha256::new();
+        hasher.update(b"AERONYX_MULTI_V1");
+        hasher.update(&(components.len() as u64).to_le_bytes());
+        
+        for component in components {
+            hasher.update(&(component.len() as u64).to_le_bytes());
+            hasher.update(component.as_bytes());
+        }
+        
+        let hash = hasher.finalize();
         let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(repr.as_ref());
+        bytes.copy_from_slice(&hash);
         bytes
     }
 }
@@ -190,7 +199,7 @@ impl BatchCommitment {
         }
         
         // Simple aggregation using Blake2b
-        let hash = Params::new()
+        let hash = Blake2bParams::new()
             .hash_length(32)
             .personal(b"AERONYX_AGGREGATE")
             .to_state()
