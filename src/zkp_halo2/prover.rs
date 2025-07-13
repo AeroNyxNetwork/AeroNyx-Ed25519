@@ -1,23 +1,26 @@
 // src/zkp_halo2/prover.rs
-// AeroNyx Privacy Network - Zero-Knowledge Proof Generation
-// Version: 6.0.0 - 修复 halo2_proofs v0.3 API 兼容性
+// AeroNyx Privacy Network - Production-Ready Zero-Knowledge Proof Generation
+// Version: 8.0.0 - Optimized for production with key caching
 
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{info, debug};
+use tracing::{info, debug, instrument};
 use ff::PrimeField;
 use pasta_curves::{pallas, vesta};
 use halo2_proofs::{
     plonk::{
-        create_proof, keygen_pk, keygen_vk, verify_proof,
+        create_proof, keygen_pk, keygen_vk, verify_proof, ProvingKey, VerifyingKey,
     },
     poly::kzg::{
-        commitment::ParamsKZG,
-        multiopen::ProverGWC,
+        commitment::{KZGCommitmentScheme, ParamsKZG},
+        multiopen::{ProverGWC, VerifierGWC},
         strategy::SingleStrategy,
     },
+    poly::commitment::Params,
     transcript::{
         Blake2bRead, Blake2bWrite, Challenge255,
+        TranscriptReadBuffer, TranscriptWriterBuffer,
     },
+    SerdeFormat,
 };
 use rand::rngs::OsRng;
 
@@ -27,53 +30,14 @@ use crate::zkp_halo2::{
     types::{Proof, SetupParams},
 };
 
-/// Generate setup parameters for the proof system
-pub async fn generate_setup_params(k: u32) -> Result<SetupParams, String> {
-    use tokio::task;
-    
-    info!("Generating Halo2 setup parameters with k={}", k);
-    
-    task::spawn_blocking(move || {
-        // Generate KZG parameters
-        let params = ParamsKZG::<vesta::Affine>::setup(k, OsRng);
-        
-        // Create empty circuit for key generation
-        let empty_circuit = HardwareCircuit::without_witnesses();
-        
-        // Generate verifying key
-        let vk = keygen_vk(&params, &empty_circuit)
-            .map_err(|e| format!("Failed to generate vk: {:?}", e))?;
-        
-        // Generate proving key
-        let pk = keygen_pk(&params, vk.clone(), &empty_circuit)
-            .map_err(|e| format!("Failed to generate pk: {:?}", e))?;
-        
-        // Serialize parameters
-        let mut srs_bytes = Vec::new();
-        params.write(&mut srs_bytes)
-            .map_err(|e| format!("Failed to serialize SRS: {:?}", e))?;
-        
-        // For v0.3, we cannot serialize vk/pk directly
-        // Store only SRS and regenerate keys when needed
-        info!("Setup complete - SRS: {} bytes", srs_bytes.len());
-        
-        Ok(SetupParams {
-            srs: srs_bytes,
-            verifying_key: vec![k as u8], // Store k value only
-            proving_key: None,
-        })
-    })
-    .await
-    .map_err(|e| format!("Task error: {}", e))?
-}
-
-/// Generate a hardware attestation proof
+/// Generate a hardware attestation proof with optimized key handling
+#[instrument(skip_all, fields(hw_cpu = %hardware_info.cpu.model))]
 pub async fn generate_hardware_proof(
     hardware_info: &HardwareInfo,
     commitment: &[u8],
     params: &SetupParams,
 ) -> Result<Proof, String> {
-    info!("Starting ZKP proof generation...");
+    info!("Starting optimized ZKP proof generation...");
     
     // Extract hardware data
     let cpu_model = &hardware_info.cpu.model;
@@ -100,38 +64,7 @@ pub async fn generate_hardware_proof(
     
     // Generate proof in blocking task
     let proof_bytes = tokio::task::spawn_blocking(move || {
-        // Deserialize parameters
-        let srs = ParamsKZG::<vesta::Affine>::read(&mut &params_clone.srs[..])
-            .map_err(|e| format!("Failed to read SRS: {}", e))?;
-        
-        // Regenerate keys (since we can't serialize them in v0.3)
-        let empty_circuit = HardwareCircuit::without_witnesses();
-        let vk = keygen_vk(&srs, &empty_circuit)
-            .map_err(|e| format!("Failed to regenerate vk: {}", e))?;
-        let pk = keygen_pk(&srs, vk, &circuit)
-            .map_err(|e| format!("Failed to generate pk: {}", e))?;
-        
-        // Create proof
-        let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
-        
-        create_proof::<
-            KZGCommitmentScheme<vesta::Affine>,
-            ProverGWC<'_, vesta::Affine>,
-            Challenge255<vesta::Affine>,
-            OsRng,
-            Blake2bWrite<Vec<u8>, vesta::Affine, Challenge255<vesta::Affine>>,
-            HardwareCircuit,
-        >(
-            &srs,
-            &pk,
-            &[circuit],
-            &[&[&public_inputs[..]]],
-            OsRng,
-            &mut transcript,
-        )
-        .map_err(|e| format!("Proof creation failed: {:?}", e))?;
-        
-        Ok(transcript.finalize())
+        generate_proof_internal(circuit, public_inputs, params_clone)
     })
     .await
     .map_err(|e| format!("Proof generation task failed: {}", e))??;
@@ -148,7 +81,62 @@ pub async fn generate_hardware_proof(
     })
 }
 
-/// Verify a hardware attestation proof
+/// Internal proof generation with optimized key handling
+fn generate_proof_internal(
+    circuit: HardwareCircuit,
+    public_inputs: Vec<pallas::Base>,
+    params: SetupParams,
+) -> Result<Vec<u8>, String> {
+    // Deserialize parameters
+    let srs = ParamsKZG::<vesta::Affine>::read(&mut &params.srs[..])
+        .map_err(|e| format!("Failed to read SRS: {}", e))?;
+    
+    // Try to use cached proving key if available
+    let pk = if let Some(pk_bytes) = params.proving_key.as_ref() {
+        debug!("Using cached proving key");
+        bincode::deserialize::<ProvingKey<vesta::Affine>>(pk_bytes)
+            .map_err(|e| format!("Failed to deserialize cached pk: {}", e))?
+    } else {
+        debug!("Generating proving key (no cache available)");
+        // Need to generate vk first
+        let empty_circuit = HardwareCircuit::without_witnesses();
+        let vk = if params.verifying_key.is_empty() {
+            keygen_vk(&srs, &empty_circuit)
+                .map_err(|e| format!("Failed to generate vk: {}", e))?
+        } else {
+            bincode::deserialize::<VerifyingKey<vesta::Affine>>(&params.verifying_key)
+                .map_err(|e| format!("Failed to deserialize vk: {}", e))?
+        };
+        
+        keygen_pk(&srs, vk, &circuit)
+            .map_err(|e| format!("Failed to generate pk: {}", e))?
+    };
+    
+    // Create proof
+    let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+    
+    create_proof::<
+        KZGCommitmentScheme<vesta::Affine>,
+        ProverGWC<'_, vesta::Affine>,
+        Challenge255<vesta::Affine>,
+        OsRng,
+        Blake2bWrite<Vec<u8>, vesta::Affine, Challenge255<vesta::Affine>>,
+        HardwareCircuit,
+    >(
+        &srs,
+        &pk,
+        &[circuit],
+        &[&[&public_inputs[..]]],
+        OsRng,
+        &mut transcript,
+    )
+    .map_err(|e| format!("Proof creation failed: {:?}", e))?;
+    
+    Ok(transcript.finalize())
+}
+
+/// Verify a hardware attestation proof with optimized key handling
+#[instrument(skip_all, fields(proof_size = proof.data.len()))]
 pub fn verify_hardware_proof(
     proof: &Proof,
     commitment: &[u8],
@@ -156,13 +144,13 @@ pub fn verify_hardware_proof(
 ) -> Result<bool, String> {
     info!("Verifying hardware attestation proof...");
     
-    // Check proof freshness (1 hour max)
+    // Check proof freshness (5 minutes max for stricter security)
     let current_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
     
-    const MAX_AGE: u64 = 3600;
+    const MAX_AGE: u64 = 300; // 5 minutes
     if current_time > proof.timestamp + MAX_AGE {
         return Err(format!("Proof expired: {} seconds old", 
                          current_time - proof.timestamp));
@@ -170,22 +158,31 @@ pub fn verify_hardware_proof(
     
     // Check commitment match
     if proof.public_inputs != commitment {
+        debug!("Commitment mismatch in public inputs");
         return Ok(false);
     }
     
     // Parse commitment
     let mut comm_bytes = [0u8; 32];
     comm_bytes.copy_from_slice(commitment);
-    let commitment_point = pallas::Base::from_repr(comm_bytes).unwrap();
+    let commitment_point = pallas::Base::from_repr(comm_bytes)
+        .ok_or("Invalid commitment format")?;
     
     // Deserialize parameters
     let srs = ParamsKZG::<vesta::Affine>::read(&mut &params.srs[..])
         .map_err(|e| format!("Failed to read SRS: {}", e))?;
     
-    // Regenerate vk (since we can't serialize it in v0.3)
-    let empty_circuit = HardwareCircuit::without_witnesses();
-    let vk = keygen_vk(&srs, &empty_circuit)
-        .map_err(|e| format!("Failed to regenerate vk: {}", e))?;
+    // Use cached verifying key if available
+    let vk = if !params.verifying_key.is_empty() {
+        debug!("Using cached verifying key");
+        bincode::deserialize::<VerifyingKey<vesta::Affine>>(&params.verifying_key)
+            .map_err(|e| format!("Failed to deserialize cached vk: {}", e))?
+    } else {
+        debug!("Generating verifying key (no cache)");
+        let empty_circuit = HardwareCircuit::without_witnesses();
+        keygen_vk(&srs, &empty_circuit)
+            .map_err(|e| format!("Failed to generate vk: {}", e))?
+    };
     
     // Verify proof
     let strategy = SingleStrategy::new(&srs);
@@ -217,9 +214,61 @@ pub fn verify_hardware_proof(
     }
 }
 
-// 添加缺失的 KZGCommitmentScheme 类型别名
-use halo2_proofs::poly::kzg::commitment::KZGCommitmentScheme;
-use halo2_proofs::poly::kzg::multiopen::VerifierGWC;
+/// Generate setup parameters for the proof system with full key generation
+pub async fn generate_setup_params(k: u32) -> Result<SetupParams, String> {
+    use crate::zkp_halo2::circuit::HardwareCircuit;
+    
+    info!("Generating Halo2 setup parameters with k={}", k);
+    
+    tokio::task::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        
+        // Generate KZG parameters
+        let params = ParamsKZG::<vesta::Affine>::setup(k, OsRng);
+        debug!("SRS generation took {:?}", start.elapsed());
+        
+        // Create empty circuit for key generation
+        let empty_circuit = HardwareCircuit::without_witnesses();
+        
+        // Generate verifying key
+        let vk_start = std::time::Instant::now();
+        let vk = keygen_vk(&params, &empty_circuit)
+            .map_err(|e| format!("Failed to generate vk: {:?}", e))?;
+        debug!("VK generation took {:?}", vk_start.elapsed());
+        
+        // Generate proving key
+        let pk_start = std::time::Instant::now();
+        let pk = keygen_pk(&params, vk.clone(), &empty_circuit)
+            .map_err(|e| format!("Failed to generate pk: {:?}", e))?;
+        debug!("PK generation took {:?}", pk_start.elapsed());
+        
+        // Serialize all parameters
+        let mut srs_bytes = Vec::new();
+        params.write(&mut srs_bytes)
+            .map_err(|e| format!("Failed to serialize SRS: {:?}", e))?;
+        
+        let vk_bytes = bincode::serialize(&vk)
+            .map_err(|e| format!("Failed to serialize vk: {:?}", e))?;
+        
+        let pk_bytes = bincode::serialize(&pk)
+            .map_err(|e| format!("Failed to serialize pk: {:?}", e))?;
+        
+        info!("Setup complete - SRS: {} KB, VK: {} KB, PK: {} KB", 
+              srs_bytes.len() / 1024,
+              vk_bytes.len() / 1024, 
+              pk_bytes.len() / 1024);
+        
+        info!("Total setup time: {:?}", start.elapsed());
+        
+        Ok(SetupParams {
+            srs: srs_bytes,
+            verifying_key: vk_bytes,
+            proving_key: Some(pk_bytes),
+        })
+    })
+    .await
+    .map_err(|e| format!("Task error: {}", e))?
+}
 
 #[cfg(test)]
 mod tests {
@@ -294,5 +343,25 @@ mod tests {
             .unwrap();
         
         assert!(valid, "Proof should be valid");
+    }
+    
+    #[tokio::test]
+    async fn test_proof_with_wrong_commitment() {
+        let params = generate_setup_params(10).await.unwrap();
+        let hw = create_test_hardware();
+        
+        let commitment = compute_commitment(&hw.cpu.model, &hw.network.interfaces[0].mac_address);
+        let comm_bytes = commitment.to_repr();
+        
+        let proof = generate_hardware_proof(&hw, comm_bytes.as_ref(), &params)
+            .await
+            .unwrap();
+        
+        // Verify with wrong commitment
+        let wrong_commitment = [0u8; 32];
+        let valid = verify_hardware_proof(&proof, &wrong_commitment, &params)
+            .unwrap();
+        
+        assert!(!valid, "Proof should be invalid with wrong commitment");
     }
 }
