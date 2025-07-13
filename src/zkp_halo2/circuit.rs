@@ -1,6 +1,6 @@
 // src/zkp_halo2/circuit.rs
 // AeroNyx Privacy Network - Secure Zero-Knowledge Proof Circuit
-// Version: 6.0.0 - 修复 halo2_gadgets v0.3 API 兼容性
+// Version: 7.0.0 - 使用正确的 halo2_gadgets v0.3 API
 
 use ff::Field;
 use halo2_proofs::{
@@ -75,14 +75,15 @@ impl Circuit<pallas::Base> for HardwareCircuit {
         meta.enable_equality(instance_column);
         
         // Configure Poseidon hash with width 3
-        // For v0.3, we need an additional advice column for partial rounds
         let state = [
             meta.advice_column(),
             meta.advice_column(),
             meta.advice_column(),
         ];
         
+        // For halo2_gadgets v0.3, we need a partial round column
         let partial_sbox = meta.advice_column();
+        meta.enable_equality(partial_sbox);
         
         let rc_a = [
             meta.fixed_column(),
@@ -96,8 +97,7 @@ impl Circuit<pallas::Base> for HardwareCircuit {
             meta.fixed_column(),
         ];
         
-        // Use P128Pow5T3: secure parameters for 128-bit security
-        // v0.3 API: configure takes (meta, state, partial_sbox, rc_a, rc_b)
+        // Configure Poseidon with secure parameters
         let poseidon_config = Pow5Chip::configure::<P128Pow5T3>(
             meta,
             state,
@@ -147,11 +147,12 @@ impl Circuit<pallas::Base> for HardwareCircuit {
         )?;
         
         // Step 2: Hash the inputs using secure Poseidon
-        // For v0.3, use hash_2 to hash two elements
-        let commitment_cell = poseidon_chip.hash_2(
-            layouter.namespace(|| "poseidon hash"),
-            cpu_cell,
-            mac_cell,
+        // For halo2_gadgets v0.3, use the generic hash method
+        let message = [cpu_cell, mac_cell];
+        let hasher = poseidon_chip.construct_hasher(layouter.namespace(|| "init hasher"))?;
+        let commitment_cell = hasher.hash(
+            layouter.namespace(|| "hash inputs"),
+            message,
         )?;
         
         // Step 3: Constrain hash output to public input
@@ -173,7 +174,6 @@ pub fn compute_commitment(cpu_model: &str, mac_address: &str) -> pallas::Base {
     let mac_field = mac_to_field(mac_address);
     
     // Use the same Poseidon parameters as the circuit
-    // For v0.3, the Hash struct has 5 type parameters
     poseidon_primitives::Hash::<_, P128Pow5T3, ConstantLength<2>, 3, 2>::init()
         .hash([cpu_field, mac_field])
 }
@@ -201,5 +201,16 @@ mod tests {
         
         // Verify
         assert_eq!(prover.verify(), Ok(()));
+    }
+    
+    #[test]
+    fn test_commitment_determinism() {
+        let cpu = "AMD Ryzen 9 5950X";
+        let mac = "11:22:33:44:55:66";
+        
+        let c1 = compute_commitment(cpu, mac);
+        let c2 = compute_commitment(cpu, mac);
+        
+        assert_eq!(c1, c2, "Commitment should be deterministic");
     }
 }
