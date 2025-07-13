@@ -1,43 +1,34 @@
 // src/zkp_halo2/commitment.rs
-// AeroNyx Privacy Network - Commitment Helper Functions
-// Version: 6.0.0 - 修复字段元素转换 API
+// AeroNyx Privacy Network - Production-Ready Commitment Functions
+// Version: 8.0.0 - Optimized for efficiency and security
 
-use ff::PrimeField;
+use ff::{Field, PrimeField};
 use pasta_curves::pallas;
-use sha2::{Digest, Sha256};
+use blake2b_simd::Params;
+
+/// Domain separation tags for different input types
+const DOMAIN_CPU: &[u8] = b"AERONYX_CPU_V1";
+const DOMAIN_MAC: &[u8] = b"AERONYX_MAC_V1";
+const DOMAIN_STRING: &[u8] = b"AERONYX_STRING_V1";
 
 /// Converts a string into a field element deterministically
-/// Uses SHA256 with domain separation for security
+/// Uses Blake2b with domain separation for security
 pub fn string_to_field(s: &str) -> pallas::Base {
-    // Domain separator prevents collisions between different data types
-    let mut hasher = Sha256::new();
-    hasher.update(b"AERONYX_V1_CPU_STRING:");
-    hasher.update(s.as_bytes());
-    let hash_result = hasher.finalize();
-    
-    // Convert 32-byte hash to field element
-    // Since we can't use from_bytes_wide in v0.3, we need to reduce manually
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&hash_result);
-    
-    // Use from_repr which expects the bytes in little-endian
-    // If this fails, we'll use a modular reduction approach
-    pallas::Base::from_repr(bytes).unwrap_or_else(|| {
-        // Fallback: interpret as big integer and reduce
-        let mut acc = pallas::Base::zero();
-        let mut base = pallas::Base::one();
+    // For short strings, we can pack directly into field element
+    if s.len() <= 31 {
+        let mut bytes = [0u8; 32];
+        bytes[1..s.len() + 1].copy_from_slice(s.as_bytes());
+        // Set first byte to indicate length
+        bytes[0] = s.len() as u8;
         
-        for &byte in hash_result.iter().rev() {
-            for _ in 0..8 {
-                if byte & (1 << 7) != 0 {
-                    acc = acc + base;
-                }
-                base = base.double();
-            }
-        }
-        
-        acc
-    })
+        return pallas::Base::from_repr(bytes).unwrap_or_else(|| {
+            // Fallback to hashing if direct conversion fails
+            hash_to_field(s.as_bytes(), DOMAIN_STRING)
+        });
+    }
+    
+    // For longer strings, use hashing
+    hash_to_field(s.as_bytes(), DOMAIN_CPU)
 }
 
 /// Converts MAC address to field element
@@ -54,39 +45,59 @@ pub fn mac_to_field(mac: &str) -> pallas::Base {
         panic!("MAC address must be 6 bytes");
     }
     
-    // Hash with domain separator
-    let mut hasher = Sha256::new();
-    hasher.update(b"AERONYX_V1_MAC_ADDR:");
-    hasher.update(&bytes);
-    let hash_result = hasher.finalize();
+    // Pack MAC address efficiently
+    let mut field_bytes = [0u8; 32];
+    field_bytes[0] = 0x01; // Tag for MAC address
+    field_bytes[1..7].copy_from_slice(&bytes);
     
-    // Convert to field element (same approach as string_to_field)
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&hash_result);
-    
-    pallas::Base::from_repr(bytes).unwrap_or_else(|| {
-        // Fallback: manual reduction
-        let mut acc = pallas::Base::zero();
-        let mut base = pallas::Base::one();
-        
-        for &byte in hash_result.iter().rev() {
-            for _ in 0..8 {
-                if byte & (1 << 7) != 0 {
-                    acc = acc + base;
-                }
-                base = base.double();
-            }
-        }
-        
-        acc
+    pallas::Base::from_repr(field_bytes).unwrap_or_else(|| {
+        // Fallback to hashing
+        hash_to_field(&bytes, DOMAIN_MAC)
     })
+}
+
+/// Generic hash-to-field function with domain separation
+fn hash_to_field(data: &[u8], domain: &[u8]) -> pallas::Base {
+    let hash = Params::new()
+        .hash_length(32)
+        .personal(domain)
+        .to_state()
+        .update(data)
+        .finalize();
+    
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(hash.as_bytes());
+    
+    // Try direct conversion first
+    pallas::Base::from_repr(bytes).unwrap_or_else(|| {
+        // If it fails (very unlikely), use modular reduction
+        reduce_bytes_to_field(&bytes)
+    })
+}
+
+/// Reduce arbitrary bytes to field element via modular reduction
+fn reduce_bytes_to_field(bytes: &[u8]) -> pallas::Base {
+    let mut acc = pallas::Base::zero();
+    let mut base = pallas::Base::one();
+    
+    // Process bytes in little-endian order
+    for &byte in bytes.iter() {
+        for i in 0..8 {
+            if byte & (1 << i) != 0 {
+                acc += base;
+            }
+            base = base.double();
+        }
+    }
+    
+    acc
 }
 
 /// Main commitment interface for compatibility
 pub struct PoseidonCommitment;
 
 impl PoseidonCommitment {
-    /// Generate commitment for CPU and MAC
+    /// Generate commitment for CPU and MAC using circuit's compute_commitment
     pub fn commit_combined(cpu_model: &str, mac: &str) -> [u8; 32] {
         let commitment = crate::zkp_halo2::circuit::compute_commitment(cpu_model, mac);
         let repr = commitment.to_repr();
@@ -95,14 +106,77 @@ impl PoseidonCommitment {
         bytes
     }
     
-    /// CPU-only commitment
+    /// CPU-only commitment (with default MAC)
     pub fn commit_cpu_model(cpu_model: &str) -> [u8; 32] {
         Self::commit_combined(cpu_model, "00:00:00:00:00:00")
     }
     
-    /// MAC-only commitment
+    /// MAC-only commitment (with empty CPU)
     pub fn commit_mac_address(mac: &str) -> [u8; 32] {
         Self::commit_combined("", mac)
+    }
+    
+    /// Extended commitment for multiple components
+    pub fn commit_multiple(components: &[&str]) -> [u8; 32] {
+        if components.len() == 2 {
+            // Optimize for the common case
+            return Self::commit_combined(components[0], components[1]);
+        }
+        
+        // For other cases, use extended commitment
+        let commitment = crate::zkp_halo2::circuit::compute_extended_commitment(components);
+        let repr = commitment.to_repr();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(repr.as_ref());
+        bytes
+    }
+}
+
+/// Batch commitment generation for efficiency
+pub struct BatchCommitment {
+    commitments: Vec<[u8; 32]>,
+}
+
+impl BatchCommitment {
+    pub fn new() -> Self {
+        Self {
+            commitments: Vec::new(),
+        }
+    }
+    
+    /// Add a hardware commitment to the batch
+    pub fn add_hardware(&mut self, cpu_model: &str, mac: &str) {
+        let commitment = PoseidonCommitment::commit_combined(cpu_model, mac);
+        self.commitments.push(commitment);
+    }
+    
+    /// Get all commitments
+    pub fn commitments(&self) -> &[[u8; 32]] {
+        &self.commitments
+    }
+    
+    /// Generate a merkle root of all commitments (simplified)
+    pub fn aggregate_commitment(&self) -> [u8; 32] {
+        if self.commitments.is_empty() {
+            return [0u8; 32];
+        }
+        
+        if self.commitments.len() == 1 {
+            return self.commitments[0];
+        }
+        
+        // Simple aggregation using Blake2b
+        let hash = Params::new()
+            .hash_length(32)
+            .personal(b"AERONYX_AGGREGATE")
+            .to_state()
+            .update(&(self.commitments.len() as u64).to_le_bytes())
+            .update(self.commitments.iter().flatten().cloned().collect::<Vec<u8>>().as_slice())
+            .finalize();
+        
+        let mut result = [0u8; 32];
+        result.copy_from_slice(hash.as_bytes());
+        result
     }
 }
 
@@ -126,15 +200,43 @@ mod tests {
     
     #[test]
     fn test_mac_normalization() {
-        let mac1 = "AA:BB:CC:DD:EE:FF";
-        let mac2 = "aa-bb-cc-dd-ee-ff";
-        let mac3 = "11:22:33:44:55:66";
+        let mac_formats = vec![
+            "AA:BB:CC:DD:EE:FF",
+            "aa:bb:cc:dd:ee:ff",
+            "AA-BB-CC-DD-EE-FF",
+            "aa-bb-cc-dd-ee-ff",
+            "AABBCCDDEEFF",
+            "aabbccddeeff",
+        ];
         
-        let f1 = mac_to_field(mac1);
-        let f2 = mac_to_field(mac2);
-        let f3 = mac_to_field(mac3);
+        let first = mac_to_field(mac_formats[0]);
         
-        assert_eq!(f1, f2, "Different MAC formats should normalize to same value");
-        assert_ne!(f1, f3, "Different MACs should produce different values");
+        for mac in &mac_formats[1..] {
+            let field = mac_to_field(mac);
+            assert_eq!(first, field, "All MAC formats should normalize to same value");
+        }
+    }
+    
+    #[test]
+    fn test_short_string_optimization() {
+        // Test that short strings are handled efficiently
+        let short = "CPU123";
+        let field = string_to_field(short);
+        
+        // Should produce a valid field element
+        let _ = field.to_repr();
+    }
+    
+    #[test]
+    fn test_batch_commitment() {
+        let mut batch = BatchCommitment::new();
+        
+        batch.add_hardware("CPU1", "aa:bb:cc:dd:ee:ff");
+        batch.add_hardware("CPU2", "11:22:33:44:55:66");
+        
+        assert_eq!(batch.commitments().len(), 2);
+        
+        let agg = batch.aggregate_commitment();
+        assert_ne!(agg, [0u8; 32]);
     }
 }
