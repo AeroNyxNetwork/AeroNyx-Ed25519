@@ -2,9 +2,9 @@
 // AeroNyx Privacy Network - Production-Ready Commitment Functions
 // Version: 8.0.0 - Optimized for efficiency and security
 
-use ff::{Field, PrimeField};
+use ff::PrimeField;
 use pasta_curves::pallas;
-use blake2b_simd::Params;
+use sha2::{Digest, Sha256};
 
 /// Domain separation tags for different input types
 const DOMAIN_CPU: &[u8] = b"AERONYX_CPU_V1";
@@ -12,23 +12,32 @@ const DOMAIN_MAC: &[u8] = b"AERONYX_MAC_V1";
 const DOMAIN_STRING: &[u8] = b"AERONYX_STRING_V1";
 
 /// Converts a string into a field element deterministically
-/// Uses Blake2b with domain separation for security
+/// Uses SHA256 with domain separation for security
 pub fn string_to_field(s: &str) -> pallas::Base {
-    // For short strings, we can pack directly into field element
-    if s.len() <= 31 {
-        let mut bytes = [0u8; 32];
-        bytes[1..s.len() + 1].copy_from_slice(s.as_bytes());
-        // Set first byte to indicate length
-        bytes[0] = s.len() as u8;
-        
-        return pallas::Base::from_repr(bytes).unwrap_or_else(|| {
-            // Fallback to hashing if direct conversion fails
-            hash_to_field(s.as_bytes(), DOMAIN_STRING)
-        });
-    }
+    let mut hasher = Sha256::new();
+    hasher.update(DOMAIN_CPU);
+    hasher.update(s.as_bytes());
+    let hash = hasher.finalize();
     
-    // For longer strings, use hashing
-    hash_to_field(s.as_bytes(), DOMAIN_CPU)
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&hash);
+    
+    pallas::Base::from_repr(bytes).unwrap_or_else(|| {
+        // Fallback: interpret as big integer and reduce
+        let mut acc = pallas::Base::zero();
+        let mut base = pallas::Base::one();
+        
+        for &byte in hash.iter().rev() {
+            for i in 0..8 {
+                if byte & (1 << i) != 0 {
+                    acc = acc + base;
+                }
+                base = base.double();
+            }
+        }
+        
+        acc
+    })
 }
 
 /// Converts MAC address to field element
@@ -45,14 +54,29 @@ pub fn mac_to_field(mac: &str) -> pallas::Base {
         panic!("MAC address must be 6 bytes");
     }
     
-    // Pack MAC address efficiently
-    let mut field_bytes = [0u8; 32];
-    field_bytes[0] = 0x01; // Tag for MAC address
-    field_bytes[1..7].copy_from_slice(&bytes);
+    let mut hasher = Sha256::new();
+    hasher.update(DOMAIN_MAC);
+    hasher.update(&bytes);
+    let hash = hasher.finalize();
     
-    pallas::Base::from_repr(field_bytes).unwrap_or_else(|| {
-        // Fallback to hashing
-        hash_to_field(&bytes, DOMAIN_MAC)
+    let mut hash_bytes = [0u8; 32];
+    hash_bytes.copy_from_slice(&hash);
+    
+    pallas::Base::from_repr(hash_bytes).unwrap_or_else(|| {
+        // Fallback: manual reduction
+        let mut acc = pallas::Base::zero();
+        let mut base = pallas::Base::one();
+        
+        for &byte in hash.iter().rev() {
+            for i in 0..8 {
+                if byte & (1 << i) != 0 {
+                    acc = acc + base;
+                }
+                base = base.double();
+            }
+        }
+        
+        acc
     })
 }
 
