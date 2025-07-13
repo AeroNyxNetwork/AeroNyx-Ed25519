@@ -1,6 +1,6 @@
 // src/registration.rs
 // AeroNyx Privacy Network - Node Registration and Management Module
-// Version: 1.0.0
+// Version: 1.0.1 - Fixed missing metadata fields
 //
 // Copyright (c) 2024 AeroNyx Team
 // SPDX-License-Identifier: MIT
@@ -572,8 +572,6 @@ impl RegistrationManager {
     }
 
     /// Create a deterministic serialization for ZKP circuit input
-    
-/// Create a deterministic serialization for ZKP circuit input
     pub fn to_zkp_bytes(&self) -> Result<Vec<u8>, String> {
         // Load the stored registration data to get the commitment
         let reg_data = self.load_registration_file()
@@ -591,7 +589,7 @@ impl RegistrationManager {
     }
 
     /// Generate and store hardware commitment during registration
-     pub async fn generate_hardware_commitment(
+    pub async fn generate_hardware_commitment(
         &mut self,
         hardware_info: &HardwareInfo,
     ) -> Result<Vec<u8>, String> {
@@ -604,6 +602,7 @@ impl RegistrationManager {
         info!("Hardware commitment generated: {}...", &commitment_hex[..16.min(commitment_hex.len())]);
         Ok(commitment)
     }
+
     /// Save registration data locally with enhanced hardware tracking
     fn save_registration_data(&self, node_info: &NodeInfo, hw_info: &HardwareInfo) -> Result<(), String> {
         let hardware_components = Self::extract_hardware_components(hw_info);
@@ -794,6 +793,7 @@ impl RegistrationManager {
         let commitment = hex::decode(commitment_hex)
             .map_err(|e| format!("Invalid commitment format: {}", e))?;
         
+        // Fixed: Add metadata field when creating Proof
         let proof = Proof {
             data: proof_data,
             public_inputs: commitment.clone(),
@@ -801,6 +801,7 @@ impl RegistrationManager {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            metadata: None,  // Add this missing field
         };
         
         verify_hardware_proof(&proof, &commitment, zkp_params)
