@@ -1,6 +1,6 @@
 // src/zkp_halo2/prover.rs
 // AeroNyx Privacy Network - Production-Ready Zero-Knowledge Proof Generation
-// Version: 8.0.2 - Fixed for halo2_proofs 0.3.x API
+// Version: 8.0.3 - Fixed for halo2_proofs 0.3.x API
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, debug};
@@ -11,13 +11,10 @@ use halo2_proofs::{
         create_proof, keygen_pk, keygen_vk, verify_proof,
         ProvingKey, VerifyingKey, SingleVerifier,
     },
-    poly::{
-        commitment::{Params, ParamsProver},
-        ipa::commitment::{IPACommitmentScheme, ParamsIPA},
-    },
+    poly::commitment::Params,
     transcript::{
         Blake2bRead, Blake2bWrite, Challenge255,
-        TranscriptReadBuffer, TranscriptWriterBuffer,
+        TranscriptRead, TranscriptWrite,
     },
 };
 use rand::rngs::OsRng;
@@ -76,6 +73,7 @@ pub async fn generate_hardware_proof(
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs(),
+        metadata: None, // Add missing field
     })
 }
 
@@ -83,28 +81,28 @@ pub async fn generate_hardware_proof(
 fn generate_proof_internal(
     circuit: HardwareCircuit,
     public_inputs: Vec<pallas::Base>,
-    params: SetupParams,
+    setup_params: SetupParams,
 ) -> Result<Vec<u8>, String> {
-    // Deserialize IPA parameters
-    let ipa_params = ParamsIPA::<vesta::Affine>::read(&mut &params.srs[..])
-        .map_err(|e| format!("Failed to read IPA params: {}", e))?;
+    // Deserialize parameters
+    let params = Params::<vesta::Affine>::read(&mut &setup_params.srs[..])
+        .map_err(|e| format!("Failed to read params: {}", e))?;
     
     // Load or generate keys
-    let pk = if let Some(pk_bytes) = params.proving_key.as_ref() {
+    let pk = if let Some(pk_bytes) = setup_params.proving_key.as_ref() {
         debug!("Using cached proving key");
         ProvingKey::<vesta::Affine>::read(&mut Cursor::new(pk_bytes))
             .map_err(|e| format!("Failed to deserialize pk: {}", e))?
     } else {
         debug!("Generating proving key");
-        let vk = if !params.verifying_key.is_empty() {
-            VerifyingKey::<vesta::Affine>::read(&mut Cursor::new(&params.verifying_key))
+        let vk = if !setup_params.verifying_key.is_empty() {
+            VerifyingKey::<vesta::Affine>::read(&mut Cursor::new(&setup_params.verifying_key))
                 .map_err(|e| format!("Failed to deserialize vk: {}", e))?
         } else {
-            keygen_vk(&ipa_params, &circuit)
+            keygen_vk(&params, &circuit)
                 .map_err(|e| format!("Failed to generate vk: {:?}", e))?
         };
         
-        keygen_pk(&ipa_params, vk, &circuit)
+        keygen_pk(&params, vk, &circuit)
             .map_err(|e| format!("Failed to generate pk: {:?}", e))?
     };
     
@@ -112,7 +110,7 @@ fn generate_proof_internal(
     let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
     
     create_proof(
-        &ipa_params,
+        &params,
         &pk,
         &[circuit],
         &[&[&public_inputs[..]]],
@@ -128,7 +126,7 @@ fn generate_proof_internal(
 pub fn verify_hardware_proof(
     proof: &Proof,
     commitment: &[u8],
-    params: &SetupParams,
+    setup_params: &SetupParams,
 ) -> Result<bool, String> {
     info!("Verifying hardware attestation proof...");
     
@@ -152,32 +150,32 @@ pub fn verify_hardware_proof(
     // Parse commitment
     let mut comm_bytes = [0u8; 32];
     comm_bytes.copy_from_slice(commitment);
-    let commitment_point = pallas::Base::from_repr(comm_bytes)
+    let commitment_point = Option::from(pallas::Base::from_repr(comm_bytes))
         .ok_or("Invalid commitment format")?;
     
     // Deserialize parameters
-    let ipa_params = ParamsIPA::<vesta::Affine>::read(&mut &params.srs[..])
-        .map_err(|e| format!("Failed to read IPA params: {}", e))?;
+    let params = Params::<vesta::Affine>::read(&mut &setup_params.srs[..])
+        .map_err(|e| format!("Failed to read params: {}", e))?;
     
     // Load verifying key
-    let vk = if !params.verifying_key.is_empty() {
+    let vk = if !setup_params.verifying_key.is_empty() {
         debug!("Using cached verifying key");
-        VerifyingKey::<vesta::Affine>::read(&mut Cursor::new(&params.verifying_key))
+        VerifyingKey::<vesta::Affine>::read(&mut Cursor::new(&setup_params.verifying_key))
             .map_err(|e| format!("Failed to deserialize vk: {}", e))?
     } else {
         debug!("Generating verifying key");
         let empty_circuit = HardwareCircuit::without_witnesses();
-        keygen_vk(&ipa_params, &empty_circuit)
+        keygen_vk(&params, &empty_circuit)
             .map_err(|e| format!("Failed to generate vk: {:?}", e))?
     };
     
     // Create verification strategy
-    let strategy = SingleVerifier::new(&ipa_params);
+    let strategy = SingleVerifier::new(&params);
     let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof.data[..]);
     
     // Verify proof - simplified call
     let result = verify_proof(
-        &ipa_params,
+        &params,
         &vk,
         strategy,
         &[&[&[commitment_point]]],
@@ -201,24 +199,24 @@ pub async fn generate_setup_params(k: u32) -> Result<SetupParams, String> {
     info!("Generating Halo2 setup parameters with k={}", k);
     
     tokio::task::spawn_blocking(move || {
-        // Generate IPA parameters (no trusted setup needed!)
-        let ipa_params = ParamsIPA::<vesta::Affine>::new(k);
+        // Generate parameters (using standard PLONK)
+        let params = Params::<vesta::Affine>::new(k);
         
         // Create empty circuit for key generation
         let empty_circuit = HardwareCircuit::without_witnesses();
         
         // Generate verifying key
-        let vk = keygen_vk(&ipa_params, &empty_circuit)
+        let vk = keygen_vk(&params, &empty_circuit)
             .map_err(|e| format!("Failed to generate vk: {:?}", e))?;
         
         // Generate proving key
-        let pk = keygen_pk(&ipa_params, vk.clone(), &empty_circuit)
+        let pk = keygen_pk(&params, vk.clone(), &empty_circuit)
             .map_err(|e| format!("Failed to generate pk: {:?}", e))?;
         
         // Serialize parameters
         let mut srs_bytes = Vec::new();
-        ipa_params.write(&mut srs_bytes)
-            .map_err(|e| format!("Failed to serialize IPA params: {:?}", e))?;
+        params.write(&mut srs_bytes)
+            .map_err(|e| format!("Failed to serialize params: {:?}", e))?;
         
         let mut vk_bytes = Vec::new();
         vk.write(&mut vk_bytes)
@@ -228,7 +226,7 @@ pub async fn generate_setup_params(k: u32) -> Result<SetupParams, String> {
         pk.write(&mut pk_bytes)
             .map_err(|e| format!("Failed to serialize pk: {:?}", e))?;
         
-        info!("Setup complete - IPA: {} KB, VK: {} KB, PK: {} KB", 
+        info!("Setup complete - Params: {} KB, VK: {} KB, PK: {} KB", 
               srs_bytes.len() / 1024,
               vk_bytes.len() / 1024, 
               pk_bytes.len() / 1024);
@@ -237,6 +235,7 @@ pub async fn generate_setup_params(k: u32) -> Result<SetupParams, String> {
             srs: srs_bytes,
             verifying_key: vk_bytes,
             proving_key: Some(pk_bytes),
+            metadata: None, // Add missing field
         })
     })
     .await
