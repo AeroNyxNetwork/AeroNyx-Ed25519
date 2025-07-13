@@ -1,6 +1,6 @@
 // src/zkp_halo2/commitment.rs
 // AeroNyx Privacy Network - Production-Ready Commitment Functions
-// Version: 8.0.0 - Optimized for efficiency and security
+// Version: 8.0.1 - Fixed CtOption conversions
 
 use ff::PrimeField;
 use pasta_curves::pallas;
@@ -23,7 +23,8 @@ pub fn string_to_field(s: &str) -> pallas::Base {
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&hash);
     
-    pallas::Base::from_repr(bytes).unwrap_or_else(|| {
+    // Fixed: Convert CtOption to Option
+    Option::from(pallas::Base::from_repr(bytes)).unwrap_or_else(|| {
         // Fallback: interpret as big integer and reduce
         let mut acc = pallas::Base::zero();
         let mut base = pallas::Base::one();
@@ -63,7 +64,8 @@ pub fn mac_to_field(mac: &str) -> pallas::Base {
     let mut hash_bytes = [0u8; 32];
     hash_bytes.copy_from_slice(&hash);
     
-    pallas::Base::from_repr(hash_bytes).unwrap_or_else(|| {
+    // Fixed: Convert CtOption to Option
+    Option::from(pallas::Base::from_repr(hash_bytes)).unwrap_or_else(|| {
         // Fallback: manual reduction
         let mut acc = pallas::Base::zero();
         let mut base = pallas::Base::one();
