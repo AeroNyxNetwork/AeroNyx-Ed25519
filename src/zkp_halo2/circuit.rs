@@ -2,13 +2,13 @@
 // AeroNyx Privacy Network - Production-Ready Zero-Knowledge Proof Circuit
 // Version: 8.0.1 - Verified against halo2_proofs 0.3.0 API
 
-use ff::Field;
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance},
 };
 use halo2_gadgets::poseidon::{
     primitives::{self as poseidon, ConstantLength, P128Pow5T3},
+    Hash as PoseidonHash,
     Pow5Chip, Pow5Config,
 };
 use pasta_curves::pallas;
@@ -132,11 +132,21 @@ impl Circuit<pallas::Base> for HardwareCircuit {
         // Hash using Poseidon
         let chip = Pow5Chip::construct(config.poseidon_config);
         
-        // Use the hasher for 2 inputs
-        let hasher = chip.hash(layouter.namespace(|| "hash"), [cpu_cell, mac_cell])?;
+        // Create hasher instance for constant length 2
+        let hasher = PoseidonHash::<_, _, P128Pow5T3, ConstantLength<2>, 3, 2>::init(
+            chip,
+            layouter.namespace(|| "init hasher"),
+        )?;
+        
+        // Hash the two inputs
+        let message = [cpu_cell, mac_cell];
+        let hash_output = hasher.hash(
+            layouter.namespace(|| "hash inputs"),
+            message,
+        )?;
         
         // Expose as public input
-        layouter.constrain_instance(hasher.cell(), config.instance, 0)?;
+        layouter.constrain_instance(hash_output.cell(), config.instance, 0)?;
         
         Ok(())
     }
