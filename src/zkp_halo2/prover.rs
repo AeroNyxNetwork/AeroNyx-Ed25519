@@ -1,6 +1,6 @@
 // src/zkp_halo2/prover.rs
 // AeroNyx Privacy Network - Production-Ready Zero-Knowledge Proof Generation
-// Version: 8.0.1 - Verified against halo2_proofs 0.3.0 API
+// Version: 8.0.2 - Fixed for halo2_proofs 0.3.0 actual API
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, debug};
@@ -9,15 +9,11 @@ use pasta_curves::{pallas, vesta};
 use halo2_proofs::{
     plonk::{
         create_proof, keygen_pk, keygen_vk, verify_proof,
-        ProvingKey, VerifyingKey,
+        ProvingKey, VerifyingKey, SingleVerifier,
     },
     poly::{
         commitment::{Params, ParamsProver},
-        ipa::{
-            commitment::{IPACommitmentScheme, ParamsIPA},
-            multiopen::{ProverIPA, VerifierIPA},
-            strategy::SingleStrategy,
-        },
+        ipa::commitment::{IPACommitmentScheme, ParamsIPA},
         VerificationStrategy,
     },
     transcript::{
@@ -96,17 +92,22 @@ fn generate_proof_internal(
     // Load or generate keys
     let pk = if let Some(pk_bytes) = params.proving_key.as_ref() {
         debug!("Using cached proving key");
+        // Use std::io::Cursor for reading from bytes
+        use std::io::Cursor;
         ProvingKey::<vesta::Affine>::read::<_, HardwareCircuit>(
-            &mut &pk_bytes[..],
-            SerdeFormat::RawBytes,
+            &mut Cursor::new(pk_bytes),
+            #[cfg(feature = "circuit-params")]
+            circuit.params(),
         )
         .map_err(|e| format!("Failed to deserialize pk: {}", e))?
     } else {
         debug!("Generating proving key");
         let vk = if !params.verifying_key.is_empty() {
+            use std::io::Cursor;
             VerifyingKey::<vesta::Affine>::read::<_, HardwareCircuit>(
-                &mut &params.verifying_key[..],
-                SerdeFormat::RawBytes,
+                &mut Cursor::new(&params.verifying_key),
+                #[cfg(feature = "circuit-params")]
+                circuit.params(),
             )
             .map_err(|e| format!("Failed to deserialize vk: {}", e))?
         } else {
@@ -121,14 +122,8 @@ fn generate_proof_internal(
     // Create proof
     let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
     
-    create_proof::<
-        IPACommitmentScheme<vesta::Affine>,
-        ProverIPA<'_, vesta::Affine>,
-        Challenge255<vesta::Affine>,
-        OsRng,
-        Blake2bWrite<Vec<u8>, vesta::Affine, Challenge255<vesta::Affine>>,
-        HardwareCircuit,
-    >(
+    // create_proof takes 5 generic parameters, not 6
+    create_proof(
         &ipa_params,
         &pk,
         &[circuit],
@@ -179,9 +174,11 @@ pub fn verify_hardware_proof(
     // Load verifying key
     let vk = if !params.verifying_key.is_empty() {
         debug!("Using cached verifying key");
+        use std::io::Cursor;
         VerifyingKey::<vesta::Affine>::read::<_, HardwareCircuit>(
-            &mut &params.verifying_key[..],
-            SerdeFormat::RawBytes,
+            &mut Cursor::new(&params.verifying_key),
+            #[cfg(feature = "circuit-params")]
+            HardwareCircuit::default().params(),
         )
         .map_err(|e| format!("Failed to deserialize vk: {}", e))?
     } else {
@@ -191,17 +188,12 @@ pub fn verify_hardware_proof(
             .map_err(|e| format!("Failed to generate vk: {:?}", e))?
     };
     
-    // Verify proof
-    let strategy = SingleStrategy::new(&ipa_params);
+    // Verify proof - using SingleVerifier strategy
+    let strategy = SingleVerifier::new(&ipa_params);
     let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof.data[..]);
     
-    let result = verify_proof::<
-        IPACommitmentScheme<vesta::Affine>,
-        VerifierIPA<'_, vesta::Affine>,
-        Challenge255<vesta::Affine>,
-        Blake2bRead<&[u8], vesta::Affine, Challenge255<vesta::Affine>>,
-        SingleStrategy<'_, vesta::Affine>,
-    >(
+    // verify_proof takes 4 generic parameters, not 5
+    let result = verify_proof(
         &ipa_params,
         &vk,
         strategy,
@@ -246,11 +238,11 @@ pub async fn generate_setup_params(k: u32) -> Result<SetupParams, String> {
             .map_err(|e| format!("Failed to serialize IPA params: {:?}", e))?;
         
         let mut vk_bytes = Vec::new();
-        vk.write(&mut vk_bytes, SerdeFormat::RawBytes)
+        vk.write(&mut vk_bytes)
             .map_err(|e| format!("Failed to serialize vk: {:?}", e))?;
         
         let mut pk_bytes = Vec::new();
-        pk.write(&mut pk_bytes, SerdeFormat::RawBytes)
+        pk.write(&mut pk_bytes)
             .map_err(|e| format!("Failed to serialize pk: {:?}", e))?;
         
         info!("Setup complete - IPA: {} KB, VK: {} KB, PK: {} KB", 
@@ -267,9 +259,6 @@ pub async fn generate_setup_params(k: u32) -> Result<SetupParams, String> {
     .await
     .map_err(|e| format!("Task error: {}", e))?
 }
-
-// Import SerdeFormat for key serialization
-use halo2_proofs::SerdeFormat;
 
 #[cfg(test)]
 mod tests {
