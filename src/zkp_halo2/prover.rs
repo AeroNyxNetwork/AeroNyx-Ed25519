@@ -1,6 +1,6 @@
 // src/zkp_halo2/prover.rs
 // AeroNyx Privacy Network - Production-Ready Zero-Knowledge Proof Generation
-// Version: 8.0.3 - Fixed for halo2_proofs 0.3.x API
+// Version: 8.0.5 - Fixed for halo2_proofs 0.3.x API (完全移除密钥序列化)
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, debug};
@@ -18,7 +18,6 @@ use halo2_proofs::{
     },
 };
 use rand::rngs::OsRng;
-use std::io::Cursor;
 
 use crate::hardware::HardwareInfo;
 use crate::zkp_halo2::{
@@ -73,7 +72,7 @@ pub async fn generate_hardware_proof(
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs(),
-        metadata: None, // Add missing field
+        metadata: None,
     })
 }
 
@@ -83,30 +82,18 @@ fn generate_proof_internal(
     public_inputs: Vec<pallas::Base>,
     setup_params: SetupParams,
 ) -> Result<Vec<u8>, String> {
-    // Deserialize parameters
+    // Deserialize parameters (the "recipe")
     let params = Params::<vesta::Affine>::read(&mut &setup_params.srs[..])
         .map_err(|e| format!("Failed to read params: {}", e))?;
     
-    // Load or generate keys
-    let pk = if let Some(pk_bytes) = setup_params.proving_key.as_ref() {
-        debug!("Using cached proving key");
-        ProvingKey::<vesta::Affine>::read(&mut Cursor::new(pk_bytes))
-            .map_err(|e| format!("Failed to deserialize pk: {}", e))?
-    } else {
-        debug!("Generating proving key");
-        let vk = if !setup_params.verifying_key.is_empty() {
-            VerifyingKey::<vesta::Affine>::read(&mut Cursor::new(&setup_params.verifying_key))
-                .map_err(|e| format!("Failed to deserialize vk: {}", e))?
-        } else {
-            keygen_vk(&params, &circuit)
-                .map_err(|e| format!("Failed to generate vk: {:?}", e))?
-        };
-        
-        keygen_pk(&params, vk, &circuit)
-            .map_err(|e| format!("Failed to generate pk: {:?}", e))?
-    };
+    // Always generate fresh keys from params and circuit (make fresh "burgers")
+    debug!("Generating proving and verifying keys for proof generation");
+    let vk = keygen_vk(&params, &circuit)
+        .map_err(|e| format!("Failed to generate vk: {:?}", e))?;
+    let pk = keygen_pk(&params, vk, &circuit)
+        .map_err(|e| format!("Failed to generate pk: {:?}", e))?;
     
-    // Create proof - simplified call without explicit type parameters
+    // Create proof with fresh keys
     let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
     
     create_proof(
@@ -153,27 +140,21 @@ pub fn verify_hardware_proof(
     let commitment_point = Option::from(pallas::Base::from_repr(comm_bytes))
         .ok_or("Invalid commitment format")?;
     
-    // Deserialize parameters
+    // Deserialize parameters (the "recipe")
     let params = Params::<vesta::Affine>::read(&mut &setup_params.srs[..])
         .map_err(|e| format!("Failed to read params: {}", e))?;
     
-    // Load verifying key
-    let vk = if !setup_params.verifying_key.is_empty() {
-        debug!("Using cached verifying key");
-        VerifyingKey::<vesta::Affine>::read(&mut Cursor::new(&setup_params.verifying_key))
-            .map_err(|e| format!("Failed to deserialize vk: {}", e))?
-    } else {
-        debug!("Generating verifying key");
-        let empty_circuit = HardwareCircuit::without_witnesses();
-        keygen_vk(&params, &empty_circuit)
-            .map_err(|e| format!("Failed to generate vk: {:?}", e))?
-    };
+    // Always generate fresh verifying key from empty circuit
+    debug!("Generating verifying key for verification");
+    let empty_circuit = HardwareCircuit::without_witnesses();
+    let vk = keygen_vk(&params, &empty_circuit)
+        .map_err(|e| format!("Failed to generate vk: {:?}", e))?;
     
     // Create verification strategy
     let strategy = SingleVerifier::new(&params);
     let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof.data[..]);
     
-    // Verify proof - simplified call
+    // Verify proof
     let result = verify_proof(
         &params,
         &vk,
@@ -199,43 +180,22 @@ pub async fn generate_setup_params(k: u32) -> Result<SetupParams, String> {
     info!("Generating Halo2 setup parameters with k={}", k);
     
     tokio::task::spawn_blocking(move || {
-        // Generate parameters (using standard PLONK)
+        // Generate parameters (the precious "recipe")
         let params = Params::<vesta::Affine>::new(k);
         
-        // Create empty circuit for key generation
-        let empty_circuit = HardwareCircuit::without_witnesses();
-        
-        // Generate verifying key
-        let vk = keygen_vk(&params, &empty_circuit)
-            .map_err(|e| format!("Failed to generate vk: {:?}", e))?;
-        
-        // Generate proving key
-        let pk = keygen_pk(&params, vk.clone(), &empty_circuit)
-            .map_err(|e| format!("Failed to generate pk: {:?}", e))?;
-        
-        // Serialize parameters
+        // Only serialize and save the params
         let mut srs_bytes = Vec::new();
         params.write(&mut srs_bytes)
             .map_err(|e| format!("Failed to serialize params: {:?}", e))?;
         
-        let mut vk_bytes = Vec::new();
-        vk.write(&mut vk_bytes)
-            .map_err(|e| format!("Failed to serialize vk: {:?}", e))?;
+        info!("Setup complete - Params: {} KB", srs_bytes.len() / 1024);
         
-        let mut pk_bytes = Vec::new();
-        pk.write(&mut pk_bytes)
-            .map_err(|e| format!("Failed to serialize pk: {:?}", e))?;
-        
-        info!("Setup complete - Params: {} KB, VK: {} KB, PK: {} KB", 
-              srs_bytes.len() / 1024,
-              vk_bytes.len() / 1024, 
-              pk_bytes.len() / 1024);
-        
+        // Return SetupParams with only SRS, no keys
         Ok(SetupParams {
             srs: srs_bytes,
-            verifying_key: vk_bytes,
-            proving_key: Some(pk_bytes),
-            metadata: None, // Add missing field
+            verifying_key: Vec::new(),  // Empty - we don't store keys
+            proving_key: None,          // Empty - we don't store keys
+            metadata: None,
         })
     })
     .await
