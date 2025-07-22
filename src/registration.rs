@@ -1063,13 +1063,23 @@ impl RegistrationManager {
                             
                             // First try to parse as structured ServerMessage
                             let handled = if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
-                                self.handle_server_message(
+                                // Check if this is a heartbeat ack before handling
+                                let is_heartbeat_ack = matches!(server_msg, ServerMessage::HeartbeatAck { .. });
+                                
+                                let result = self.handle_server_message(
                                     server_msg,
                                     &mut write,
                                     &mut authenticated,
                                     hardware_info,
                                     setup_params,
-                                ).await.is_ok()
+                                ).await;
+                                
+                                // Update timestamp for heartbeat ack
+                                if is_heartbeat_ack && result.is_ok() {
+                                    last_heartbeat_ack = std::time::Instant::now();
+                                }
+                                
+                                result.is_ok()
                             } else {
                                 false
                             };
@@ -1128,9 +1138,9 @@ impl RegistrationManager {
                                                 }
                                             }
                                             
-                                            "heartbeat_ack" => {
+                                            "heartbeat_ack" | "heartbeat_response" => {
                                                 debug!("Heartbeat acknowledged");
-                                                last_heartbeat_ack = std::time::Instant::now();
+                                                last_heartbeat_ack = std::time::Instant::now(); // THIS IS THE KEY LINE!
                                             }
                                             
                                             "challenge_request" | "CHALLENGE_REQUEST" => {
@@ -1252,7 +1262,10 @@ impl RegistrationManager {
         
         *self.websocket_connected.write().await = false;
         
-        if !authenticated && auth_sent {
+        // Return more accurate error messages
+        if authenticated && last_heartbeat_ack.elapsed() > heartbeat_timeout {
+            Err("Connection lost: heartbeat timeout".to_string())
+        } else if !authenticated && auth_sent {
             Err("WebSocket connection closed without successful authentication".to_string())
         } else if !auth_sent {
             Err("Server did not send initial connection message".to_string())
@@ -1260,7 +1273,6 @@ impl RegistrationManager {
             Ok(())
         }
     }
-
     /// Handle ZKP challenge
     async fn handle_zkp_challenge(
         &self,
@@ -1320,7 +1332,6 @@ impl RegistrationManager {
             ServerMessage::ConnectionEstablished | ServerMessage::Connected { .. } => {
                 info!("Connection established, sending authentication");
                 
-                // Use simplified auth format with just "code" field
                 let auth_code = self.reference_code.clone()
                     .or_else(|| self.registration_code.clone())
                     .ok_or("No authentication code available")?;
@@ -1358,10 +1369,8 @@ impl RegistrationManager {
             ServerMessage::ChallengeRequest { challenge_id, nonce: _ } => {
                 info!("✅ Received ZKP challenge request with ID: {}", challenge_id);
                 
-                // Generate commitment
                 let commitment = hardware_info.generate_zkp_commitment();
                 
-                // Generate proof
                 match zkp_halo2::generate_hardware_proof(hardware_info, &commitment, setup_params).await {
                     Ok(proof) => {
                         let response = ClientMessage::ChallengeResponse {
@@ -1388,6 +1397,7 @@ impl RegistrationManager {
             
             ServerMessage::HeartbeatAck { received_at: _, next_interval: _ } => {
                 debug!("Heartbeat acknowledged");
+                // Don't update timestamp here - it needs to be updated in the caller
             }
             
             ServerMessage::Error { error_code, message } => {
@@ -1401,6 +1411,7 @@ impl RegistrationManager {
         
         Ok(())
     }
+
     
     /// Handle incoming WebSocket messages (legacy version)
     async fn handle_websocket_message(
