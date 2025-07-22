@@ -1022,7 +1022,7 @@ impl RegistrationManager {
         }
     }
 
-    /// Internal WebSocket connection handler with ZKP support
+    /// Updated WebSocket connection handler that properly handles initial messages
     async fn connect_and_run_websocket_v2(
         &self,
         ws_url: &str,
@@ -1033,41 +1033,151 @@ impl RegistrationManager {
             .await
             .map_err(|e| format!("WebSocket connection failed: {}", e))?;
         
-        info!("WebSocket connected successfully");
+        info!("WebSocket TCP connection established, waiting for server handshake");
         *self.websocket_connected.write().await = true;
         
         let (mut write, mut read) = ws_stream.split();
         
-        let mut heartbeat_interval = time::interval(Duration::from_secs(60));
+        // Set up heartbeat interval (30 seconds to match test script)
+        let mut heartbeat_interval = time::interval(Duration::from_secs(30));
+        heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        
         let mut authenticated = false;
+        let mut auth_sent = false;
         let metrics_collector = Arc::new(ServerMetricsCollector::new(
             Duration::from_secs(60),
             60,
         ));
+        
+        // Track last heartbeat acknowledgment
+        let mut last_heartbeat_ack = std::time::Instant::now();
+        let heartbeat_timeout = Duration::from_secs(90); // 3 missed heartbeats
         
         loop {
             tokio::select! {
                 Some(message) = read.next() => {
                     match message {
                         Ok(Message::Text(text)) => {
-                            // Try to parse as ServerMessage first
-                            match serde_json::from_str::<ServerMessage>(&text) {
-                                Ok(server_msg) => {
-                                    if let Err(e) = self.handle_server_message(
-                                        server_msg,
-                                        &mut write,
-                                        &mut authenticated,
-                                        hardware_info,
-                                        setup_params,
-                                    ).await {
-                                        error!("Failed to handle message: {}", e);
+                            debug!("Received WebSocket message: {}", text);
+                            
+                            // First try to parse as structured ServerMessage
+                            let handled = if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
+                                self.handle_server_message(
+                                    server_msg,
+                                    &mut write,
+                                    &mut authenticated,
+                                    hardware_info,
+                                    setup_params,
+                                ).await.is_ok()
+                            } else {
+                                false
+                            };
+                            
+                            // If structured parsing failed, try generic JSON handling
+                            if !handled {
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                                    if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
+                                        match msg_type {
+                                            "connected" | "connection_established" => {
+                                                info!("Received connection confirmation from server");
+                                                
+                                                if !auth_sent {
+                                                    // Send authentication using the simplified format
+                                                    let auth_code = self.reference_code.clone()
+                                                        .or_else(|| self.registration_code.clone())
+                                                        .ok_or("No authentication code available")?;
+                                                    
+                                                    let auth_msg = serde_json::json!({
+                                                        "type": "auth",
+                                                        "code": auth_code
+                                                    });
+                                                    
+                                                    info!("Sending authentication with code: {}...", 
+                                                          &auth_code[..8.min(auth_code.len())]);
+                                                    
+                                                    write.send(Message::Text(auth_msg.to_string())).await
+                                                        .map_err(|e| format!("Failed to send auth: {}", e))?;
+                                                    
+                                                    auth_sent = true;
+                                                }
+                                            }
+                                            
+                                            "auth_success" | "auth_response" => {
+                                                let success = json.get("success")
+                                                    .and_then(|s| s.as_bool())
+                                                    .unwrap_or(true); // Default to true for "auth_success"
+                                                
+                                                if success {
+                                                    info!("Authentication successful");
+                                                    authenticated = true;
+                                                    last_heartbeat_ack = std::time::Instant::now();
+                                                    
+                                                    // Update heartbeat interval if provided
+                                                    if let Some(interval) = json.get("heartbeat_interval")
+                                                        .and_then(|v| v.as_u64()) {
+                                                        heartbeat_interval = time::interval(Duration::from_secs(interval));
+                                                        info!("Heartbeat interval set to {} seconds", interval);
+                                                    }
+                                                } else {
+                                                    let message = json.get("message")
+                                                        .and_then(|m| m.as_str())
+                                                        .unwrap_or("Authentication failed");
+                                                    error!("Authentication failed: {}", message);
+                                                    return Err(format!("Authentication failed: {}", message));
+                                                }
+                                            }
+                                            
+                                            "heartbeat_ack" => {
+                                                debug!("Heartbeat acknowledged");
+                                                last_heartbeat_ack = std::time::Instant::now();
+                                            }
+                                            
+                                            "challenge_request" | "CHALLENGE_REQUEST" => {
+                                                info!("Received ZKP challenge request");
+                                                
+                                                let challenge_id = json.get("challenge_id")
+                                                    .or_else(|| json.get("payload")
+                                                        .and_then(|p| p.get("challenge_id")))
+                                                    .and_then(|id| id.as_str())
+                                                    .unwrap_or("unknown");
+                                                
+                                                // Generate and send ZKP proof
+                                                if let Err(e) = self.handle_zkp_challenge(
+                                                    challenge_id,
+                                                    hardware_info,
+                                                    setup_params,
+                                                    &mut write
+                                                ).await {
+                                                    error!("Failed to handle ZKP challenge: {}", e);
+                                                }
+                                            }
+                                            
+                                            "error" => {
+                                                let error_code = json.get("error_code")
+                                                    .and_then(|c| c.as_str())
+                                                    .unwrap_or("unknown");
+                                                let message = json.get("message")
+                                                    .and_then(|m| m.as_str())
+                                                    .unwrap_or("Unknown error");
+                                                
+                                                error!("Server error [{}]: {}", error_code, message);
+                                                
+                                                if error_code == "AUTH_TIMEOUT" || 
+                                                   error_code == "INVALID_CODE" || 
+                                                   error_code == "auth_failed" {
+                                                    return Err(format!("Authentication error: {}", message));
+                                                }
+                                            }
+                                            
+                                            _ => {
+                                                debug!("Unhandled message type: {}", msg_type);
+                                            }
+                                        }
+                                    } else {
+                                        warn!("Message without type field: {:?}", json);
                                     }
-                                }
-                                Err(_) => {
-                                    // Fall back to legacy message handling
-                                    if let Err(e) = self.handle_websocket_message(&text, &mut write, &mut authenticated, &mut heartbeat_interval, &mut std::time::Instant::now()).await {
-                                        error!("Failed to handle WebSocket message: {}", e);
-                                    }
+                                } else {
+                                    warn!("Non-JSON message: {}", text);
                                 }
                             }
                         }
@@ -1075,8 +1185,19 @@ impl RegistrationManager {
                             info!("WebSocket closed by server");
                             break;
                         }
+                        Ok(Message::Ping(data)) => {
+                            debug!("Received ping, sending pong");
+                            if let Err(e) = write.send(Message::Pong(data)).await {
+                                error!("Failed to send pong: {}", e);
+                                break;
+                            }
+                        }
+                        Ok(Message::Pong(_)) => {
+                            debug!("Received pong");
+                            last_heartbeat_ack = std::time::Instant::now();
+                        }
                         Err(e) => {
-                            error!("WebSocket error: {}", e);
+                            error!("WebSocket read error: {}", e);
                             break;
                         }
                         _ => {}
@@ -1085,19 +1206,98 @@ impl RegistrationManager {
                 
                 _ = heartbeat_interval.tick() => {
                     if authenticated {
-                        let heartbeat = self.create_client_heartbeat_message(&metrics_collector).await;
-                        let heartbeat_json = serde_json::to_string(&heartbeat)
-                            .map_err(|e| format!("Failed to serialize heartbeat: {}", e))?;
+                        // Check heartbeat timeout
+                        if last_heartbeat_ack.elapsed() > heartbeat_timeout {
+                            error!("Heartbeat timeout - no response from server for {:?}", 
+                                   last_heartbeat_ack.elapsed());
+                            break;
+                        }
                         
-                        if let Err(e) = write.send(Message::Text(heartbeat_json)).await {
+                        // Send heartbeat in simple format
+                        let heartbeat = serde_json::json!({
+                            "type": "heartbeat",
+                            "metrics": {
+                                "cpu": self.get_cpu_usage().await,
+                                "memory": self.get_memory_usage().await,
+                                "disk": self.get_disk_usage().await,
+                                "network": self.get_network_usage().await
+                            }
+                        });
+                        
+                        debug!("Sending heartbeat");
+                        if let Err(e) = write.send(Message::Text(heartbeat.to_string())).await {
                             error!("Failed to send heartbeat: {}", e);
                             break;
                         }
+                        
+                        info!("Sent heartbeat at {}", std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs());
+                    } else if auth_sent && self.start_time.elapsed() > Duration::from_secs(25) {
+                        warn!("Not authenticated after 25 seconds despite sending auth");
+                    }
+                }
+                
+                // Timeout for initial connection/auth sequence
+                _ = tokio::time::sleep(Duration::from_secs(35)) => {
+                    if !authenticated && !auth_sent {
+                        error!("No server message received within 35 seconds of connection");
+                        break;
                     }
                 }
             }
         }
         
+        *self.websocket_connected.write().await = false;
+        
+        if !authenticated && auth_sent {
+            Err("WebSocket connection closed without successful authentication".to_string())
+        } else if !auth_sent {
+            Err("Server did not send initial connection message".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Handle ZKP challenge
+    async fn handle_zkp_challenge(
+        &self,
+        challenge_id: &str,
+        hardware_info: &HardwareInfo,
+        setup_params: &SetupParams,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            Message
+        >,
+    ) -> Result<(), String> {
+        use crate::zkp_halo2;
+        
+        info!("Generating ZKP proof for challenge ID: {}", challenge_id);
+        
+        // Generate commitment
+        let commitment = hardware_info.generate_zkp_commitment();
+        
+        // Generate proof
+        let proof = zkp_halo2::generate_hardware_proof(hardware_info, &commitment, setup_params)
+            .await
+            .map_err(|e| format!("Failed to generate proof: {}", e))?;
+        
+        // Send response in the expected format
+        let response = serde_json::json!({
+            "type": "challenge_response",
+            "challenge_id": challenge_id,
+            "proof": {
+                "data": hex::encode(&proof.data),
+                "public_inputs": hex::encode(&proof.public_inputs),
+                "timestamp": proof.timestamp,
+            }
+        });
+        
+        write.send(Message::Text(response.to_string())).await
+            .map_err(|e| format!("Failed to send challenge response: {}", e))?;
+        
+        info!("Successfully sent ZKP proof for challenge {}", challenge_id);
         Ok(())
     }
 
