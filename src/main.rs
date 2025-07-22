@@ -160,9 +160,7 @@ async fn run_depin_only(config: ServerConfig) -> anyhow::Result<()> {
     // Run WebSocket connection with hardware info and setup params
     match reg_manager.start_websocket_connection(
         reference_code, 
-        None,
-        &hardware_info,
-        &setup_params
+        None
     ).await {
         Ok(_) => info!("WebSocket connection closed"),
         Err(e) => error!("WebSocket error: {}", e),
@@ -314,9 +312,7 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
                     test_duration,
                     reg_manager.start_websocket_connection(
                         response.node.reference_code.clone(),
-                        Some(registration_code.to_string()),
-                        &hardware_info,
-                        &params
+                        Some(registration_code.to_string())
                     )
                 ).await;
                 
