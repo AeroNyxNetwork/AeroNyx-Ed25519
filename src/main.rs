@@ -18,6 +18,7 @@ mod registration;
 mod hardware;
 mod remote_management;
 mod zkp_halo2;
+mod websocket_protocol;
 
 use zkp_halo2::{initialize, SetupParams};
 use config::settings::{ServerConfig, ServerArgs, Command, NodeMode};
@@ -112,7 +113,7 @@ async fn run_depin_only(config: ServerConfig) -> anyhow::Result<()> {
     };
     
     // Store ZKP params in registration manager if available
-    if let Some(params) = zkp_params {
+    if let Some(params) = zkp_params.clone() {
         reg_manager.set_zkp_params(params);
         info!("ZKP-enabled hardware attestation is available");
     }
@@ -152,21 +153,38 @@ async fn run_depin_only(config: ServerConfig) -> anyhow::Result<()> {
     info!("Starting DePIN node with reference code: {}", 
           reg_manager.reference_code.as_ref().unwrap());
     
-    // Start WebSocket connection
+    // Get reference code
     let reference_code = reg_manager.reference_code.clone().unwrap();
     
-    // Enable remote management in WebSocket connection
+    // Enable remote management if configured
     if config.enable_remote_management {
         info!("Remote management enabled");
         reg_manager.set_remote_management_enabled(true);
-        // Give the async task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
     
-    // Run WebSocket connection
-    match reg_manager.start_websocket_connection(reference_code, None).await {
-        Ok(_) => info!("WebSocket connection closed"),
-        Err(e) => error!("WebSocket error: {}", e),
+    // Check if we need to use ZKP-enabled WebSocket connection
+    if let Some(params) = zkp_params {
+        // Collect current hardware info for WebSocket connection
+        let hardware_info = HardwareInfo::collect().await
+            .map_err(|e| anyhow::anyhow!("Failed to collect hardware info: {}", e))?;
+        
+        // Run WebSocket connection with hardware info and setup params
+        match reg_manager.start_websocket_connection_with_params(
+            reference_code, 
+            None,
+            &hardware_info,
+            &params
+        ).await {
+            Ok(_) => info!("WebSocket connection closed"),
+            Err(e) => error!("WebSocket error: {}", e),
+        }
+    } else {
+        // Run WebSocket connection without ZKP (backward compatibility)
+        match reg_manager.start_websocket_connection(reference_code, None).await {
+            Ok(_) => info!("WebSocket connection closed"),
+            Err(e) => error!("WebSocket error: {}", e),
+        }
     }
     
     Ok(())
@@ -236,15 +254,17 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
     
     // Initialize ZKP system
     info!("Initializing zero-knowledge proof system...");
-    match reg_manager.initialize_zkp().await {
+    let zkp_params = match reg_manager.initialize_zkp().await {
         Ok(params) => {
-            reg_manager.set_zkp_params(params);
+            reg_manager.set_zkp_params(params.clone());
             info!("✓ ZKP system initialized successfully");
+            Some(params)
         }
         Err(e) => {
             warn!("Failed to initialize ZKP system: {}. Registration will proceed without ZKP.", e);
+            None
         }
-    }
+    };
     
     // Test API connection first
     info!("Testing connection to API server at {}", config.api_url);
@@ -309,21 +329,42 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
             
             info!("Registration data saved successfully");
             
-            // Test WebSocket connection
-            info!("Testing WebSocket connection...");
-            let test_duration = tokio::time::Duration::from_secs(5);
-            let ws_test = tokio::time::timeout(
-                test_duration,
-                reg_manager.start_websocket_connection(
-                    response.node.reference_code.clone(),
-                    Some(registration_code.to_string())
-                )
-            ).await;
-            
-            match ws_test {
-                Ok(Ok(_)) => info!("WebSocket connection test completed successfully"),
-                Ok(Err(e)) => warn!("WebSocket connection test failed: {}", e),
-                Err(_) => info!("WebSocket connection test completed (timeout)"),
+            // Test WebSocket connection if ZKP is available
+            if let Some(params) = zkp_params {
+                info!("Testing WebSocket connection with ZKP support...");
+                let test_duration = tokio::time::Duration::from_secs(10);
+                let ws_test = tokio::time::timeout(
+                    test_duration,
+                    reg_manager.start_websocket_connection_with_params(
+                        response.node.reference_code.clone(),
+                        Some(registration_code.to_string()),
+                        &hardware_info,
+                        &params
+                    )
+                ).await;
+                
+                match ws_test {
+                    Ok(Ok(_)) => info!("WebSocket connection test completed successfully"),
+                    Ok(Err(e)) => warn!("WebSocket connection test failed: {}", e),
+                    Err(_) => info!("WebSocket connection test completed (timeout)"),
+                }
+            } else {
+                // Test WebSocket connection without ZKP
+                info!("Testing WebSocket connection...");
+                let test_duration = tokio::time::Duration::from_secs(5);
+                let ws_test = tokio::time::timeout(
+                    test_duration,
+                    reg_manager.start_websocket_connection(
+                        response.node.reference_code.clone(),
+                        Some(registration_code.to_string())
+                    )
+                ).await;
+                
+                match ws_test {
+                    Ok(Ok(_)) => info!("WebSocket connection test completed successfully"),
+                    Ok(Err(e)) => warn!("WebSocket connection test failed: {}", e),
+                    Err(_) => info!("WebSocket connection test completed (timeout)"),
+                }
             }
             
             info!("\n================================================================================");
