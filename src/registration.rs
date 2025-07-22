@@ -747,7 +747,7 @@ impl RegistrationManager {
     /// Handle hardware attestation request
     pub async fn handle_attestation_request(
         &self,
-        challenge: Vec<u8>,
+        _challenge: Vec<u8>,
         nonce: String,
     ) -> Result<WebSocketMessage, String> {
         info!("Handling hardware attestation request");
@@ -1123,7 +1123,8 @@ impl RegistrationManager {
                     registration_code: self.registration_code.clone(),
                 };
                 
-                let auth_json = serde_json::to_string(&auth_msg)?;
+                let auth_json = serde_json::to_string(&auth_msg)
+                    .map_err(|e| format!("Failed to serialize auth: {}", e))?;
                 write.send(Message::Text(auth_json)).await
                     .map_err(|e| format!("Failed to send auth: {}", e))?;
             }
@@ -1153,7 +1154,8 @@ impl RegistrationManager {
                             },
                         };
                         
-                        let response_json = serde_json::to_string(&response)?;
+                        let response_json = serde_json::to_string(&response)
+                            .map_err(|e| format!("Failed to serialize response: {}", e))?;
                         write.send(Message::Text(response_json)).await
                             .map_err(|e| format!("Failed to send challenge response: {}", e))?;
                         
@@ -1493,7 +1495,7 @@ impl RegistrationManager {
     }
 
     /// Create heartbeat with metrics (new format)
-    async fn create_client_heartbeat_message(&self, metrics_collector: &ServerMetricsCollector) -> ClientMessage {
+    async fn create_client_heartbeat_message(&self, _metrics_collector: &ServerMetricsCollector) -> ClientMessage {
         let uptime_seconds = self.start_time.elapsed().as_secs();
         
         let (cpu_usage, mem_usage, disk_usage, net_usage) = tokio::join!(
