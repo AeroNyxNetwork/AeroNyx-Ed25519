@@ -1316,12 +1316,16 @@ impl RegistrationManager {
         use crate::zkp_halo2;
         
         match message {
-            ServerMessage::ConnectionEstablished => {
+            ServerMessage::ConnectionEstablished | ServerMessage::Connected { .. } => {
                 info!("Connection established, sending authentication");
                 
+                // Use simplified auth format with just "code" field
+                let auth_code = self.reference_code.clone()
+                    .or_else(|| self.registration_code.clone())
+                    .ok_or("No authentication code available")?;
+                
                 let auth_msg = ClientMessage::Auth {
-                    reference_code: self.reference_code.clone().unwrap(),
-                    registration_code: self.registration_code.clone(),
+                    code: auth_code,
                 };
                 
                 let auth_json = serde_json::to_string(&auth_msg)
@@ -1339,8 +1343,19 @@ impl RegistrationManager {
                 }
             }
             
-            ServerMessage::ChallengeRequest { payload } => {
-                info!("✅ Received ZKP challenge request with ID: {}", payload.challenge_id);
+            ServerMessage::AuthResponse { success, message, node_info: _ } => {
+                if success {
+                    info!("Authentication successful");
+                    *authenticated = true;
+                } else {
+                    let err_msg = message.unwrap_or_else(|| "Authentication failed".to_string());
+                    error!("Authentication failed: {}", err_msg);
+                    return Err(format!("Authentication failed: {}", err_msg));
+                }
+            }
+            
+            ServerMessage::ChallengeRequest { challenge_id, nonce: _ } => {
+                info!("✅ Received ZKP challenge request with ID: {}", challenge_id);
                 
                 // Generate commitment
                 let commitment = hardware_info.generate_zkp_commitment();
@@ -1349,10 +1364,8 @@ impl RegistrationManager {
                 match zkp_halo2::generate_hardware_proof(hardware_info, &commitment, setup_params).await {
                     Ok(proof) => {
                         let response = ClientMessage::ChallengeResponse {
-                            payload: ChallengeResponsePayload {
-                                challenge_id: payload.challenge_id.clone(),
-                                proof: ProofData::from(&proof),
-                            },
+                            challenge_id: challenge_id.clone(),
+                            proof: ProofData::from(&proof),
                         };
                         
                         let response_json = serde_json::to_string(&response)
@@ -1360,7 +1373,7 @@ impl RegistrationManager {
                         write.send(Message::Text(response_json)).await
                             .map_err(|e| format!("Failed to send challenge response: {}", e))?;
                         
-                        info!("🚀 Successfully sent proof for challenge {}", payload.challenge_id);
+                        info!("🚀 Successfully sent proof for challenge {}", challenge_id);
                     }
                     Err(e) => {
                         error!("❌ Failed to generate proof: {}", e);
@@ -1368,12 +1381,11 @@ impl RegistrationManager {
                 }
             }
             
-            ServerMessage::ChallengeResponseAck { payload } => {
-                info!("Server acknowledged proof for challenge {}: {}", 
-                      payload.challenge_id, payload.status);
+            ServerMessage::ChallengeResponseAck { challenge_id, status, message: _ } => {
+                info!("Server acknowledged proof for challenge {}: {}", challenge_id, status);
             }
             
-            ServerMessage::HeartbeatAck { next_interval: _ } => {
+            ServerMessage::HeartbeatAck { received_at: _, next_interval: _ } => {
                 debug!("Heartbeat acknowledged");
             }
             
@@ -1388,7 +1400,7 @@ impl RegistrationManager {
         
         Ok(())
     }
-
+    
     /// Handle incoming WebSocket messages (legacy version)
     async fn handle_websocket_message(
         &self,
@@ -1697,29 +1709,27 @@ impl RegistrationManager {
 
     /// Create heartbeat with metrics (new format)
     async fn create_client_heartbeat_message(&self, _metrics_collector: &ServerMetricsCollector) -> ClientMessage {
-        let uptime_seconds = self.start_time.elapsed().as_secs();
+            let (cpu_usage, mem_usage, disk_usage, net_usage) = tokio::join!(
+                self.get_cpu_usage(),
+                self.get_memory_usage(),
+                self.get_disk_usage(),
+                self.get_network_usage()
+            );
         
-        let (cpu_usage, mem_usage, disk_usage, net_usage) = tokio::join!(
-            self.get_cpu_usage(),
-            self.get_memory_usage(),
-            self.get_disk_usage(),
-            self.get_network_usage()
-        );
-        
-        ClientMessage::Heartbeat {
-            status: "active".to_string(),
-            uptime_seconds,
-            metrics: WsHeartbeatMetrics {
-                cpu: cpu_usage,
-                mem: mem_usage,
-                disk: disk_usage,
-                net: net_usage,
-                temperature: self.get_cpu_temperature().await,
-                processes: self.get_process_count().await,
-            },
+            ClientMessage::Heartbeat {
+                metrics: HeartbeatMetrics {
+                    cpu: cpu_usage,
+                    memory: mem_usage,
+                    disk: disk_usage,
+                    network: net_usage,
+                },
+                timestamp: Some(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()),
+            }
         }
     }
-
     /// Submit attestation proof proactively
     pub async fn submit_attestation_proof(
         &self,
