@@ -1729,7 +1729,7 @@ impl RegistrationManager {
                 .as_secs()),
         }
     }
-}
+    
     /// Submit attestation proof proactively
     pub async fn submit_attestation_proof(
         &self,
