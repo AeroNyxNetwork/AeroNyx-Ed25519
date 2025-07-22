@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use crate::zkp_halo2::{generate_hardware_proof, verify_hardware_proof, SetupParams, Proof};
 use crate::websocket_protocol::{
     ServerMessage, ClientMessage, ChallengeResponsePayload, ProofData,
-    HeartbeatMetrics as WsHeartbeatMetrics, AttestationVerifyRequest
+    AttestationVerifyRequest
 };
 
 use crate::config::settings::ServerConfig;
@@ -92,7 +92,7 @@ pub enum WebSocketMessage {
     Heartbeat {
         status: String,
         uptime_seconds: u64,
-        metrics: HeartbeatMetrics,
+        metrics: LegacyHeartbeatMetrics,
     },
     
     /// Status update notification
@@ -141,7 +141,7 @@ pub enum WebSocketMessage {
 
 /// System metrics included in heartbeat messages
 #[derive(Debug, Serialize, Deserialize)]
-pub struct HeartbeatMetrics {
+pub struct LegacyHeartbeatMetrics {
     pub cpu: f64,
     pub mem: f64,
     pub disk: f64,
@@ -151,6 +151,7 @@ pub struct HeartbeatMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub processes: Option<u32>,
 }
+
 
 /// Stored registration data for persistence
 #[derive(Debug, Serialize, Deserialize)]
@@ -1681,7 +1682,6 @@ impl RegistrationManager {
     async fn create_heartbeat_message(&self, _metrics_collector: &ServerMetricsCollector) -> WebSocketMessage {
         let uptime_seconds = self.start_time.elapsed().as_secs();
         
-        // Collect system metrics asynchronously
         let (cpu_usage, mem_usage, disk_usage, net_usage) = tokio::join!(
             self.get_cpu_usage(),
             self.get_memory_usage(),
@@ -1689,14 +1689,13 @@ impl RegistrationManager {
             self.get_network_usage()
         );
         
-        // Get optional metrics
         let temperature = self.get_cpu_temperature().await;
         let processes = self.get_process_count().await;
         
         WebSocketMessage::Heartbeat {
             status: "active".to_string(),
             uptime_seconds,
-            metrics: HeartbeatMetrics {
+            metrics: LegacyHeartbeatMetrics {  // Changed from HeartbeatMetrics
                 cpu: cpu_usage,
                 mem: mem_usage,
                 disk: disk_usage,
@@ -1716,8 +1715,9 @@ impl RegistrationManager {
             self.get_network_usage()
         );
         
+        // Use the websocket_protocol HeartbeatMetrics directly
         ClientMessage::Heartbeat {
-            metrics: HeartbeatMetrics {
+            metrics: crate::websocket_protocol::HeartbeatMetrics {
                 cpu: cpu_usage,
                 memory: mem_usage,
                 disk: disk_usage,
@@ -1937,7 +1937,7 @@ mod tests {
         let heartbeat = WebSocketMessage::Heartbeat {
             status: "active".to_string(),
             uptime_seconds: 3600,
-            metrics: HeartbeatMetrics {
+            metrics: LegacyHeartbeatMetrics {
                 cpu: 25.5,
                 mem: 45.2,
                 disk: 60.1,
