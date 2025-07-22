@@ -1709,27 +1709,27 @@ impl RegistrationManager {
 
     /// Create heartbeat with metrics (new format)
     async fn create_client_heartbeat_message(&self, _metrics_collector: &ServerMetricsCollector) -> ClientMessage {
-            let (cpu_usage, mem_usage, disk_usage, net_usage) = tokio::join!(
-                self.get_cpu_usage(),
-                self.get_memory_usage(),
-                self.get_disk_usage(),
-                self.get_network_usage()
-            );
+        let (cpu_usage, mem_usage, disk_usage, net_usage) = tokio::join!(
+            self.get_cpu_usage(),
+            self.get_memory_usage(),
+            self.get_disk_usage(),
+            self.get_network_usage()
+        );
         
-            ClientMessage::Heartbeat {
-                metrics: HeartbeatMetrics {
-                    cpu: cpu_usage,
-                    memory: mem_usage,
-                    disk: disk_usage,
-                    network: net_usage,
-                },
-                timestamp: Some(std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()),
-            }
+        ClientMessage::Heartbeat {
+            metrics: HeartbeatMetrics {
+                cpu: cpu_usage,
+                memory: mem_usage,
+                disk: disk_usage,
+                network: net_usage,
+            },
+            timestamp: Some(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()),
         }
     }
+}
     /// Submit attestation proof proactively
     pub async fn submit_attestation_proof(
         &self,
