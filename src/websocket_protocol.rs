@@ -9,30 +9,45 @@ use crate::zkp_halo2::types::Proof;
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
+    /// Initial connection message
+    #[serde(rename = "connected")]
+    Connected {
+        #[serde(default)]
+        message: Option<String>,
+    },
+    
+    /// Authentication success/failure
+    #[serde(rename = "auth_response")]
+    AuthResponse {
+        success: bool,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        node_info: Option<serde_json::Value>,
+    },
+    
     /// ZKP challenge request from server
-    #[serde(rename = "CHALLENGE_REQUEST")]
+    #[serde(rename = "challenge_request")]
     ChallengeRequest {
-        payload: ChallengeRequestPayload,
+        challenge_id: String,
+        #[serde(default)]
+        nonce: Option<String>,
     },
     
     /// Acknowledgment of challenge response
-    #[serde(rename = "CHALLENGE_RESPONSE_ACK")]
+    #[serde(rename = "challenge_response_ack")]
     ChallengeResponseAck {
-        payload: ChallengeResponseAckPayload,
-    },
-    
-    /// Authentication success
-    #[serde(rename = "auth_success")]
-    AuthSuccess {
+        challenge_id: String,
+        status: String,
         #[serde(default)]
-        heartbeat_interval: Option<u64>,
-        #[serde(default)]
-        node_info: Option<serde_json::Value>,
+        message: Option<String>,
     },
     
     /// Heartbeat acknowledgment
     #[serde(rename = "heartbeat_ack")]
     HeartbeatAck {
+        #[serde(default)]
+        received_at: Option<u64>,
         #[serde(default)]
         next_interval: Option<u64>,
     },
@@ -44,77 +59,44 @@ pub enum ServerMessage {
         message: String,
     },
     
-    /// Connection established
-    #[serde(rename = "connection_established")]
-    ConnectionEstablished,
-    
-    /// Generic message for backward compatibility
+    /// Generic message for any unhandled types
     #[serde(other)]
     Unknown,
-}
-
-/// Challenge request payload
-#[derive(Deserialize, Debug, Clone)]
-pub struct ChallengeRequestPayload {
-    pub challenge_id: String,
-}
-
-/// Challenge response acknowledgment payload
-#[derive(Deserialize, Debug, Clone)]
-pub struct ChallengeResponseAckPayload {
-    pub challenge_id: String,
-    pub status: String,
-    #[serde(default)]
-    pub message: Option<String>,
 }
 
 /// Client messages sent via WebSocket
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    /// Authentication message
+    /// Authentication message (using 'code' field like in test script)
     #[serde(rename = "auth")]
     Auth {
-        reference_code: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        registration_code: Option<String>,
+        code: String,  // This is the reference_code or registration_code
     },
     
     /// Challenge response with ZKP proof
-    #[serde(rename = "CHALLENGE_RESPONSE")]
+    #[serde(rename = "challenge_response")]
     ChallengeResponse {
-        payload: ChallengeResponsePayload,
+        challenge_id: String,
+        proof: ProofData,
     },
     
     /// Heartbeat message
     #[serde(rename = "heartbeat")]
     Heartbeat {
-        status: String,
-        uptime_seconds: u64,
         metrics: HeartbeatMetrics,
-    },
-    
-    /// Status update
-    #[serde(rename = "status_update")]
-    StatusUpdate {
-        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp: Option<u64>,
     },
 }
 
-/// Challenge response payload containing the ZKP proof
-#[derive(Serialize, Debug, Clone)]
-pub struct ChallengeResponsePayload {
-    pub challenge_id: String,
-    pub proof: ProofData,
-}
-
-/// Proof data structure matching the Python backend expectations
+/// Proof data structure for challenge responses
 #[derive(Serialize, Debug, Clone)]
 pub struct ProofData {
-    /// The actual proof bytes
-    pub data: Vec<u8>,
-    /// Public inputs (commitment)
-    pub public_inputs: Vec<u8>,
+    /// The actual proof bytes (hex encoded)
+    pub data: String,
+    /// Public inputs (commitment) in hex
+    pub public_inputs: String,
     /// Timestamp of proof generation
     pub timestamp: u64,
     /// Optional metadata
@@ -122,24 +104,20 @@ pub struct ProofData {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// System metrics for heartbeat
+/// System metrics for heartbeat (matching test script format)
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HeartbeatMetrics {
     pub cpu: f64,
-    pub mem: f64,
+    pub memory: f64,
     pub disk: f64,
-    pub net: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub processes: Option<u32>,
+    pub network: f64,
 }
 
 impl From<&Proof> for ProofData {
     fn from(proof: &Proof) -> Self {
         Self {
-            data: proof.data.clone(),
-            public_inputs: proof.public_inputs.clone(),
+            data: hex::encode(&proof.data),
+            public_inputs: hex::encode(&proof.public_inputs),
             timestamp: proof.timestamp,
             metadata: proof.metadata.as_ref().map(|m| {
                 serde_json::json!({
@@ -153,16 +131,8 @@ impl From<&Proof> for ProofData {
     }
 }
 
-/// API request for attestation verification
+/// API request for attestation verification (if needed)
 #[derive(Serialize, Debug)]
 pub struct AttestationVerifyRequest {
     pub proof: ProofData,
-}
-
-/// API response for attestation verification
-#[derive(Deserialize, Debug)]
-pub struct AttestationVerifyResponse {
-    pub valid: bool,
-    pub challenge_id: Option<String>,
-    pub message: String,
 }
