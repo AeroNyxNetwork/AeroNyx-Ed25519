@@ -1,6 +1,5 @@
 // src/websocket_protocol.rs
-// AeroNyx Privacy Network - WebSocket Protocol Implementation
-
+// Fixed version with correct message structures
 
 use serde::{Deserialize, Serialize};
 use crate::zkp_halo2::types::Proof;
@@ -16,7 +15,20 @@ pub enum ServerMessage {
         message: Option<String>,
     },
     
-    /// Authentication success/failure
+    /// Connection established (alternative name)
+    #[serde(rename = "connection_established")]
+    ConnectionEstablished,
+    
+    /// Authentication success
+    #[serde(rename = "auth_success")]
+    AuthSuccess {
+        #[serde(default)]
+        heartbeat_interval: Option<u64>,
+        #[serde(default)]
+        node_info: Option<serde_json::Value>,
+    },
+    
+    /// Authentication response (alternative)
     #[serde(rename = "auth_response")]
     AuthResponse {
         success: bool,
@@ -26,7 +38,7 @@ pub enum ServerMessage {
         node_info: Option<serde_json::Value>,
     },
     
-    /// ZKP challenge request from server
+    /// ZKP challenge request
     #[serde(rename = "challenge_request")]
     ChallengeRequest {
         challenge_id: String,
@@ -68,7 +80,7 @@ pub enum ServerMessage {
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    /// Authentication message (using 'code' field like in test script)
+    /// Authentication message - simplified format
     #[serde(rename = "auth")]
     Auth {
         code: String,  // This is the reference_code or registration_code
@@ -90,7 +102,20 @@ pub enum ClientMessage {
     },
 }
 
-/// Proof data structure for challenge responses
+/// Challenge request payload
+#[derive(Deserialize, Debug, Clone)]
+pub struct ChallengeRequestPayload {
+    pub challenge_id: String,
+}
+
+/// Challenge response payload
+#[derive(Serialize, Debug, Clone)]
+pub struct ChallengeResponsePayload {
+    pub challenge_id: String,
+    pub proof: ProofData,
+}
+
+/// Proof data structure
 #[derive(Serialize, Debug, Clone)]
 pub struct ProofData {
     /// The actual proof bytes (hex encoded)
@@ -104,7 +129,7 @@ pub struct ProofData {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// System metrics for heartbeat (matching test script format)
+/// System metrics for heartbeat
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct HeartbeatMetrics {
     pub cpu: f64,
@@ -131,7 +156,7 @@ impl From<&Proof> for ProofData {
     }
 }
 
-/// API request for attestation verification (if needed)
+/// API request for attestation verification
 #[derive(Serialize, Debug)]
 pub struct AttestationVerifyRequest {
     pub proof: ProofData,
