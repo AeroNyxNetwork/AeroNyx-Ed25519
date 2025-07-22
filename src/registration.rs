@@ -24,6 +24,10 @@ use std::path::PathBuf;
 use std::fs;
 use std::collections::HashSet;
 use crate::zkp_halo2::{generate_hardware_proof, verify_hardware_proof, SetupParams, Proof};
+use crate::websocket_protocol::{
+    ServerMessage, ClientMessage, ChallengeResponsePayload, ProofData,
+    HeartbeatMetrics as WsHeartbeatMetrics, AttestationVerifyRequest
+};
 
 use crate::config::settings::ServerConfig;
 use crate::server::metrics::ServerMetricsCollector;
@@ -230,6 +234,8 @@ pub struct RegistrationManager {
     tolerance_config: HardwareToleranceConfig,
     /// ZKP setup parameters
     zkp_params: Option<Arc<SetupParams>>,
+    /// Cached hardware info for ZKP operations
+    hardware_info: Option<HardwareInfo>,
 }
 
 impl RegistrationManager {
@@ -262,6 +268,7 @@ impl RegistrationManager {
             remote_handler: Arc::new(RemoteManagementHandler::new()),
             tolerance_config: HardwareToleranceConfig::default(),
             zkp_params: None,
+            hardware_info: None,
         }
     }
 
@@ -655,7 +662,7 @@ impl RegistrationManager {
         info!("Generated hardware fingerprint: {}...", &hardware_fingerprint[..16]);
         
         // Generate ZKP commitment
-        let commitment = self.generate_hardware_commitment(hardware_info).await?;
+        let commitment = hardware_info.generate_zkp_commitment();
         let commitment_hex = hex::encode(&commitment);
         
         info!("Generated ZKP commitment: {}...", &commitment_hex[..16]);
@@ -676,9 +683,10 @@ impl RegistrationManager {
         let payload = serde_json::json!({
             "registration_code": registration_code,
             "node_info": node_info,
+            "zkp_commitment": commitment_hex,
+            "hardware_fingerprint": hardware_fingerprint,
             "node_signature": format!("node-sig-{}", utils::random_string(32)),
             "client_version": env!("CARGO_PKG_VERSION"),
-            "hardware_commitment": commitment_hex, // Add ZKP commitment
             "tolerance_config": {
                 "allow_minor_changes": self.tolerance_config.allow_minor_changes,
                 "max_change_percentage": self.tolerance_config.max_change_percentage,
@@ -716,6 +724,7 @@ impl RegistrationManager {
                     self.wallet_address = Some(data.node.wallet_address.clone());
                     self.hardware_fingerprint = Some(hardware_fingerprint);
                     self.hardware_components = Some(Self::extract_hardware_components(hardware_info));
+                    self.hardware_info = Some(hardware_info.clone());
                     
                     info!("Registration confirmed successfully!");
                     info!("Node ID: {}, Type: {}", data.node.id, data.node.node_type);
@@ -825,11 +834,44 @@ impl RegistrationManager {
             .map_err(|e| format!("Failed to write registration file: {}", e))
     }
 
-    /// Start WebSocket connection for real-time communication
+    /// Start WebSocket connection for real-time communication (original version for compatibility)
     pub async fn start_websocket_connection(
         &mut self,
         reference_code: String,
         registration_code: Option<String>,
+    ) -> Result<(), String> {
+        // Collect hardware info if not already cached
+        let hardware_info = if let Some(ref hw_info) = self.hardware_info {
+            hw_info.clone()
+        } else {
+            HardwareInfo::collect().await
+                .map_err(|e| format!("Failed to collect hardware info: {}", e))?
+        };
+        
+        // Initialize ZKP if not already done
+        let setup_params = if let Some(ref params) = self.zkp_params {
+            params.as_ref().clone()
+        } else {
+            let params = self.initialize_zkp().await?;
+            self.set_zkp_params(params.clone());
+            params
+        };
+        
+        self.start_websocket_connection_with_params(
+            reference_code,
+            registration_code,
+            &hardware_info,
+            &setup_params,
+        ).await
+    }
+
+    /// Start WebSocket connection with explicit hardware info and ZKP params
+    pub async fn start_websocket_connection_with_params(
+        &mut self,
+        reference_code: String,
+        registration_code: Option<String>,
+        hardware_info: &HardwareInfo,
+        setup_params: &SetupParams,
     ) -> Result<(), String> {
         self.reference_code = Some(reference_code.clone());
         if let Some(code) = registration_code {
@@ -852,8 +894,12 @@ impl RegistrationManager {
         let mut retry_count = 0;
         let mut backoff = Duration::from_secs(1);
         
+        // Clone for the async task
+        let hw_info = hardware_info.clone();
+        let params = setup_params.clone();
+        
         loop {
-            match self.connect_and_run_websocket(&ws_url).await {
+            match self.connect_and_run_websocket_v2(&ws_url, &hw_info, &params).await {
                 Ok(_) => {
                     info!("WebSocket connection closed normally");
                     
@@ -892,7 +938,7 @@ impl RegistrationManager {
         }
     }
 
-    /// Internal WebSocket connection handler
+    /// Internal WebSocket connection handler (original version)
     async fn connect_and_run_websocket(&self, ws_url: &str) -> Result<(), String> {
         let (ws_stream, _) = connect_async(ws_url)
             .await
@@ -976,7 +1022,171 @@ impl RegistrationManager {
         }
     }
 
-    /// Handle incoming WebSocket messages
+    /// Internal WebSocket connection handler with ZKP support
+    async fn connect_and_run_websocket_v2(
+        &self,
+        ws_url: &str,
+        hardware_info: &HardwareInfo,
+        setup_params: &SetupParams,
+    ) -> Result<(), String> {
+        let (ws_stream, _) = connect_async(ws_url)
+            .await
+            .map_err(|e| format!("WebSocket connection failed: {}", e))?;
+        
+        info!("WebSocket connected successfully");
+        *self.websocket_connected.write().await = true;
+        
+        let (mut write, mut read) = ws_stream.split();
+        
+        let mut heartbeat_interval = time::interval(Duration::from_secs(60));
+        let mut authenticated = false;
+        let metrics_collector = Arc::new(ServerMetricsCollector::new(
+            Duration::from_secs(60),
+            60,
+        ));
+        
+        loop {
+            tokio::select! {
+                Some(message) = read.next() => {
+                    match message {
+                        Ok(Message::Text(text)) => {
+                            // Try to parse as ServerMessage first
+                            match serde_json::from_str::<ServerMessage>(&text) {
+                                Ok(server_msg) => {
+                                    if let Err(e) = self.handle_server_message(
+                                        server_msg,
+                                        &mut write,
+                                        &mut authenticated,
+                                        hardware_info,
+                                        setup_params,
+                                    ).await {
+                                        error!("Failed to handle message: {}", e);
+                                    }
+                                }
+                                Err(_) => {
+                                    // Fall back to legacy message handling
+                                    if let Err(e) = self.handle_websocket_message(&text, &mut write, &mut authenticated, &mut heartbeat_interval, &mut std::time::Instant::now()).await {
+                                        error!("Failed to handle WebSocket message: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Message::Close(_)) => {
+                            info!("WebSocket closed by server");
+                            break;
+                        }
+                        Err(e) => {
+                            error!("WebSocket error: {}", e);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                
+                _ = heartbeat_interval.tick() => {
+                    if authenticated {
+                        let heartbeat = self.create_client_heartbeat_message(&metrics_collector).await;
+                        let heartbeat_json = serde_json::to_string(&heartbeat)?;
+                        
+                        if let Err(e) = write.send(Message::Text(heartbeat_json)).await {
+                            error!("Failed to send heartbeat: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle server messages with ZKP support
+    async fn handle_server_message(
+        &self,
+        message: ServerMessage,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            Message
+        >,
+        authenticated: &mut bool,
+        hardware_info: &HardwareInfo,
+        setup_params: &SetupParams,
+    ) -> Result<(), String> {
+        use crate::zkp_halo2;
+        
+        match message {
+            ServerMessage::ConnectionEstablished => {
+                info!("Connection established, sending authentication");
+                
+                let auth_msg = ClientMessage::Auth {
+                    reference_code: self.reference_code.clone().unwrap(),
+                    registration_code: self.registration_code.clone(),
+                };
+                
+                let auth_json = serde_json::to_string(&auth_msg)?;
+                write.send(Message::Text(auth_json)).await
+                    .map_err(|e| format!("Failed to send auth: {}", e))?;
+            }
+            
+            ServerMessage::AuthSuccess { heartbeat_interval, node_info } => {
+                info!("Authentication successful");
+                *authenticated = true;
+                
+                if let Some(interval) = heartbeat_interval {
+                    info!("Heartbeat interval: {} seconds", interval);
+                }
+            }
+            
+            ServerMessage::ChallengeRequest { payload } => {
+                info!("✅ Received ZKP challenge request with ID: {}", payload.challenge_id);
+                
+                // Generate commitment
+                let commitment = hardware_info.generate_zkp_commitment();
+                
+                // Generate proof
+                match zkp_halo2::generate_hardware_proof(hardware_info, &commitment, setup_params).await {
+                    Ok(proof) => {
+                        let response = ClientMessage::ChallengeResponse {
+                            payload: ChallengeResponsePayload {
+                                challenge_id: payload.challenge_id.clone(),
+                                proof: ProofData::from(&proof),
+                            },
+                        };
+                        
+                        let response_json = serde_json::to_string(&response)?;
+                        write.send(Message::Text(response_json)).await
+                            .map_err(|e| format!("Failed to send challenge response: {}", e))?;
+                        
+                        info!("🚀 Successfully sent proof for challenge {}", payload.challenge_id);
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to generate proof: {}", e);
+                    }
+                }
+            }
+            
+            ServerMessage::ChallengeResponseAck { payload } => {
+                info!("Server acknowledged proof for challenge {}: {}", 
+                      payload.challenge_id, payload.status);
+            }
+            
+            ServerMessage::HeartbeatAck { next_interval } => {
+                debug!("Heartbeat acknowledged");
+            }
+            
+            ServerMessage::Error { error_code, message } => {
+                error!("Server error [{}]: {}", error_code, message);
+            }
+            
+            ServerMessage::Unknown => {
+                debug!("Received unknown message type");
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Handle incoming WebSocket messages (legacy version)
     async fn handle_websocket_message(
         &self,
         text: &str,
@@ -1252,7 +1462,7 @@ impl RegistrationManager {
         Ok(())
     }
 
-    /// Create heartbeat message with system metrics
+    /// Create heartbeat message with system metrics (legacy format)
     async fn create_heartbeat_message(&self, _metrics_collector: &ServerMetricsCollector) -> WebSocketMessage {
         let uptime_seconds = self.start_time.elapsed().as_secs();
         
@@ -1279,6 +1489,71 @@ impl RegistrationManager {
                 temperature,
                 processes,
             },
+        }
+    }
+
+    /// Create heartbeat with metrics (new format)
+    async fn create_client_heartbeat_message(&self, metrics_collector: &ServerMetricsCollector) -> ClientMessage {
+        let uptime_seconds = self.start_time.elapsed().as_secs();
+        
+        let (cpu_usage, mem_usage, disk_usage, net_usage) = tokio::join!(
+            self.get_cpu_usage(),
+            self.get_memory_usage(),
+            self.get_disk_usage(),
+            self.get_network_usage()
+        );
+        
+        ClientMessage::Heartbeat {
+            status: "active".to_string(),
+            uptime_seconds,
+            metrics: WsHeartbeatMetrics {
+                cpu: cpu_usage,
+                mem: mem_usage,
+                disk: disk_usage,
+                net: net_usage,
+                temperature: self.get_cpu_temperature().await,
+                processes: self.get_process_count().await,
+            },
+        }
+    }
+
+    /// Submit attestation proof proactively
+    pub async fn submit_attestation_proof(
+        &self,
+        session_token: &str,
+        hardware_info: &HardwareInfo,
+        setup_params: &SetupParams,
+    ) -> Result<(), String> {
+        info!("Proactively submitting hardware attestation proof");
+        
+        // Generate commitment and proof
+        let commitment = hardware_info.generate_zkp_commitment();
+        let proof = crate::zkp_halo2::generate_hardware_proof(hardware_info, &commitment, setup_params)
+            .await
+            .map_err(|e| format!("Failed to generate proof: {}", e))?;
+        
+        // Prepare request
+        let request = AttestationVerifyRequest {
+            proof: ProofData::from(&proof),
+        };
+        
+        let url = format!("{}/api/aeronyx/attestation/verify/", self.api_url);
+        
+        let response = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", session_token))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
+        
+        if response.status().is_success() {
+            info!("✅ Server successfully verified the submitted proof");
+            Ok(())
+        } else {
+            let status = response.status();
+            let error_body = response.text().await.unwrap_or_default();
+            Err(format!("Verification failed with status {}: {}", status, error_body))
         }
     }
 
@@ -1555,5 +1830,64 @@ mod tests {
         assert!(!manager.is_connected().await);
         assert_eq!(manager.api_url, "https://api.aeronyx.com");
         assert!(!manager.has_zkp_enabled());
+    }
+    
+    #[test]
+    fn test_client_message_serialization() {
+        // Test auth message
+        let auth = ClientMessage::Auth {
+            reference_code: "AERO-12345".to_string(),
+            registration_code: Some("AERO-REG123".to_string()),
+        };
+        
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains("\"type\":\"auth\""));
+        assert!(json.contains("AERO-12345"));
+        
+        // Test heartbeat message
+        let heartbeat = ClientMessage::Heartbeat {
+            status: "active".to_string(),
+            uptime_seconds: 3600,
+            metrics: WsHeartbeatMetrics {
+                cpu: 25.5,
+                mem: 45.2,
+                disk: 60.1,
+                net: 10.3,
+                temperature: Some(65.0),
+                processes: Some(150),
+            },
+        };
+        
+        let json = serde_json::to_string(&heartbeat).unwrap();
+        assert!(json.contains("\"type\":\"heartbeat\""));
+        assert!(json.contains("\"cpu\":25.5"));
+    }
+    
+    #[test]
+    fn test_server_message_deserialization() {
+        // Test connection established
+        let json = r#"{"type":"connection_established"}"#;
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::ConnectionEstablished));
+        
+        // Test auth success
+        let json = r#"{"type":"auth_success","heartbeat_interval":60}"#;
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ServerMessage::AuthSuccess { heartbeat_interval, .. } => {
+                assert_eq!(heartbeat_interval, Some(60));
+            }
+            _ => panic!("Wrong message type"),
+        }
+        
+        // Test challenge request
+        let json = r#"{"type":"challenge_request","payload":{"challenge_id":"test-123","challenge":"AQID","timestamp":1234567890}}"#;
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ServerMessage::ChallengeRequest { payload } => {
+                assert_eq!(payload.challenge_id, "test-123");
+            }
+            _ => panic!("Wrong message type"),
+        }
     }
 }
