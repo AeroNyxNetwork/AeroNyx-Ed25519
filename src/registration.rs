@@ -1086,7 +1086,8 @@ impl RegistrationManager {
                 _ = heartbeat_interval.tick() => {
                     if authenticated {
                         let heartbeat = self.create_client_heartbeat_message(&metrics_collector).await;
-                        let heartbeat_json = serde_json::to_string(&heartbeat)?;
+                        let heartbeat_json = serde_json::to_string(&heartbeat)
+                            .map_err(|e| format!("Failed to serialize heartbeat: {}", e))?;
                         
                         if let Err(e) = write.send(Message::Text(heartbeat_json)).await {
                             error!("Failed to send heartbeat: {}", e);
@@ -1129,7 +1130,7 @@ impl RegistrationManager {
                     .map_err(|e| format!("Failed to send auth: {}", e))?;
             }
             
-            ServerMessage::AuthSuccess { heartbeat_interval, node_info } => {
+            ServerMessage::AuthSuccess { heartbeat_interval, node_info: _ } => {
                 info!("Authentication successful");
                 *authenticated = true;
                 
@@ -1172,7 +1173,7 @@ impl RegistrationManager {
                       payload.challenge_id, payload.status);
             }
             
-            ServerMessage::HeartbeatAck { next_interval } => {
+            ServerMessage::HeartbeatAck { next_interval: _ } => {
                 debug!("Heartbeat acknowledged");
             }
             
