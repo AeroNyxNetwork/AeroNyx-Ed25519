@@ -1620,8 +1620,7 @@ impl RegistrationManager {
                         // TODO: Apply configuration updates
                     }
                 }
-
-
+                
                 Some("remote_command") => {
                     if *self.remote_management_enabled.read().await {
                         match serde_json::from_str::<serde_json::Value>(text) {
@@ -1692,31 +1691,29 @@ impl RegistrationManager {
                         }
                     } else {
                         warn!("Remote management is disabled");
-                    }
-             
-                    if let Some(request_id) = json.get("request_id").and_then(|id| id.as_str()) {
-                        let error_response = RemoteCommandResponse {
-                            request_id: request_id.to_string(),
-                            success: false,
-                            result: None,
-                            error: Some(crate::remote_command_handler::RemoteCommandError {
-                                code: "REMOTE_MANAGEMENT_DISABLED".to_string(),
-                                message: "Remote management is disabled on this node".to_string(),
-                                details: None,
-                            }),
-                            executed_at: chrono::Utc::now().to_rfc3339(),
-                        };
                         
-                        let response_msg = WebSocketMessage::RemoteCommandResponse { response: error_response };
-                        let response_json = serde_json::to_string(&response_msg)
-                            .map_err(|e| format!("Failed to serialize error response: {}", e))?;
-                        
-                        write.send(Message::Text(response_json)).await
-                            .map_err(|e| format!("Failed to send error response: {}", e))?;
+                        if let Some(request_id) = json.get("request_id").and_then(|id| id.as_str()) {
+                            let error_response = RemoteCommandResponse {
+                                request_id: request_id.to_string(),
+                                success: false,
+                                result: None,
+                                error: Some(crate::remote_command_handler::RemoteCommandError {
+                                    code: "REMOTE_MANAGEMENT_DISABLED".to_string(),
+                                    message: "Remote management is disabled on this node".to_string(),
+                                    details: None,
+                                }),
+                                executed_at: chrono::Utc::now().to_rfc3339(),
+                            };
+                            
+                            let response_msg = WebSocketMessage::RemoteCommandResponse { response: error_response };
+                            let response_json = serde_json::to_string(&response_msg)
+                                .map_err(|e| format!("Failed to serialize error response: {}", e))?;
+                            
+                            write.send(Message::Text(response_json)).await
+                                .map_err(|e| format!("Failed to send error response: {}", e))?;
+                        }
                     }
                 }
-            }
-                
                 
                 Some("status_request") => {
                     // Server requesting current status
