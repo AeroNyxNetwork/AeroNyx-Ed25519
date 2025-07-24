@@ -25,7 +25,7 @@ use std::fs;
 use std::collections::HashSet;
 use crate::zkp_halo2::{generate_hardware_proof, verify_hardware_proof, SetupParams, Proof};
 use crate::websocket_protocol::{
-    ServerMessage, ClientMessage, ChallengeResponsePayload, ProofData,
+    ServerMessage, ClientMessage, ProofData,
     AttestationVerifyRequest
 };
 
@@ -33,8 +33,8 @@ use crate::config::settings::ServerConfig;
 use crate::server::metrics::ServerMetricsCollector;
 use crate::utils;
 use crate::hardware::HardwareInfo;
-use crate::remote_management::{RemoteCommand, RemoteManagementHandler, CommandResponse};
-use crate::remote_command_handler::{RemoteCommand, RemoteCommandHandler, RemoteCommandConfig, RemoteCommandResponse, log_remote_command};
+use crate::remote_management::{RemoteCommand as RemoteMgmtCommand, RemoteManagementHandler, CommandResponse};
+use crate::remote_command_handler::{RemoteCommandData, RemoteCommandHandler, RemoteCommandConfig, RemoteCommandResponse, log_remote_command};
 
 
 /// Generic API response wrapper
@@ -243,8 +243,6 @@ pub struct RegistrationManager {
     start_time: std::time::Instant,
     /// Data directory for persistence
     data_dir: PathBuf,
-    /// Remote management enabled flag
-    remote_management_enabled: Arc<RwLock<bool>>,
     /// Remote command handler
     remote_handler: Arc<RemoteManagementHandler>,
     /// Hardware tolerance configuration
@@ -288,7 +286,6 @@ impl RegistrationManager {
             websocket_connected: Arc::new(RwLock::new(false)),
             start_time: std::time::Instant::now(),
             data_dir: PathBuf::from("data"),
-            remote_management_enabled: Arc::new(RwLock::new(false)),
             remote_handler: Arc::new(RemoteManagementHandler::new()),
             tolerance_config: HardwareToleranceConfig::default(),
             zkp_params: None,
@@ -312,20 +309,6 @@ impl RegistrationManager {
     /// Check if ZKP is enabled
     pub fn has_zkp_enabled(&self) -> bool {
         self.zkp_params.is_some()
-    }
-
-    pub fn set_remote_management_enabled(&self, enabled: bool) {
-        tokio::spawn({
-            let remote_management_enabled = self.remote_management_enabled.clone();
-            async move {
-                *remote_management_enabled.write().await = enabled;
-                if enabled {
-                    info!("Remote management capabilities enabled");
-                } else {
-                    info!("Remote management capabilities disabled");
-                }
-            }
-        });
     }
 
     /// Set hardware tolerance configuration
@@ -382,10 +365,9 @@ impl RegistrationManager {
 
                             if let Some(handler) = Arc::get_mut(&mut self.remote_command_handler) {
           
+                      
                                 let mut remote_config = RemoteCommandConfig::default();
                                 remote_config.working_dir = config.data_dir.clone();
-                                
-                      
                                 remote_config.allowed_paths = vec![
                                     config.data_dir.clone(),
                                     PathBuf::from("/var/log/aeronyx"),
@@ -1641,40 +1623,78 @@ impl RegistrationManager {
 
 
                 Some("remote_command") => {
-                // 处理远程命令
-                if *self.remote_management_enabled.read().await {
-                    if let Ok(remote_cmd_msg) = serde_json::from_value::<WebSocketMessage>(json.clone()) {
-                        if let WebSocketMessage::RemoteCommand { request_id, from_session, command } = remote_cmd_msg {
-                            info!("Received remote command: request_id={}, from_session={}", request_id, from_session);
-                            
-                            // 异步处理命令
-                            let handler = self.remote_command_handler.clone();
-                            let response = handler.handle_command(request_id.clone(), command).await;
-                            
-                            // 记录日志
-                            log_remote_command(
-                                &from_session,
-                                &response.result.as_ref()
-                                    .and_then(|r| r.get("type"))
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("unknown"),
-                                response.success,
-                                &format!("request_id={}", request_id)
-                            );
-                            
-                            // 发送响应
-                            let response_msg = WebSocketMessage::RemoteCommandResponse { response };
-                            let response_json = serde_json::to_string(&response_msg)
-                                .map_err(|e| format!("Failed to serialize response: {}", e))?;
-                            
-                            write.send(Message::Text(response_json)).await
-                                .map_err(|e| format!("Failed to send response: {}", e))?;
+                    if *self.remote_management_enabled.read().await {
+                        match serde_json::from_str::<serde_json::Value>(text) {
+                            Ok(json_value) => {
+                                let request_id = json_value.get("request_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let from_session = json_value.get("from_session")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                
+                                if let Some(command_json) = json_value.get("command") {
+                                    match serde_json::from_value::<RemoteCommandData>(command_json.clone()) {
+                                        Ok(command_data) => {
+                                            info!("Processing remote command: {}", request_id);
+                                            
+                                            let handler = self.remote_command_handler.clone();
+                                            let response = handler.handle_command(
+                                                request_id.to_string(), 
+                                                command_data
+                                            ).await;
+                                            
+                                            // Log the command
+                                            log_remote_command(
+                                                from_session,
+                                                &response.result.as_ref()
+                                                    .and_then(|r| r.get("type"))
+                                                    .and_then(|t| t.as_str())
+                                                    .unwrap_or("unknown"),
+                                                response.success,
+                                                &format!("request_id={}", request_id)
+                                            );
+                                            
+                                            // Send response
+                                            let response_msg = WebSocketMessage::RemoteCommandResponse { response };
+                                            if let Ok(response_json) = serde_json::to_string(&response_msg) {
+                                                let _ = write.send(Message::Text(response_json)).await;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to parse remote command: {}", e);
+                                            // Send error response
+                                            let error_response = RemoteCommandResponse {
+                                                request_id: request_id.to_string(),
+                                                success: false,
+                                                result: None,
+                                                error: Some(crate::remote_command_handler::RemoteCommandError {
+                                                    code: "INVALID_COMMAND".to_string(),
+                                                    message: format!("Failed to parse command: {}", e),
+                                                    details: None,
+                                                }),
+                                                executed_at: chrono::Utc::now().to_rfc3339(),
+                                            };
+                                            
+                                            let response_msg = WebSocketMessage::RemoteCommandResponse { 
+                                                response: error_response 
+                                            };
+                                            if let Ok(response_json) = serde_json::to_string(&response_msg) {
+                                                let _ = write.send(Message::Text(response_json)).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to parse remote command message: {}", e);
+                            }
+                        }
+                    } else {
+                        warn!("Remote management is disabled");
                         }
                     }
-                } else {
-                    warn!("Received remote command but remote management is disabled");
-                    
-                    // 发送错误响应
+             
                     if let Some(request_id) = json.get("request_id").and_then(|id| id.as_str()) {
                         let error_response = RemoteCommandResponse {
                             request_id: request_id.to_string(),
