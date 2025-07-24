@@ -14,6 +14,8 @@ use tokio::fs;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
+use std::pin::Pin;
+use std::future::Future;
 
 /// Remote command received from server
 #[derive(Debug, Deserialize)]
@@ -418,83 +420,85 @@ impl RemoteCommandHandler {
     }
 
     /// Recursively list directory contents
-    async fn list_directory(
-        &self,
-        path: &Path,
+    fn list_directory<'a>(
+        &'a self,
+        path: &'a Path,
         include_hidden: bool,
         recursive: bool,
         depth: u32,
-    ) -> Result<Vec<serde_json::Value>, RemoteCommandError> {
-        // Limit recursion depth
-        if depth > 5 {
-            return Ok(vec![]);
-        }
-
-        let mut entries = Vec::new();
-        let mut dir_stream = fs::read_dir(path).await.map_err(|e| {
-            self.create_error("SYSTEM_ERROR", format!("Failed to read directory: {}", e), None)
-        })?;
-
-        while let Ok(Some(entry)) = dir_stream.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            // Skip hidden files if not requested
-            if !include_hidden && name.starts_with('.') {
-                continue;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<serde_json::Value>, RemoteCommandError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Limit recursion depth
+            if depth > 5 {
+                return Ok(vec![]);
             }
 
-            let metadata = match entry.metadata().await {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            let mut entries = Vec::new();
+            let mut dir_stream = fs::read_dir(path).await.map_err(|e| {
+                self.create_error("SYSTEM_ERROR", format!("Failed to read directory: {}", e), None)
+            })?;
 
-            let file_type = if metadata.is_dir() {
-                "directory"
-            } else if metadata.is_file() {
-                "file"
-            } else {
-                "other"
-            };
+            while let Ok(Some(entry)) = dir_stream.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
 
-            let mut entry_info = serde_json::json!({
-                "name": name,
-                "type": file_type,
-                "size": metadata.len(),
-            });
-
-            // Add permissions and ownership info on Unix
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                use std::os::unix::fs::PermissionsExt;
-                
-                entry_info["permissions"] = serde_json::json!(
-                    format!("{:o}", metadata.permissions().mode() & 0o777)
-                );
-                entry_info["owner"] = serde_json::json!(metadata.uid());
-                entry_info["group"] = serde_json::json!(metadata.gid());
-            }
-
-            // Add modification time
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(duration) = modified.duration_since(SystemTime::UNIX_EPOCH) {
-                    let dt = chrono::Utc::now() - chrono::Duration::seconds(duration.as_secs() as i64);
-                    entry_info["modified"] = serde_json::json!(dt.to_rfc3339());
+                // Skip hidden files if not requested
+                if !include_hidden && name.starts_with('.') {
+                    continue;
                 }
-            }
 
-            // Recursively list subdirectories
-            if recursive && metadata.is_dir() {
-                let sub_path = entry.path();
-                if let Ok(sub_entries) = self.list_directory(&sub_path, include_hidden, true, depth + 1).await {
-                    entry_info["entries"] = serde_json::json!(sub_entries);
+                let metadata = match entry.metadata().await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                let file_type = if metadata.is_dir() {
+                    "directory"
+                } else if metadata.is_file() {
+                    "file"
+                } else {
+                    "other"
+                };
+
+                let mut entry_info = serde_json::json!({
+                    "name": name,
+                    "type": file_type,
+                    "size": metadata.len(),
+                });
+
+                // Add permissions and ownership info on Unix
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    use std::os::unix::fs::PermissionsExt;
+                    
+                    entry_info["permissions"] = serde_json::json!(
+                        format!("{:o}", metadata.permissions().mode() & 0o777)
+                    );
+                    entry_info["owner"] = serde_json::json!(metadata.uid());
+                    entry_info["group"] = serde_json::json!(metadata.gid());
                 }
+
+                // Add modification time
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(duration) = modified.duration_since(SystemTime::UNIX_EPOCH) {
+                        let dt = chrono::Utc::now() - chrono::Duration::seconds(duration.as_secs() as i64);
+                        entry_info["modified"] = serde_json::json!(dt.to_rfc3339());
+                    }
+                }
+
+                // Recursively list subdirectories
+                if recursive && metadata.is_dir() {
+                    let sub_path = entry.path();
+                    if let Ok(sub_entries) = self.list_directory(&sub_path, include_hidden, true, depth + 1).await {
+                        entry_info["entries"] = serde_json::json!(sub_entries);
+                    }
+                }
+
+                entries.push(entry_info);
             }
 
-            entries.push(entry_info);
-        }
-
-        Ok(entries)
+            Ok(entries)
+        })
     }
 
     /// Handle system info request
