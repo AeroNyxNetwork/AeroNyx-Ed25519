@@ -15,7 +15,7 @@ categories = ["networking", "cryptography"]
 tokio = { version = "1.28", features = ["full"] }
 futures = "0.3"
 futures-util = "0.3"
-
+mime_guess = "2.0"
 # Networking
 tun = { version = "0.5", features = ["async"] }
 socket2 = "0.5"
