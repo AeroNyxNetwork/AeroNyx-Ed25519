@@ -1692,7 +1692,6 @@ impl RegistrationManager {
                         }
                     } else {
                         warn!("Remote management is disabled");
-                        }
                     }
              
                     if let Some(request_id) = json.get("request_id").and_then(|id| id.as_str()) {
