@@ -104,11 +104,8 @@ pub enum WebSocketMessage {
     /// Remote command response to server
     #[serde(rename = "remote_command_response")]
     RemoteCommandResponse {
-        request_id: String,
-        success: bool,
-        result: Option<serde_json::Value>,
-        error: Option<RemoteCommandError>,
-        executed_at: String,
+        #[serde(flatten)]  
+        response: RemoteCommandResponse,
     },
     
     /// Periodic heartbeat with system metrics
@@ -175,15 +172,6 @@ pub struct LegacyHeartbeatMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub processes: Option<u32>,
 }
-
-/// Error structure for remote commands
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RemoteCommandError {
-    pub code: String,
-    pub message: String,
-    pub details: Option<serde_json::Value>,
-}
-
 
 /// Stored registration data for persistence
 #[derive(Debug, Serialize, Deserialize)]
@@ -1668,37 +1656,36 @@ impl RegistrationManager {
                                         &format!("request_id={}", request_id)
                                     );
                                     
-                                    // Send response - 使用文档要求的格式
-                                    let response_msg = serde_json::json!({
-                                        "type": "remote_command_response",
-                                        "request_id": response.request_id,
-                                        "success": response.success,
-                                        "result": response.result,
-                                        "error": response.error,
-                                        "executed_at": response.executed_at
-                                    });
+                                    // Send response
+                                    let response_msg = WebSocketMessage::RemoteCommandResponse {
+                                        response,  // 现在这样就对了
+                                    };
                                     
-                                    write.send(Message::Text(response_msg.to_string())).await
-                                        .map_err(|e| format!("Failed to send response: {}", e))?;
+                                    if let Ok(response_json) = serde_json::to_string(&response_msg) {
+                                        let _ = write.send(Message::Text(response_json)).await;
+                                    }
                                 }
                                 Err(e) => {
                                     error!("Failed to parse remote command: {}", e);
                                     // Send error response
-                                    let error_response = serde_json::json!({
-                                        "type": "remote_command_response",
-                                        "request_id": request_id,
-                                        "success": false,
-                                        "result": null,
-                                        "error": {
-                                            "code": "INVALID_COMMAND",
-                                            "message": format!("Failed to parse command: {}", e),
-                                            "details": null
-                                        },
-                                        "executed_at": chrono::Utc::now().to_rfc3339()
-                                    });
+                                    let error_response = RemoteCommandResponse {
+                                        request_id: request_id.to_string(),
+                                        success: false,
+                                        result: None,
+                                        error: Some(RemoteCommandError {
+                                            code: "INVALID_COMMAND".to_string(),
+                                            message: format!("Failed to parse command: {}", e),
+                                            details: None,
+                                        }),
+                                        executed_at: chrono::Utc::now().to_rfc3339(),
+                                    };
                                     
-                                    write.send(Message::Text(error_response.to_string())).await
-                                        .map_err(|e| format!("Failed to send error response: {}", e))?;
+                                    let response_msg = WebSocketMessage::RemoteCommandResponse { 
+                                        response: error_response 
+                                    };
+                                    if let Ok(response_json) = serde_json::to_string(&response_msg) {
+                                        let _ = write.send(Message::Text(response_json)).await;
+                                    }
                                 }
                             }
                         }
@@ -1706,20 +1693,25 @@ impl RegistrationManager {
                         warn!("Remote management is disabled");
                         
                         if let Some(request_id) = json.get("request_id").and_then(|id| id.as_str()) {
-                            let error_response = serde_json::json!({
-                                "type": "remote_command_response",
-                                "request_id": request_id,
-                                "success": false,
-                                "result": null,
-                                "error": {
-                                    "code": "REMOTE_MANAGEMENT_DISABLED",
-                                    "message": "Remote management is disabled on this node",
-                                    "details": null
-                                },
-                                "executed_at": chrono::Utc::now().to_rfc3339()
-                            });
+                            let error_response = RemoteCommandResponse {
+                                request_id: request_id.to_string(),
+                                success: false,
+                                result: None,
+                                error: Some(RemoteCommandError {
+                                    code: "REMOTE_MANAGEMENT_DISABLED".to_string(),
+                                    message: "Remote management is disabled on this node".to_string(),
+                                    details: None,
+                                }),
+                                executed_at: chrono::Utc::now().to_rfc3339(),
+                            };
                             
-                            write.send(Message::Text(error_response.to_string())).await
+                            let response_msg = WebSocketMessage::RemoteCommandResponse { 
+                                response: error_response 
+                            };
+                            let response_json = serde_json::to_string(&response_msg)
+                                .map_err(|e| format!("Failed to serialize error response: {}", e))?;
+                            
+                            write.send(Message::Text(response_json)).await
                                 .map_err(|e| format!("Failed to send error response: {}", e))?;
                         }
                     }
