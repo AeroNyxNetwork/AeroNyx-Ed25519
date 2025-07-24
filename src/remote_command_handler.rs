@@ -715,14 +715,39 @@ pub fn log_remote_command(
     details: &str,
 ) {
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let log_entry = format!(
-        "[{}] REMOTE_{}: session={}, result={}, details={}",
-        timestamp,
-        command_type.to_uppercase(),
-        session_id,
-        if success { "success" } else { "failed" },
-        details
-    );
+    let result = if success { "success" } else { "failed" };
     
-    info!("{}", log_entry);
+    match command_type {
+        "execute" => {
+            info!("[{}] REMOTE_CMD: session={}, {}, result={}", 
+                timestamp, session_id, details, result);
+        }
+        "upload" => {
+            info!("[{}] REMOTE_UPLOAD: session={}, {}, result={}", 
+                timestamp, session_id, details, result);
+        }
+        "download" => {
+            info!("[{}] REMOTE_DOWNLOAD: session={}, {}, result={}", 
+                timestamp, session_id, details, result);
+        }
+        "list" => {
+            info!("[{}] REMOTE_LIST: session={}, {}, result={}", 
+                timestamp, session_id, details, result);
+        }
+        "system_info" => {
+            info!("[{}] REMOTE_SYSINFO: session={}, {}, result={}", 
+                timestamp, session_id, details, result);
+        }
+        _ => {
+            info!("[{}] REMOTE_{}: session={}, {}, result={}", 
+                timestamp, command_type.to_uppercase(), session_id, details, result);
+        }
+    }
+    
+    if !success && command_type == "execute" {
+        if details.contains("FORBIDDEN_COMMAND") {
+            error!("[{}] REMOTE_ERROR: session={}, cmd={}, error=FORBIDDEN_COMMAND", 
+                timestamp, session_id, details);
+        }
+    }
 }
