@@ -34,9 +34,14 @@ use crate::server::metrics::ServerMetricsCollector;
 use crate::utils;
 use crate::hardware::HardwareInfo;
 use crate::remote_management::{RemoteCommand as RemoteMgmtCommand, RemoteManagementHandler, CommandResponse};
-use crate::remote_command_handler::{RemoteCommandData, RemoteCommandHandler, RemoteCommandConfig, RemoteCommandResponse, log_remote_command};
-
-
+use crate::remote_command_handler::{
+    RemoteCommandData, 
+    RemoteCommandHandler, 
+    RemoteCommandConfig, 
+    RemoteCommandResponse, 
+    RemoteCommandError,
+    log_remote_command
+};
 /// Generic API response wrapper
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ApiResponse<T> {
@@ -93,14 +98,17 @@ pub enum WebSocketMessage {
     RemoteCommand {
         request_id: String,
         from_session: String,
-        command: RemoteCommandData,
+        command: RemoteCommandData,  
     },
     
     /// Remote command response to server
     #[serde(rename = "remote_command_response")]
     RemoteCommandResponse {
-        #[serde(flatten)]
-        response: RemoteCommandResponse,
+        request_id: String,
+        success: bool,
+        result: Option<serde_json::Value>,
+        error: Option<RemoteCommandError>,
+        executed_at: String,
     },
     
     /// Periodic heartbeat with system metrics
@@ -166,6 +174,14 @@ pub struct LegacyHeartbeatMetrics {
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub processes: Option<u32>,
+}
+
+/// Error structure for remote commands
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RemoteCommandError {
+    pub code: String,
+    pub message: String,
+    pub details: Option<serde_json::Value>,
 }
 
 
@@ -1623,93 +1639,87 @@ impl RegistrationManager {
                 
                 Some("remote_command") => {
                     if *self.remote_management_enabled.read().await {
-                        match serde_json::from_str::<serde_json::Value>(text) {
-                            Ok(json_value) => {
-                                let request_id = json_value.get("request_id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-                                let from_session = json_value.get("from_session")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-                                
-                                if let Some(command_json) = json_value.get("command") {
-                                    match serde_json::from_value::<RemoteCommandData>(command_json.clone()) {
-                                        Ok(command_data) => {
-                                            info!("Processing remote command: {}", request_id);
-                                            
-                                            let handler = self.remote_command_handler.clone();
-                                            let response = handler.handle_command(
-                                                request_id.to_string(), 
-                                                command_data
-                                            ).await;
-                                            
-                                            // Log the command
-                                            log_remote_command(
-                                                from_session,
-                                                &response.result.as_ref()
-                                                    .and_then(|r| r.get("type"))
-                                                    .and_then(|t| t.as_str())
-                                                    .unwrap_or("unknown"),
-                                                response.success,
-                                                &format!("request_id={}", request_id)
-                                            );
-                                            
-                                            // Send response
-                                            let response_msg = WebSocketMessage::RemoteCommandResponse { response };
-                                            if let Ok(response_json) = serde_json::to_string(&response_msg) {
-                                                let _ = write.send(Message::Text(response_json)).await;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to parse remote command: {}", e);
-                                            // Send error response
-                                            let error_response = RemoteCommandResponse {
-                                                request_id: request_id.to_string(),
-                                                success: false,
-                                                result: None,
-                                                error: Some(crate::remote_command_handler::RemoteCommandError {
-                                                    code: "INVALID_COMMAND".to_string(),
-                                                    message: format!("Failed to parse command: {}", e),
-                                                    details: None,
-                                                }),
-                                                executed_at: chrono::Utc::now().to_rfc3339(),
-                                            };
-                                            
-                                            let response_msg = WebSocketMessage::RemoteCommandResponse { 
-                                                response: error_response 
-                                            };
-                                            if let Ok(response_json) = serde_json::to_string(&response_msg) {
-                                                let _ = write.send(Message::Text(response_json)).await;
-                                            }
-                                        }
-                                    }
+                        let request_id = json.get("request_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let from_session = json.get("from_session")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        
+                        if let Some(command_json) = json.get("command") {
+                            match serde_json::from_value::<RemoteCommandData>(command_json.clone()) {
+                                Ok(command_data) => {
+                                    info!("Processing remote command: {}", request_id);
+                                    
+                                    let handler = self.remote_command_handler.clone();
+                                    let response = handler.handle_command(
+                                        request_id.to_string(), 
+                                        command_data
+                                    ).await;
+                                    
+                                    // Log the command
+                                    log_remote_command(
+                                        from_session,
+                                        &response.result.as_ref()
+                                            .and_then(|r| r.get("type"))
+                                            .and_then(|t| t.as_str())
+                                            .unwrap_or("unknown"),
+                                        response.success,
+                                        &format!("request_id={}", request_id)
+                                    );
+                                    
+                                    // Send response - 使用文档要求的格式
+                                    let response_msg = serde_json::json!({
+                                        "type": "remote_command_response",
+                                        "request_id": response.request_id,
+                                        "success": response.success,
+                                        "result": response.result,
+                                        "error": response.error,
+                                        "executed_at": response.executed_at
+                                    });
+                                    
+                                    write.send(Message::Text(response_msg.to_string())).await
+                                        .map_err(|e| format!("Failed to send response: {}", e))?;
                                 }
-                            }
-                            Err(e) => {
-                                error!("Failed to parse remote command message: {}", e);
+                                Err(e) => {
+                                    error!("Failed to parse remote command: {}", e);
+                                    // Send error response
+                                    let error_response = serde_json::json!({
+                                        "type": "remote_command_response",
+                                        "request_id": request_id,
+                                        "success": false,
+                                        "result": null,
+                                        "error": {
+                                            "code": "INVALID_COMMAND",
+                                            "message": format!("Failed to parse command: {}", e),
+                                            "details": null
+                                        },
+                                        "executed_at": chrono::Utc::now().to_rfc3339()
+                                    });
+                                    
+                                    write.send(Message::Text(error_response.to_string())).await
+                                        .map_err(|e| format!("Failed to send error response: {}", e))?;
+                                }
                             }
                         }
                     } else {
                         warn!("Remote management is disabled");
                         
                         if let Some(request_id) = json.get("request_id").and_then(|id| id.as_str()) {
-                            let error_response = RemoteCommandResponse {
-                                request_id: request_id.to_string(),
-                                success: false,
-                                result: None,
-                                error: Some(crate::remote_command_handler::RemoteCommandError {
-                                    code: "REMOTE_MANAGEMENT_DISABLED".to_string(),
-                                    message: "Remote management is disabled on this node".to_string(),
-                                    details: None,
-                                }),
-                                executed_at: chrono::Utc::now().to_rfc3339(),
-                            };
+                            let error_response = serde_json::json!({
+                                "type": "remote_command_response",
+                                "request_id": request_id,
+                                "success": false,
+                                "result": null,
+                                "error": {
+                                    "code": "REMOTE_MANAGEMENT_DISABLED",
+                                    "message": "Remote management is disabled on this node",
+                                    "details": null
+                                },
+                                "executed_at": chrono::Utc::now().to_rfc3339()
+                            });
                             
-                            let response_msg = WebSocketMessage::RemoteCommandResponse { response: error_response };
-                            let response_json = serde_json::to_string(&response_msg)
-                                .map_err(|e| format!("Failed to serialize error response: {}", e))?;
-                            
-                            write.send(Message::Text(response_json)).await
+                            write.send(Message::Text(error_response.to_string())).await
                                 .map_err(|e| format!("Failed to send error response: {}", e))?;
                         }
                     }
