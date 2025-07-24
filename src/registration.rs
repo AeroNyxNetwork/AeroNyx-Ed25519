@@ -34,6 +34,8 @@ use crate::server::metrics::ServerMetricsCollector;
 use crate::utils;
 use crate::hardware::HardwareInfo;
 use crate::remote_management::{RemoteCommand, RemoteManagementHandler, CommandResponse};
+use crate::remote_command_handler::{RemoteCommand, RemoteCommandHandler, RemoteCommandConfig, RemoteCommandResponse, log_remote_command};
+
 
 /// Generic API response wrapper
 #[derive(Debug, Deserialize, Serialize)]
@@ -85,6 +87,20 @@ pub enum WebSocketMessage {
         reference_code: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         registration_code: Option<String>,
+    },
+
+    #[serde(rename = "remote_command")]
+    RemoteCommand {
+        request_id: String,
+        from_session: String,
+        command: RemoteCommand,
+    },
+    
+    /// Remote command response to server
+    #[serde(rename = "remote_command_response")]
+    RemoteCommandResponse {
+        #[serde(flatten)]
+        response: RemoteCommandResponse,
     },
     
     /// Periodic heartbeat with system metrics
@@ -237,6 +253,10 @@ pub struct RegistrationManager {
     zkp_params: Option<Arc<SetupParams>>,
     /// Cached hardware info for ZKP operations
     hardware_info: Option<HardwareInfo>,
+    /// Remote command handler
+    remote_command_handler: Arc<RemoteCommandHandler>,
+    /// Remote management enabled flag
+    remote_management_enabled: Arc<RwLock<bool>>,
 }
 
 impl RegistrationManager {
@@ -253,6 +273,9 @@ impl RegistrationManager {
                 warn!("Failed to build custom HTTP client: {}, using default", e);
                 Client::new()
             });
+        let remote_config = RemoteCommandConfig::default();
+        let remote_command_handler = Arc::new(RemoteCommandHandler::new(remote_config));
+        
 
         Self {
             client,
@@ -270,6 +293,8 @@ impl RegistrationManager {
             tolerance_config: HardwareToleranceConfig::default(),
             zkp_params: None,
             hardware_info: None,
+            remote_command_handler,
+            remote_management_enabled: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -287,6 +312,20 @@ impl RegistrationManager {
     /// Check if ZKP is enabled
     pub fn has_zkp_enabled(&self) -> bool {
         self.zkp_params.is_some()
+    }
+
+    pub fn set_remote_management_enabled(&self, enabled: bool) {
+        tokio::spawn({
+            let remote_management_enabled = self.remote_management_enabled.clone();
+            async move {
+                *remote_management_enabled.write().await = enabled;
+                if enabled {
+                    info!("Remote management capabilities enabled");
+                } else {
+                    info!("Remote management capabilities disabled");
+                }
+            }
+        });
     }
 
     /// Set hardware tolerance configuration
@@ -339,6 +378,21 @@ impl RegistrationManager {
                             
                             if let Some(commitment) = stored_reg.hardware_commitment {
                                 info!("ZKP commitment found: {}...", &commitment[..16.min(commitment.len())]);
+                            }
+
+                            if let Some(handler) = Arc::get_mut(&mut self.remote_command_handler) {
+          
+                                let mut remote_config = RemoteCommandConfig::default();
+                                remote_config.working_dir = config.data_dir.clone();
+                                
+                      
+                                remote_config.allowed_paths = vec![
+                                    config.data_dir.clone(),
+                                    PathBuf::from("/var/log/aeronyx"),
+                                    PathBuf::from("/tmp"),
+                                ];
+                                
+                                self.remote_command_handler = Arc::new(RemoteCommandHandler::new(remote_config));
                             }
                             
                             return Ok(true);
@@ -1584,6 +1638,66 @@ impl RegistrationManager {
                         // TODO: Apply configuration updates
                     }
                 }
+
+
+                Some("remote_command") => {
+                // 处理远程命令
+                if *self.remote_management_enabled.read().await {
+                    if let Ok(remote_cmd_msg) = serde_json::from_value::<WebSocketMessage>(json.clone()) {
+                        if let WebSocketMessage::RemoteCommand { request_id, from_session, command } = remote_cmd_msg {
+                            info!("Received remote command: request_id={}, from_session={}", request_id, from_session);
+                            
+                            // 异步处理命令
+                            let handler = self.remote_command_handler.clone();
+                            let response = handler.handle_command(request_id.clone(), command).await;
+                            
+                            // 记录日志
+                            log_remote_command(
+                                &from_session,
+                                &response.result.as_ref()
+                                    .and_then(|r| r.get("type"))
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("unknown"),
+                                response.success,
+                                &format!("request_id={}", request_id)
+                            );
+                            
+                            // 发送响应
+                            let response_msg = WebSocketMessage::RemoteCommandResponse { response };
+                            let response_json = serde_json::to_string(&response_msg)
+                                .map_err(|e| format!("Failed to serialize response: {}", e))?;
+                            
+                            write.send(Message::Text(response_json)).await
+                                .map_err(|e| format!("Failed to send response: {}", e))?;
+                        }
+                    }
+                } else {
+                    warn!("Received remote command but remote management is disabled");
+                    
+                    // 发送错误响应
+                    if let Some(request_id) = json.get("request_id").and_then(|id| id.as_str()) {
+                        let error_response = RemoteCommandResponse {
+                            request_id: request_id.to_string(),
+                            success: false,
+                            result: None,
+                            error: Some(crate::remote_command_handler::RemoteCommandError {
+                                code: "REMOTE_MANAGEMENT_DISABLED".to_string(),
+                                message: "Remote management is disabled on this node".to_string(),
+                                details: None,
+                            }),
+                            executed_at: chrono::Utc::now().to_rfc3339(),
+                        };
+                        
+                        let response_msg = WebSocketMessage::RemoteCommandResponse { response: error_response };
+                        let response_json = serde_json::to_string(&response_msg)
+                            .map_err(|e| format!("Failed to serialize error response: {}", e))?;
+                        
+                        write.send(Message::Text(response_json)).await
+                            .map_err(|e| format!("Failed to send error response: {}", e))?;
+                    }
+                }
+            }
+                
                 
                 Some("status_request") => {
                     // Server requesting current status
