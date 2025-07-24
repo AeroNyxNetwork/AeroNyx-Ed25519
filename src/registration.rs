@@ -93,7 +93,7 @@ pub enum WebSocketMessage {
     RemoteCommand {
         request_id: String,
         from_session: String,
-        command: RemoteCommand,
+        command: RemoteCommandData,
     },
     
     /// Remote command response to server
@@ -1752,34 +1752,22 @@ impl RegistrationManager {
         
         info!("Processing remote command with request ID: {}", request_id);
         
-        // Parse remote command from parameters
-        if let Some(params) = json.get("parameters") {
-            match serde_json::from_value::<RemoteCommand>(params.clone()) {
-                Ok(remote_cmd) => {
-                    info!("Executing remote command: {:?}", remote_cmd);
+        // Parse remote command data from the command field instead of parameters
+        if let Some(command_data) = json.get("command") {
+            match serde_json::from_value::<RemoteCommandData>(command_data.clone()) {
+                Ok(remote_cmd_data) => {
+                    info!("Executing remote command: {:?}", remote_cmd_data);
                     
-                    // Execute command with timeout
-                    let handler = self.remote_handler.clone();
-                    let response = tokio::time::timeout(
-                        Duration::from_secs(30),
-                        handler.handle_command(remote_cmd)
+                    // Use the new remote command handler
+                    let handler = self.remote_command_handler.clone();
+                    let response = handler.handle_command(
+                        request_id.clone(),
+                        remote_cmd_data
                     ).await;
                     
-                    let command_response = match response {
-                        Ok(resp) => resp,
-                        Err(_) => CommandResponse {
-                            success: false,
-                            message: "Command execution timed out".to_string(),
-                            data: None,
-                            error_code: Some("TIMEOUT".to_string()),
-                            execution_time_ms: None,
-                        }
-                    };
-                    
-                    // Send response back
-                    let response_msg = WebSocketMessage::CommandResponse {
-                        request_id,
-                        response: command_response,
+                    // Send response back using RemoteCommandResponse
+                    let response_msg = WebSocketMessage::RemoteCommandResponse {
+                        response,
                     };
                     
                     let response_json = serde_json::to_string(&response_msg)
@@ -1792,16 +1780,19 @@ impl RegistrationManager {
                     warn!("Invalid remote command format: {}", e);
                     
                     // Send error response
-                    let error_response = CommandResponse {
+                    let error_response = RemoteCommandResponse {
+                        request_id,
                         success: false,
-                        message: format!("Invalid command format: {}", e),
-                        data: None,
-                        error_code: Some("INVALID_COMMAND".to_string()),
-                        execution_time_ms: None,
+                        result: None,
+                        error: Some(crate::remote_command_handler::RemoteCommandError {
+                            code: "INVALID_COMMAND".to_string(),
+                            message: format!("Invalid command format: {}", e),
+                            details: None,
+                        }),
+                        executed_at: chrono::Utc::now().to_rfc3339(),
                     };
                     
-                    let response_msg = WebSocketMessage::CommandResponse {
-                        request_id,
+                    let response_msg = WebSocketMessage::RemoteCommandResponse {
                         response: error_response,
                     };
                     
@@ -1813,7 +1804,30 @@ impl RegistrationManager {
                 }
             }
         } else {
-            warn!("Remote command missing parameters");
+            warn!("Remote command missing command data");
+            
+            // Send error response
+            let error_response = RemoteCommandResponse {
+                request_id,
+                success: false,
+                result: None,
+                error: Some(crate::remote_command_handler::RemoteCommandError {
+                    code: "INVALID_COMMAND".to_string(),
+                    message: "Missing command data".to_string(),
+                    details: None,
+                }),
+                executed_at: chrono::Utc::now().to_rfc3339(),
+            };
+            
+            let response_msg = WebSocketMessage::RemoteCommandResponse {
+                response: error_response,
+            };
+            
+            let response_json = serde_json::to_string(&response_msg)
+                .map_err(|e| format!("Failed to serialize error response: {}", e))?;
+            
+            write.send(Message::Text(response_json)).await
+                .map_err(|e| format!("Failed to send error response: {}", e))?;
         }
         
         Ok(())
