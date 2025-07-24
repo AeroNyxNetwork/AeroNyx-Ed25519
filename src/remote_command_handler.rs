@@ -4,21 +4,20 @@
 //
 // This module handles remote commands received from the backend via WebSocket
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Remote command received from server
 #[derive(Debug, Deserialize)]
-pub struct RemoteCommand {
+pub struct RemoteCommandData {
     #[serde(rename = "type")]
     pub command_type: String,
     pub cmd: Option<String>,
@@ -37,7 +36,7 @@ pub struct RemoteCommand {
 }
 
 /// Remote command response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RemoteCommandResponse {
     pub request_id: String,
     pub success: bool,
@@ -47,7 +46,7 @@ pub struct RemoteCommandResponse {
 }
 
 /// Error structure for remote commands
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RemoteCommandError {
     pub code: String,
     pub message: String,
@@ -116,7 +115,7 @@ impl RemoteCommandHandler {
     pub async fn handle_command(
         &self,
         request_id: String,
-        command: RemoteCommand,
+        command: RemoteCommandData,
     ) -> RemoteCommandResponse {
         let start_time = SystemTime::now();
         
@@ -165,16 +164,16 @@ impl RemoteCommandHandler {
     }
 
     /// Execute system command
-    async fn handle_execute(&self, command: RemoteCommand) -> Result<serde_json::Value, RemoteCommandError> {
+    async fn handle_execute(&self, command: RemoteCommandData) -> Result<serde_json::Value, RemoteCommandError> {
         let cmd = command.cmd.ok_or_else(|| {
-            self.create_error("INVALID_COMMAND", "Missing 'cmd' field", None)
+            self.create_error("INVALID_COMMAND", "Missing 'cmd' field".to_string(), None)
         })?;
 
         // Security check: forbidden commands
         if self.is_command_forbidden(&cmd, &command.args) {
             return Err(self.create_error(
                 "PERMISSION_DENIED",
-                "This command is forbidden for security reasons",
+                "This command is forbidden for security reasons".to_string(),
                 Some(serde_json::json!({ "command": cmd })),
             ));
         }
@@ -183,7 +182,7 @@ impl RemoteCommandHandler {
         if self.config.enable_command_whitelist && !self.is_command_whitelisted(&cmd) {
             return Err(self.create_error(
                 "PERMISSION_DENIED",
-                "Command not in whitelist",
+                "Command not in whitelist".to_string(),
                 Some(serde_json::json!({ "command": cmd })),
             ));
         }
@@ -243,13 +242,13 @@ impl RemoteCommandHandler {
     }
 
     /// Handle file upload
-    async fn handle_upload(&self, command: RemoteCommand) -> Result<serde_json::Value, RemoteCommandError> {
+    async fn handle_upload(&self, command: RemoteCommandData) -> Result<serde_json::Value, RemoteCommandError> {
         let path = command.path.ok_or_else(|| {
-            self.create_error("INVALID_COMMAND", "Missing 'path' field", None)
+            self.create_error("INVALID_COMMAND", "Missing 'path' field".to_string(), None)
         })?;
 
         let content = command.content.ok_or_else(|| {
-            self.create_error("INVALID_COMMAND", "Missing 'content' field", None)
+            self.create_error("INVALID_COMMAND", "Missing 'content' field".to_string(), None)
         })?;
 
         // Validate path
@@ -274,7 +273,7 @@ impl RemoteCommandHandler {
         if full_path.exists() && !command.overwrite.unwrap_or(false) {
             return Err(self.create_error(
                 "FILE_EXISTS",
-                "File already exists and overwrite is not allowed",
+                "File already exists and overwrite is not allowed".to_string(),
                 Some(serde_json::json!({ "path": path })),
             ));
         }
@@ -309,9 +308,9 @@ impl RemoteCommandHandler {
     }
 
     /// Handle file download
-    async fn handle_download(&self, command: RemoteCommand) -> Result<serde_json::Value, RemoteCommandError> {
+    async fn handle_download(&self, command: RemoteCommandData) -> Result<serde_json::Value, RemoteCommandError> {
         let path = command.path.ok_or_else(|| {
-            self.create_error("INVALID_COMMAND", "Missing 'path' field", None)
+            self.create_error("INVALID_COMMAND", "Missing 'path' field".to_string(), None)
         })?;
 
         // Validate path
@@ -335,7 +334,7 @@ impl RemoteCommandHandler {
         if !metadata.is_file() {
             return Err(self.create_error(
                 "INVALID_PATH",
-                "Path is not a file",
+                "Path is not a file".to_string(),
                 Some(serde_json::json!({ "path": path })),
             ));
         }
@@ -380,9 +379,9 @@ impl RemoteCommandHandler {
     }
 
     /// Handle directory listing
-    async fn handle_list(&self, command: RemoteCommand) -> Result<serde_json::Value, RemoteCommandError> {
+    async fn handle_list(&self, command: RemoteCommandData) -> Result<serde_json::Value, RemoteCommandError> {
         let path = command.path.ok_or_else(|| {
-            self.create_error("INVALID_COMMAND", "Missing 'path' field", None)
+            self.create_error("INVALID_COMMAND", "Missing 'path' field".to_string(), None)
         })?;
 
         // Validate path
@@ -401,7 +400,7 @@ impl RemoteCommandHandler {
         if !full_path.is_dir() {
             return Err(self.create_error(
                 "INVALID_PATH",
-                "Path is not a directory",
+                "Path is not a directory".to_string(),
                 Some(serde_json::json!({ "path": path })),
             ));
         }
@@ -499,7 +498,7 @@ impl RemoteCommandHandler {
     }
 
     /// Handle system info request
-    async fn handle_system_info(&self, command: RemoteCommand) -> Result<serde_json::Value, RemoteCommandError> {
+    async fn handle_system_info(&self, command: RemoteCommandData) -> Result<serde_json::Value, RemoteCommandError> {
         let categories = command.categories.unwrap_or_else(|| {
             vec!["cpu".to_string(), "memory".to_string(), "disk".to_string()]
         });
@@ -617,13 +616,20 @@ impl RemoteCommandHandler {
     /// Get process information
     async fn get_process_info(&self) -> Result<serde_json::Value, RemoteCommandError> {
         let pid = std::process::id();
-        let uptime_seconds = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
+        
+        // Get simple uptime (would need to store start time for accurate calculation)
+        let uptime_seconds = 0u64; // Placeholder
+        
         // Get memory usage
-        let mem_info = sys_info::mem_info().unwrap_or_default();
+        let mem_info = sys_info::mem_info().unwrap_or(sys_info::MemInfo {
+            total: 0,
+            free: 0,
+            avail: 0,
+            buffers: 0,
+            cached: 0,
+            swap_total: 0,
+            swap_free: 0,
+        });
         let memory_mb = (mem_info.total - mem_info.avail) / 1024; // Convert KB to MB
 
         Ok(serde_json::json!({
@@ -656,7 +662,7 @@ impl RemoteCommandHandler {
         if !is_allowed {
             return Err(self.create_error(
                 "PERMISSION_DENIED",
-                "Path is outside allowed directories",
+                "Path is outside allowed directories".to_string(),
                 Some(serde_json::json!({ "path": path_str })),
             ));
         }
