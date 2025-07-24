@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::future::Future;
 
 /// Remote command received from server
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize,Serialize)]
 pub struct RemoteCommandData {
     #[serde(rename = "type")]
     pub command_type: String,
