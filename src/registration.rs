@@ -252,7 +252,6 @@ use reqwest::{Client, header    }
             ServerMessage::Error { error_code, message } => {
                 error!("Server error [{}]: {}", error_code, message);
             }
-            
             ServerMessage::Unknown => {
                 debug!("Received unknown message type");
             }
@@ -971,7 +970,7 @@ use reqwest::{Client, header    }
         
         Err("Hardware change approval not yet implemented".to_string())
     }
-} // End of impl RegistrationManager
+}
 
 #[cfg(test)]
 mod tests {
