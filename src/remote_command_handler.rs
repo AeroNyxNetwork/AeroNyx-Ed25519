@@ -58,20 +58,38 @@ pub struct RemoteCommandError {
 /// Remote command handler configuration
 #[derive(Debug, Clone)]
 pub struct RemoteCommandConfig {
+    /// Security mode
+    pub security_mode: SecurityMode,
+    /// Maximum file size for uploads/downloads
     pub max_file_size: u64,
+    /// Default command execution timeout
     pub command_timeout: Duration,
+    /// Allowed paths for file operations (only used in Restricted mode)
     pub allowed_paths: Vec<PathBuf>,
+    /// Forbidden commands (always enforced)
     pub forbidden_commands: Vec<String>,
+    /// Enable command whitelist (only used in Restricted mode)
     pub enable_command_whitelist: bool,
+    /// Whitelisted commands (only used in Restricted mode)
     pub command_whitelist: Vec<String>,
+    /// Default working directory
     pub working_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SecurityMode {
+    /// Full access mode - no restrictions (use with caution)
+    FullAccess,
+    /// Restricted mode - path and command restrictions apply
+    Restricted,
 }
 
 impl Default for RemoteCommandConfig {
     fn default() -> Self {
         Self {
+            security_mode: SecurityMode::Restricted, // Default to restricted for safety
             max_file_size: 50 * 1024 * 1024, // 50MB
-            command_timeout: Duration::from_secs(30),
+            command_timeout: Duration::from_secs(60),
             allowed_paths: vec![
                 PathBuf::from("/home"),
                 PathBuf::from("/var/log/aeronyx"),
@@ -103,74 +121,111 @@ impl Default for RemoteCommandConfig {
     }
 }
 
+
+impl RemoteCommandConfig {
+    /// Create a full access configuration (use with caution!)
+    pub fn full_access() -> Self {
+        Self {
+            security_mode: SecurityMode::FullAccess,
+            max_file_size: 100 * 1024 * 1024, // 100MB
+            command_timeout: Duration::from_secs(300), // 5 minutes
+            allowed_paths: vec![], // Not used in full access mode
+            forbidden_commands: vec![
+                // Still forbid the most dangerous commands even in full access
+                "rm -rf /".to_string(),
+                "rm -rf /*".to_string(),
+                ":(){:|:&};:".to_string(), // Fork bomb
+            ],
+            enable_command_whitelist: false,
+            command_whitelist: vec![], // Not used in full access mode
+            working_dir: PathBuf::from("/"),
+        }
+    }
+    
+    /// Create a restricted configuration with custom paths
+    pub fn restricted_with_paths(allowed_paths: Vec<PathBuf>) -> Self {
+        let mut config = Self::default();
+        config.allowed_paths = allowed_paths;
+        config
+    }
+}
+
 /// Remote command handler
 pub struct RemoteCommandHandler {
     config: RemoteCommandConfig,
 }
 
 impl RemoteCommandHandler {
-    pub fn new(config: RemoteCommandConfig) -> Self {
-        Self { config }
-    }
-
-    /// Handle incoming remote command
-    pub async fn handle_command(
-        &self,
-        request_id: String,
-        command: RemoteCommandData,
-    ) -> RemoteCommandResponse {
-        let start_time = SystemTime::now();
+    /// Validate and normalize path
+    fn validate_path(&self, path_str: &str) -> Result<PathBuf, RemoteCommandError> {
+        let path = Path::new(path_str);
         
-        info!(
-            "Handling remote command: type={}, request_id={}",
-            command.command_type, request_id
-        );
-
-        let result = match command.command_type.as_str() {
-            "execute" => self.handle_execute(command).await,
-            "upload" => self.handle_upload(command).await,
-            "download" => self.handle_download(command).await,
-            "list" => self.handle_list(command).await,
-            "system_info" => self.handle_system_info(command).await,
-            _ => Err(self.create_error(
-                "INVALID_COMMAND",
-                format!("Unknown command type: {}", command.command_type),
-                None,
-            )),
+        // Convert to absolute path
+        let absolute_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.config.working_dir.join(path)
         };
 
-        let executed_at = chrono::Utc::now().to_rfc3339();
+        // Canonicalize to resolve symlinks and normalize
+        let canonical = absolute_path.canonicalize().unwrap_or(absolute_path);
 
-        match result {
-            Ok(result) => {
-                info!("Remote command completed successfully: {}", request_id);
-                RemoteCommandResponse {
-                    request_id,
-                    success: true,
-                    result: Some(result),
-                    error: None,
-                    executed_at,
+        // In FullAccess mode, allow any path except critical system paths
+        if self.config.security_mode == SecurityMode::FullAccess {
+            // Still protect critical system paths
+            let critical_paths = [
+                "/proc",
+                "/sys", 
+                "/dev",
+                "/boot/grub",
+            ];
+            
+            for critical in &critical_paths {
+                if canonical.starts_with(critical) {
+                    return Err(self.create_error(
+                        "PERMISSION_DENIED",
+                        format!("Access to {} is forbidden for safety", critical),
+                        Some(serde_json::json!({ "path": path_str })),
+                    ));
                 }
             }
-            Err(error) => {
-                error!("Remote command failed: {}, error: {:?}", request_id, error);
-                RemoteCommandResponse {
-                    request_id,
-                    success: false,
-                    result: None,
-                    error: Some(error),
-                    executed_at,
-                }
-            }
+            
+            return Ok(canonical);
         }
+
+        // In Restricted mode, check against allowed paths
+        let is_allowed = self.config.allowed_paths.iter().any(|allowed| {
+            canonical.starts_with(allowed)
+        });
+
+        if !is_allowed {
+            return Err(self.create_error(
+                "PERMISSION_DENIED",
+                "Path is outside allowed directories".to_string(),
+                Some(serde_json::json!({ "path": path_str })),
+            ));
+        }
+
+        Ok(canonical)
     }
+    
+    /// Check if command is whitelisted (only enforced in Restricted mode)
+    fn is_command_whitelisted(&self, cmd: &str) -> bool {
+        // In FullAccess mode, all commands are allowed (except forbidden ones)
+        if self.config.security_mode == SecurityMode::FullAccess {
+            return true;
+        }
+        
+        self.config.command_whitelist.contains(&cmd.to_string())
+    }
+}
 
     /// Execute system command
     async fn handle_execute(&self, command: RemoteCommandData) -> Result<serde_json::Value, RemoteCommandError> {
         let cmd = command.cmd.ok_or_else(|| {
             self.create_error("INVALID_COMMAND", "Missing 'cmd' field".to_string(), None)
         })?;
-
+    
         // Security check: forbidden commands
         if self.is_command_forbidden(&cmd, &command.args) {
             return Err(self.create_error(
@@ -179,7 +234,7 @@ impl RemoteCommandHandler {
                 Some(serde_json::json!({ "command": cmd })),
             ));
         }
-
+    
         // Security check: whitelist
         if self.config.enable_command_whitelist && !self.is_command_whitelisted(&cmd) {
             return Err(self.create_error(
@@ -188,14 +243,14 @@ impl RemoteCommandHandler {
                 Some(serde_json::json!({ "command": cmd })),
             ));
         }
-
+    
         // Prepare command
         let mut process = Command::new(&cmd);
         
         if let Some(args) = command.args {
             process.args(&args);
         }
-
+    
         // Set working directory
         let cwd = if let Some(cwd_str) = command.cwd {
             self.validate_path(&cwd_str)?
@@ -203,31 +258,57 @@ impl RemoteCommandHandler {
             self.config.working_dir.clone()
         };
         process.current_dir(&cwd);
-
+    
         // Set environment variables
         if let Some(env) = command.env {
             for (key, value) in env {
                 process.env(key, value);
             }
         }
-
+    
         // Set up process
         process.stdout(Stdio::piped());
         process.stderr(Stdio::piped());
-
+    
         // Execute with timeout
         let timeout_duration = Duration::from_secs(command.timeout.unwrap_or(30));
         let start = std::time::Instant::now();
-
+    
         match timeout(timeout_duration, process.output()).await {
             Ok(Ok(output)) => {
                 let execution_time_ms = start.elapsed().as_millis() as u64;
                 
+                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let mut truncated = false;
+                
+                // Check output size and truncate if necessary
+                const MAX_OUTPUT_SIZE: usize = 1024 * 1024; // 1MB limit per output
+                
+                if stdout.len() > MAX_OUTPUT_SIZE {
+                    stdout.truncate(MAX_OUTPUT_SIZE);
+                    stdout.push_str("\n\n[OUTPUT TRUNCATED - Exceeded 1MB limit]");
+                    truncated = true;
+                }
+                
+                if stderr.len() > MAX_OUTPUT_SIZE {
+                    stderr.truncate(MAX_OUTPUT_SIZE);
+                    stderr.push_str("\n\n[ERROR OUTPUT TRUNCATED - Exceeded 1MB limit]");
+                    truncated = true;
+                }
+                
+                // For very large outputs, provide summary information
+                let total_output_size = output.stdout.len() + output.stderr.len();
+                
                 Ok(serde_json::json!({
-                    "stdout": String::from_utf8_lossy(&output.stdout),
-                    "stderr": String::from_utf8_lossy(&output.stderr),
+                    "stdout": stdout,
+                    "stderr": stderr,
                     "exit_code": output.status.code().unwrap_or(-1),
                     "execution_time_ms": execution_time_ms,
+                    "truncated": truncated,
+                    "original_stdout_size": output.stdout.len(),
+                    "original_stderr_size": output.stderr.len(),
+                    "total_output_size": total_output_size,
                 }))
             }
             Ok(Err(e)) => Err(self.create_error(
