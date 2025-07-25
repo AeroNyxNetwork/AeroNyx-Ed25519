@@ -261,101 +261,72 @@ pub struct RegistrationManager {
     remote_management_enabled: Arc<RwLock<bool>>,
 }
 
-impl RegistrationManager {
-    /// Create a new registration manager instance
-    pub fn new(api_url: &str) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .tcp_keepalive(Some(Duration::from_secs(60)))
-            .user_agent("AeroNyx-Node/1.0.0")
-            .pool_max_idle_per_host(5)
-            .pool_idle_timeout(Some(Duration::from_secs(90)))
-            .build()
-            .unwrap_or_else(|e| {
-                warn!("Failed to build custom HTTP client: {}, using default", e);
-                Client::new()
-            });
+    impl RegistrationManager {
+        /// Create a new registration manager instance
+        pub fn new(api_url: &str) -> Self {
+            let client = Client::builder()
+                .timeout(Duration::from_secs(30))
+                .tcp_keepalive(Some(Duration::from_secs(60)))
+                .user_agent("AeroNyx-Node/1.0.0")
+                .pool_max_idle_per_host(5)
+                .pool_idle_timeout(Some(Duration::from_secs(90)))
+                .build()
+                .unwrap_or_else(|e| {
+                    warn!("Failed to build custom HTTP client: {}, using default", e);
+                    Client::new()
+                });
+            
+            // Use restricted mode by default for security
+            let remote_config = RemoteCommandConfig::default();
+            let remote_command_handler = Arc::new(RemoteCommandHandler::new(remote_config));
+    
+            Self {
+                client,
+                api_url: api_url.to_string(),
+                reference_code: None,
+                registration_code: None,
+                wallet_address: None,
+                hardware_fingerprint: None,
+                hardware_components: None,
+                websocket_connected: Arc::new(RwLock::new(false)),
+                start_time: std::time::Instant::now(),
+                data_dir: PathBuf::from("data"),
+                remote_handler: Arc::new(RemoteManagementHandler::new()),
+                tolerance_config: HardwareToleranceConfig::default(),
+                zkp_params: None,
+                hardware_info: None,
+                remote_command_handler,
+                remote_management_enabled: Arc::new(RwLock::new(false)),
+            }
+        }
         
-        // Configure remote command handler with more permissive defaults
-        let mut remote_config = RemoteCommandConfig::default();
-        remote_config.allowed_paths = vec![
-            PathBuf::from("/"),
-            PathBuf::from("/home"),
-            PathBuf::from("/var"),
-            PathBuf::from("/var/log"),
-            PathBuf::from("/tmp"),
-            PathBuf::from("/etc"),
-            PathBuf::from("/usr"),
-            PathBuf::from("/opt"),
-            PathBuf::from("/root"),  // Allow root home for admin access
-        ];
-        
-        // Expand command whitelist
-        remote_config.command_whitelist = vec![
-            "ls".to_string(),
-            "cat".to_string(),
-            "grep".to_string(),
-            "tail".to_string(),
-            "head".to_string(),
-            "ps".to_string(),
-            "df".to_string(),
-            "du".to_string(),
-            "free".to_string(),
-            "uptime".to_string(),
-            "whoami".to_string(),
-            "pwd".to_string(),
-            "echo".to_string(),
-            "date".to_string(),
-            "hostname".to_string(),
-            "uname".to_string(),
-            "which".to_string(),
-            "wc".to_string(),
-            "sort".to_string(),
-            "uniq".to_string(),
-            "find".to_string(),
-            "stat".to_string(),
-            "file".to_string(),
-            "id".to_string(),
-            "env".to_string(),
-            "top".to_string(),
-            "htop".to_string(),
-            "netstat".to_string(),
-            "ss".to_string(),
-            "ip".to_string(),
-            "ifconfig".to_string(),
-            "journalctl".to_string(),
-            "systemctl".to_string(),
-            "service".to_string(),
-        ];
-        
-        // Disable whitelist by default for more flexibility
-        remote_config.enable_command_whitelist = false;
-        
-        // Increase command timeout for slower operations
-        remote_config.command_timeout = Duration::from_secs(60);
-        
-        let remote_command_handler = Arc::new(RemoteCommandHandler::new(remote_config));
-
-        Self {
-            client,
-            api_url: api_url.to_string(),
-            reference_code: None,
-            registration_code: None,
-            wallet_address: None,
-            hardware_fingerprint: None,
-            hardware_components: None,
-            websocket_connected: Arc::new(RwLock::new(false)),
-            start_time: std::time::Instant::now(),
-            data_dir: PathBuf::from("data"),
-            remote_handler: Arc::new(RemoteManagementHandler::new()),
-            tolerance_config: HardwareToleranceConfig::default(),
-            zkp_params: None,
-            hardware_info: None,
-            remote_command_handler,
-            remote_management_enabled: Arc::new(RwLock::new(false)),
+        /// Set security mode for remote commands
+        pub fn set_remote_security_mode(&mut self, mode: crate::remote_command_handler::SecurityMode) {
+            let config = match mode {
+                crate::remote_command_handler::SecurityMode::FullAccess => {
+                    warn!("Setting remote command handler to FULL ACCESS mode - use with caution!");
+                    RemoteCommandConfig::full_access()
+                }
+                crate::remote_command_handler::SecurityMode::Restricted => {
+                    info!("Setting remote command handler to RESTRICTED mode");
+                    // Create restricted config with common paths
+                    RemoteCommandConfig::restricted_with_paths(vec![
+                        PathBuf::from("/"),
+                        PathBuf::from("/home"),
+                        PathBuf::from("/var"),
+                        PathBuf::from("/var/log"),
+                        PathBuf::from("/tmp"),
+                        PathBuf::from("/etc"),
+                        PathBuf::from("/usr"),
+                        PathBuf::from("/opt"),
+                        self.data_dir.clone(),
+                    ])
+                }
+            };
+            
+            self.remote_command_handler = Arc::new(RemoteCommandHandler::new(config));
         }
     }
-
     /// Initialize ZKP parameters (call this during startup)
     pub async fn initialize_zkp(&self) -> Result<SetupParams, String> {
         info!("Initializing Halo2 zero-knowledge proof parameters");
