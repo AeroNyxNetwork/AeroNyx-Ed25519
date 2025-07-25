@@ -156,6 +156,50 @@ pub struct RemoteCommandHandler {
 }
 
 impl RemoteCommandHandler {
+    /// Create a new remote command handler
+    pub fn new(config: RemoteCommandConfig) -> Self {
+        Self { config }
+    }
+
+    /// Handle incoming command
+    pub async fn handle_command(
+        &self,
+        request_id: String,
+        command: RemoteCommandData,
+    ) -> RemoteCommandResponse {
+        let start_time = std::time::Instant::now();
+        
+        let result = match command.command_type.as_str() {
+            "execute" => self.handle_execute(command).await,
+            "upload" => self.handle_upload(command).await,
+            "download" => self.handle_download(command).await,
+            "list" => self.handle_list(command).await,
+            "system_info" => self.handle_system_info(command).await,
+            _ => Err(self.create_error(
+                "UNKNOWN_COMMAND",
+                format!("Unknown command type: {}", command.command_type),
+                None,
+            )),
+        };
+        
+        match result {
+            Ok(data) => RemoteCommandResponse {
+                request_id,
+                success: true,
+                result: Some(data),
+                error: None,
+                executed_at: chrono::Utc::now().to_rfc3339(),
+            },
+            Err(error) => RemoteCommandResponse {
+                request_id,
+                success: false,
+                result: None,
+                error: Some(error),
+                executed_at: chrono::Utc::now().to_rfc3339(),
+            },
+        }
+    }
+
     /// Validate and normalize path
     fn validate_path(&self, path_str: &str) -> Result<PathBuf, RemoteCommandError> {
         let path = Path::new(path_str);
@@ -218,7 +262,6 @@ impl RemoteCommandHandler {
         
         self.config.command_whitelist.contains(&cmd.to_string())
     }
-}
 
     /// Execute system command
     async fn handle_execute(&self, command: RemoteCommandData) -> Result<serde_json::Value, RemoteCommandError> {
@@ -725,36 +768,6 @@ impl RemoteCommandHandler {
         }))
     }
 
-    /// Validate and normalize path
-    fn validate_path(&self, path_str: &str) -> Result<PathBuf, RemoteCommandError> {
-        let path = Path::new(path_str);
-        
-        // Convert to absolute path
-        let absolute_path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.config.working_dir.join(path)
-        };
-
-        // Canonicalize to resolve symlinks and normalize
-        let canonical = absolute_path.canonicalize().unwrap_or(absolute_path);
-
-        // Check if path is within allowed directories
-        let is_allowed = self.config.allowed_paths.iter().any(|allowed| {
-            canonical.starts_with(allowed)
-        });
-
-        if !is_allowed {
-            return Err(self.create_error(
-                "PERMISSION_DENIED",
-                "Path is outside allowed directories".to_string(),
-                Some(serde_json::json!({ "path": path_str })),
-            ));
-        }
-
-        Ok(canonical)
-    }
-
     /// Check if command is forbidden
     fn is_command_forbidden(&self, cmd: &str, args: &Option<Vec<String>>) -> bool {
         let full_command = if let Some(args) = args {
@@ -766,11 +779,6 @@ impl RemoteCommandHandler {
         self.config.forbidden_commands.iter().any(|forbidden| {
             full_command.contains(forbidden)
         })
-    }
-
-    /// Check if command is whitelisted
-    fn is_command_whitelisted(&self, cmd: &str) -> bool {
-        self.config.command_whitelist.contains(&cmd.to_string())
     }
 
     /// Create error response
@@ -786,6 +794,7 @@ impl RemoteCommandHandler {
             details,
         }
     }
+}
 
 /// Log remote command execution
 pub fn log_remote_command(
