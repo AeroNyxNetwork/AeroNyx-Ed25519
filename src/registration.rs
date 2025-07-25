@@ -11,7 +11,1155 @@
 // implements hardware fingerprint verification with tolerance for minor changes
 // in cloud environments.
 
-use reqwest::{Client, header};
+use reqwest::{Client, header    }
+    
+    /// Handle ZKP challenge
+    async fn handle_zkp_challenge(
+        &self,
+        challenge_id: &str,
+        hardware_info: &HardwareInfo,
+        setup_params: &SetupParams,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            Message
+        >,
+    ) -> Result<(), String> {
+        use crate::zkp_halo2;
+        
+        info!("Generating ZKP proof for challenge ID: {}", challenge_id);
+        
+        // Generate commitment
+        let commitment = hardware_info.generate_zkp_commitment();
+        
+        // Generate proof
+        let proof = zkp_halo2::generate_hardware_proof(hardware_info, &commitment, setup_params)
+            .await
+            .map_err(|e| format!("Failed to generate proof: {}", e))?;
+        
+        // Send response in the expected format
+        let response = serde_json::json!({
+            "type": "challenge_response",
+            "challenge_id": challenge_id,
+            "proof": {
+                "data": hex::encode(&proof.data),
+                "public_inputs": hex::encode(&proof.public_inputs),
+                "timestamp": proof.timestamp,
+            }
+        });
+        
+        write.send(Message::Text(response.to_string())).await
+            .map_err(|e| format!("Failed to send challenge response: {}", e))?;
+        
+        info!("Successfully sent ZKP proof for challenge {}", challenge_id);
+        Ok(())
+    }
+
+    /// Handle server messages with ZKP support
+   async fn handle_server_message(
+        &self,
+        message: ServerMessage,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            Message
+        >,
+        authenticated: &mut bool,
+        hardware_info: &HardwareInfo,
+        setup_params: &SetupParams,
+    ) -> Result<(), String> {
+        use crate::zkp_halo2;
+        
+        match message {
+            ServerMessage::ConnectionEstablished | ServerMessage::Connected { .. } => {
+                info!("Connection established, sending authentication");
+                
+                let auth_code = self.reference_code.clone()
+                    .or_else(|| self.registration_code.clone())
+                    .ok_or("No authentication code available")?;
+                
+                let auth_msg = ClientMessage::Auth {
+                    code: auth_code,
+                };
+                
+                let auth_json = serde_json::to_string(&auth_msg)
+                    .map_err(|e| format!("Failed to serialize auth: {}", e))?;
+                write.send(Message::Text(auth_json)).await
+                    .map_err(|e| format!("Failed to send auth: {}", e))?;
+            }
+            
+            ServerMessage::AuthSuccess { heartbeat_interval, node_info: _ } => {
+                info!("Authentication successful");
+                *authenticated = true;
+                
+                if let Some(interval) = heartbeat_interval {
+                    info!("Heartbeat interval: {} seconds", interval);
+                }
+            }
+            
+            ServerMessage::AuthResponse { success, message, node_info: _ } => {
+                if success {
+                    info!("Authentication successful");
+                    *authenticated = true;
+                } else {
+                    let err_msg = message.unwrap_or_else(|| "Authentication failed".to_string());
+                    error!("Authentication failed: {}", err_msg);
+                    return Err(format!("Authentication failed: {}", err_msg));
+                }
+            }
+            
+            ServerMessage::RemoteCommand { request_id, command, from_session } => {
+                info!("=== REMOTE COMMAND RECEIVED (ServerMessage) ===");
+                info!("Request ID: {}", request_id);
+                info!("From session: {}", from_session);
+                info!("Command: {:?}", command);
+                
+                if *self.remote_management_enabled.read().await {
+                    match serde_json::from_value::<RemoteCommandData>(command.clone()) {
+                        Ok(command_data) => {
+                            info!("Processing remote command: type={}", command_data.command_type);
+                            
+                            // Log the command execution
+                            log_remote_command(
+                                &from_session,
+                                &command_data.command_type,
+                                true,
+                                &format!("request_id={}", request_id)
+                            );
+                            
+                            // Execute command
+                            let handler = self.remote_command_handler.clone();
+                            let response = handler.handle_command(
+                                request_id.clone(), 
+                                command_data
+                            ).await;
+                            
+                            // Build response message
+                            let response_msg = if response.success {
+                                serde_json::json!({
+                                    "type": "remote_command_response",
+                                    "request_id": request_id,
+                                    "success": true,
+                                    "result": response.result,
+                                    "executed_at": response.executed_at
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "type": "remote_command_response",
+                                    "request_id": request_id,
+                                    "success": false,
+                                    "error": response.error,
+                                    "executed_at": response.executed_at
+                                })
+                            };
+                            
+                            // Send response
+                            info!("Sending remote command response for request_id: {}", request_id);
+                            let response_json = response_msg.to_string();
+                            
+                            write.send(Message::Text(response_json)).await
+                                .map_err(|e| format!("Failed to send response: {}", e))?;
+                            
+                            info!("Response sent successfully");
+                        }
+                        Err(e) => {
+                            error!("Failed to parse remote command: {}", e);
+                            
+                            // Send error response
+                            let error_response = serde_json::json!({
+                                "type": "remote_command_response",
+                                "request_id": request_id,
+                                "success": false,
+                                "error": {
+                                    "code": "INVALID_COMMAND",
+                                    "message": format!("Failed to parse command: {}", e)
+                                }
+                            });
+                            
+                            write.send(Message::Text(error_response.to_string())).await
+                                .map_err(|e| format!("Failed to send error response: {}", e))?;
+                        }
+                    }
+                } else {
+                    warn!("Remote management is disabled");
+                    
+                    let error_response = serde_json::json!({
+                        "type": "remote_command_response",
+                        "request_id": request_id,
+                        "success": false,
+                        "error": {
+                            "code": "REMOTE_MANAGEMENT_DISABLED",
+                            "message": "Remote management is disabled on this node"
+                        }
+                    });
+                    
+                    write.send(Message::Text(error_response.to_string())).await
+                        .map_err(|e| format!("Failed to send error response: {}", e))?;
+                }
+            }
+            
+            ServerMessage::RemoteAuth { jwt_token } => {
+                info!("Received remote_auth message");
+                info!("Remote auth JWT token received, length: {}", jwt_token.len());
+                
+                // Enable remote management for this session
+                *self.remote_management_enabled.write().await = true;
+                
+                // Send success response
+                let success_response = serde_json::json!({
+                    "type": "remote_auth_success",
+                    "message": "Remote authentication successful"
+                });
+                
+                write.send(Message::Text(success_response.to_string())).await
+                    .map_err(|e| format!("Failed to send remote auth response: {}", e))?;
+                
+                info!("Remote auth success response sent, remote management enabled");
+            }
+            
+            ServerMessage::ChallengeRequest { challenge_id, nonce: _ } => {
+                info!("✅ Received ZKP challenge request with ID: {}", challenge_id);
+                
+                let commitment = hardware_info.generate_zkp_commitment();
+                
+                match zkp_halo2::generate_hardware_proof(hardware_info, &commitment, setup_params).await {
+                    Ok(proof) => {
+                        let response = ClientMessage::ChallengeResponse {
+                            challenge_id: challenge_id.clone(),
+                            proof: ProofData::from(&proof),
+                        };
+                        
+                        let response_json = serde_json::to_string(&response)
+                            .map_err(|e| format!("Failed to serialize response: {}", e))?;
+                        write.send(Message::Text(response_json)).await
+                            .map_err(|e| format!("Failed to send challenge response: {}", e))?;
+                        
+                        info!("🚀 Successfully sent proof for challenge {}", challenge_id);
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to generate proof: {}", e);
+                    }
+                }
+            }
+            
+            ServerMessage::ChallengeResponseAck { challenge_id, status, message: _ } => {
+                info!("Server acknowledged proof for challenge {}: {}", challenge_id, status);
+            }
+            
+            ServerMessage::HeartbeatAck { received_at: _, next_interval: _ } => {
+                debug!("Heartbeat acknowledged");
+                // Don't update timestamp here - it needs to be updated in the caller
+            }
+            
+            ServerMessage::Error { error_code, message } => {
+                error!("Server error [{}]: {}", error_code, message);
+            }
+            
+            ServerMessage::Unknown => {
+                debug!("Received unknown message type");
+            }
+        }
+        
+        Ok(())
+    }
+
+    
+    /// Handle incoming WebSocket messages (legacy version)
+    async fn handle_websocket_message(
+        &self,
+        text: &str,
+        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+        authenticated: &mut bool,
+        heartbeat_interval: &mut time::Interval,
+        last_heartbeat_ack: &mut std::time::Instant,
+    ) -> Result<(), String> {
+        debug!("Received WebSocket message: {}", text);
+        
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+            match json.get("type").and_then(|t| t.as_str()) {
+                Some("connection_established") => {
+                    info!("WebSocket connection established, sending authentication");
+                    
+                    let auth_msg = WebSocketMessage::Auth {
+                        reference_code: self.reference_code.clone().unwrap(),
+                        registration_code: self.registration_code.clone(),
+                    };
+                    
+                    let auth_json = serde_json::to_string(&auth_msg)
+                        .map_err(|e| format!("Failed to serialize auth: {}", e))?;
+                    
+                    write.send(Message::Text(auth_json)).await
+                        .map_err(|e| format!("Failed to send auth: {}", e))?;
+                }
+                
+                Some("auth_success") => {
+                    info!("WebSocket authentication successful");
+                    *authenticated = true;
+                    *last_heartbeat_ack = std::time::Instant::now();
+                    
+                    // Get heartbeat interval from server
+                    if let Some(interval_secs) = json.get("heartbeat_interval").and_then(|v| v.as_u64()) {
+                        *heartbeat_interval = time::interval(Duration::from_secs(interval_secs));
+                        info!("Heartbeat interval set to {} seconds", interval_secs);
+                    }
+                    
+                    // Check for additional auth info
+                    if let Some(node_info) = json.get("node_info") {
+                        if let Some(status) = node_info.get("status").and_then(|s| s.as_str()) {
+                            info!("Node status: {}", status);
+                        }
+                    }
+                }
+                
+                Some("heartbeat_ack") => {
+                    debug!("Heartbeat acknowledged by server");
+                    *last_heartbeat_ack = std::time::Instant::now();
+                    
+                    // Update next heartbeat interval if provided
+                    if let Some(next_interval) = json.get("next_interval").and_then(|v| v.as_u64()) {
+                        *heartbeat_interval = time::interval(Duration::from_secs(next_interval));
+                    }
+                }
+                
+                Some("hardware_attestation_request") => {
+                    // Handle ZKP attestation request
+                    if self.zkp_params.is_some() {
+                        info!("Received hardware attestation request");
+                        
+                        let challenge = json.get("challenge")
+                            .and_then(|c| c.as_array())
+                            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect::<Vec<u8>>())
+                            .unwrap_or_default();
+                        
+                        let nonce = json.get("nonce")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        
+                        match self.handle_attestation_request(challenge, nonce).await {
+                            Ok(response_msg) => {
+                                let response_json = serde_json::to_string(&response_msg)
+                                    .map_err(|e| format!("Failed to serialize attestation response: {}", e))?;
+                                
+                                write.send(Message::Text(response_json)).await
+                                    .map_err(|e| format!("Failed to send attestation proof: {}", e))?;
+                                
+                                info!("Hardware attestation proof sent successfully");
+                            }
+                            Err(e) => {
+                                error!("Failed to generate attestation proof: {}", e);
+                            }
+                        }
+                    } else {
+                        warn!("Received hardware attestation request but ZKP is not enabled");
+                    }
+                }
+                
+                Some("error") => {
+                    let error_code = json.get("error_code").and_then(|c| c.as_str()).unwrap_or("unknown");
+                    let message = json.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+                    error!("Server error [{}]: {}", error_code, message);
+                    
+                    // Handle specific errors
+                    match error_code {
+                        "hardware_fingerprint_conflict" => {
+                            error!("This hardware is already registered with another node");
+                            error!("Each physical device can only run one AeroNyx node");
+                            return Err("Hardware already registered".to_string());
+                        }
+                        "auth_failed" => {
+                            error!("Authentication failed - invalid reference code");
+                            return Err("Authentication failed".to_string());
+                        }
+                        "node_suspended" => {
+                            error!("This node has been suspended");
+                            error!("Please contact support for more information");
+                            return Err("Node suspended".to_string());
+                        }
+                        "node_not_found" => {
+                            error!("Node not found - registration may have been deleted");
+                            return Err("Node not found".to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                
+                Some("command") => {
+                    // Handle remote commands if enabled
+                    if *self.remote_management_enabled.read().await {
+                        self.handle_remote_command(&json, write).await?;
+                    } else {
+                        warn!("Received remote command but remote management is disabled");
+                        
+                        // Send error response
+                        if let Some(request_id) = json.get("request_id").and_then(|id| id.as_str()) {
+                            let error_response = CommandResponse {
+                                success: false,
+                                message: "Remote management is disabled".to_string(),
+                                data: None,
+                                error_code: Some("REMOTE_MANAGEMENT_DISABLED".to_string()),
+                                execution_time_ms: None,
+                            };
+                            
+                            let response_msg = WebSocketMessage::CommandResponse {
+                                request_id: request_id.to_string(),
+                                response: error_response,
+                            };
+                            
+                            let response_json = serde_json::to_string(&response_msg)
+                                .map_err(|e| format!("Failed to serialize error response: {}", e))?;
+                            
+                            write.send(Message::Text(response_json)).await
+                                .map_err(|e| format!("Failed to send error response: {}", e))?;
+                        }
+                    }
+                }
+                
+                Some("ping") => {
+                    // Respond to server ping
+                    if let Some(timestamp) = json.get("timestamp").and_then(|t| t.as_u64()) {
+                        let pong = WebSocketMessage::Ping { timestamp };
+                        let pong_json = serde_json::to_string(&pong)
+                            .map_err(|e| format!("Failed to serialize pong: {}", e))?;
+                        
+                        write.send(Message::Text(pong_json)).await
+                            .map_err(|e| format!("Failed to send pong: {}", e))?;
+                    }
+                }
+                
+                Some("config_update") => {
+                    // Handle configuration updates from server
+                    info!("Received configuration update from server");
+                    if let Some(config) = json.get("config") {
+                        debug!("New configuration: {:?}", config);
+                        // TODO: Apply configuration updates
+                    }
+                }
+                
+                Some("remote_command") => {
+                    info!("=== REMOTE COMMAND RECEIVED ===");
+                    info!("Raw message: {}", text);
+                    
+                    if *self.remote_management_enabled.read().await {
+                        if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(text) {
+                            // Extract fields
+                            let request_id = json_value.get("request_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            let from_session = json_value.get("from_session")
+                                .and_then(|v| v.as_str());
+                            
+                            info!("Request ID: {}", request_id);
+                            info!("From session: {:?}", from_session);
+                            
+                            // NOTE: Backend doesn't send node_reference, so we don't check it
+                            // The node is already authenticated, so we trust the command
+                            
+                            if let Some(command_json) = json_value.get("command") {
+                                info!("Command JSON: {:?}", command_json);
+                                
+                                match serde_json::from_value::<RemoteCommandData>(command_json.clone()) {
+                                    Ok(command_data) => {
+                                        info!("Processing remote command: type={}", command_data.command_type);
+                                        
+                                        // Log the command execution
+                                        if let Some(session_id) = from_session {
+                                            log_remote_command(
+                                                session_id,
+                                                &command_data.command_type,
+                                                true,
+                                                &format!("request_id={}", request_id)
+                                            );
+                                        }
+                                        
+                                        // Execute command
+                                        let handler = self.remote_command_handler.clone();
+                                        let response = handler.handle_command(
+                                            request_id.to_string(), 
+                                            command_data
+                                        ).await;
+                                        
+                                        // Build response message
+                                        let response_msg = if response.success {
+                                            serde_json::json!({
+                                                "type": "remote_command_response",
+                                                "request_id": request_id,
+                                                "success": true,
+                                                "result": response.result,
+                                                "executed_at": response.executed_at
+                                            })
+                                        } else {
+                                            serde_json::json!({
+                                                "type": "remote_command_response",
+                                                "request_id": request_id,
+                                                "success": false,
+                                                "error": response.error,
+                                                "executed_at": response.executed_at
+                                            })
+                                        };
+                                        
+                                        // Send response
+                                        info!("Sending remote command response for request_id: {}", request_id);
+                                        let response_json = response_msg.to_string();
+                                        
+                                        match write.send(Message::Text(response_json)).await {
+                                            Ok(_) => info!("Response sent successfully"),
+                                            Err(e) => error!("Failed to send response: {}", e),
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to parse remote command: {}", e);
+                                        error!("Command JSON was: {:?}", command_json);
+                                        
+                                        // Log failed command
+                                        if let Some(session_id) = from_session {
+                                            log_remote_command(
+                                                session_id,
+                                                "unknown",
+                                                false,
+                                                &format!("parse_error={}", e)
+                                            );
+                                        }
+                                        
+                                        // Send error response
+                                        let error_response = serde_json::json!({
+                                            "type": "remote_command_response",
+                                            "request_id": request_id,
+                                            "success": false,
+                                            "error": {
+                                                "code": "INVALID_COMMAND",
+                                                "message": format!("Failed to parse command: {}", e)
+                                            }
+                                        });
+                                        
+                                        let _ = write.send(Message::Text(error_response.to_string())).await;
+                                    }
+                                }
+                            } else {
+                                error!("No 'command' field in message");
+                                
+                                // Send error response
+                                let error_response = serde_json::json!({
+                                    "type": "remote_command_response",
+                                    "request_id": request_id,
+                                    "success": false,
+                                    "error": {
+                                        "code": "MISSING_COMMAND",
+                                        "message": "Command field is missing"
+                                    }
+                                });
+                                
+                                let _ = write.send(Message::Text(error_response.to_string())).await;
+                            }
+                        } else {
+                            error!("Failed to parse JSON message");
+                        }
+                    } else {
+                        warn!("Remote management is disabled");
+                        
+                        // If remote management is disabled, also send response
+                        if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(text) {
+                            if let Some(request_id) = json_value.get("request_id").and_then(|v| v.as_str()) {
+                                let error_response = serde_json::json!({
+                                    "type": "remote_command_response",
+                                    "request_id": request_id,
+                                    "success": false,
+                                    "error": {
+                                        "code": "REMOTE_MANAGEMENT_DISABLED",
+                                        "message": "Remote management is disabled on this node"
+                                    }
+                                });
+                                
+                                let _ = write.send(Message::Text(error_response.to_string())).await;
+                            }
+                        }
+                    }
+                    
+                    info!("=== REMOTE COMMAND PROCESSING COMPLETE ===");
+                }
+
+
+                Some("remote_auth") => {
+                    info!("Received remote_auth message");
+                    
+                    if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(text) {
+                        let jwt_token = json_value.get("jwt_token")
+                            .and_then(|v| v.as_str());
+                        
+                        if let Some(token) = jwt_token {
+                            info!("Remote auth JWT token received, length: {}", token.len());
+                            
+                            // TODO: In production, you should verify the JWT token here
+                            // For now, we'll accept it and enable remote management
+                            
+                            // Enable remote management for this session
+                            *self.remote_management_enabled.write().await = true;
+                            
+                            // Send success response
+                            let success_response = serde_json::json!({
+                                "type": "remote_auth_success",
+                                "message": "Remote authentication successful"
+                            });
+                            
+                            write.send(Message::Text(success_response.to_string())).await
+                                .map_err(|e| format!("Failed to send remote auth response: {}", e))?;
+                            
+                            info!("Remote auth success response sent, remote management enabled");
+                        } else {
+                            // JWT token missing
+                            let error_response = serde_json::json!({
+                                "type": "error",
+                                "error_code": "MISSING_JWT",
+                                "message": "JWT token is required for remote authentication"
+                            });
+                            
+                            write.send(Message::Text(error_response.to_string())).await
+                                .map_err(|e| format!("Failed to send error response: {}", e))?;
+                        }
+                    }
+                }
+                
+                Some("status_request") => {
+                    // Server requesting current status
+                    let status_update = WebSocketMessage::StatusUpdate {
+                        status: "active".to_string(),
+                    };
+                    
+                    let status_json = serde_json::to_string(&status_update)
+                        .map_err(|e| format!("Failed to serialize status: {}", e))?;
+                    
+                    write.send(Message::Text(status_json)).await
+                        .map_err(|e| format!("Failed to send status update: {}", e))?;
+                }
+                
+                _ => {
+                    debug!("Unknown message type: {:?}", json.get("type"));
+                }
+            }
+        } else {
+            warn!("Received non-JSON WebSocket message: {}", text);
+        }
+        
+        Ok(())
+    }
+
+    /// Handle remote command execution
+    async fn handle_remote_command(
+        &self,
+        json: &serde_json::Value,
+        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+    ) -> Result<(), String> {
+        let request_id = json.get("request_id")
+            .and_then(|id| id.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        
+        info!("Processing remote command with request ID: {}", request_id);
+        
+        // Parse remote command data from the command field instead of parameters
+        if let Some(command_data) = json.get("command") {
+            match serde_json::from_value::<RemoteCommandData>(command_data.clone()) {
+                Ok(remote_cmd_data) => {
+                    info!("Executing remote command: {:?}", remote_cmd_data);
+                    
+                    // Use the new remote command handler
+                    let handler = self.remote_command_handler.clone();
+                    let response = handler.handle_command(
+                        request_id.clone(),
+                        remote_cmd_data
+                    ).await;
+                    
+                    // Send response back using RemoteCommandResponse
+                    let response_msg = WebSocketMessage::RemoteCommandResponse {
+                        response,
+                    };
+                    
+                    let response_json = serde_json::to_string(&response_msg)
+                        .map_err(|e| format!("Failed to serialize response: {}", e))?;
+                    
+                    write.send(Message::Text(response_json)).await
+                        .map_err(|e| format!("Failed to send command response: {}", e))?;
+                }
+                Err(e) => {
+                    warn!("Invalid remote command format: {}", e);
+                    
+                    // Send error response
+                    let error_response = RemoteCommandResponse {
+                        request_id,
+                        success: false,
+                        result: None,
+                        error: Some(RemoteCommandError {
+                            code: "INVALID_COMMAND".to_string(),
+                            message: format!("Invalid command format: {}", e),
+                            details: None,
+                        }),
+                        executed_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    
+                    let response_msg = WebSocketMessage::RemoteCommandResponse {
+                        response: error_response,
+                    };
+                    
+                    let response_json = serde_json::to_string(&response_msg)
+                        .map_err(|e| format!("Failed to serialize error response: {}", e))?;
+                    
+                    write.send(Message::Text(response_json)).await
+                        .map_err(|e| format!("Failed to send error response: {}", e))?;
+                }
+            }
+        } else {
+            warn!("Remote command missing command data");
+            
+            // Send error response
+            let error_response = RemoteCommandResponse {
+                request_id,
+                success: false,
+                result: None,
+                error: Some(RemoteCommandError {
+                    code: "INVALID_COMMAND".to_string(),
+                    message: "Missing command data".to_string(),
+                    details: None,
+                }),
+                executed_at: chrono::Utc::now().to_rfc3339(),
+            };
+            
+            let response_msg = WebSocketMessage::RemoteCommandResponse {
+                response: error_response,
+            };
+            
+            let response_json = serde_json::to_string(&response_msg)
+                .map_err(|e| format!("Failed to serialize error response: {}", e))?;
+            
+            write.send(Message::Text(response_json)).await
+                .map_err(|e| format!("Failed to send error response: {}", e))?;
+        }
+        
+        Ok(())
+    }
+
+    /// Create heartbeat message with system metrics (legacy format)
+    async fn create_heartbeat_message(&self, _metrics_collector: &ServerMetricsCollector) -> WebSocketMessage {
+        let uptime_seconds = self.start_time.elapsed().as_secs();
+        
+        let (cpu_usage, mem_usage, disk_usage, net_usage) = tokio::join!(
+            self.get_cpu_usage(),
+            self.get_memory_usage(),
+            self.get_disk_usage(),
+            self.get_network_usage()
+        );
+        
+        let temperature = self.get_cpu_temperature().await;
+        let processes = self.get_process_count().await;
+        
+        WebSocketMessage::Heartbeat {
+            status: "active".to_string(),
+            uptime_seconds,
+            metrics: LegacyHeartbeatMetrics {  // Changed from HeartbeatMetrics
+                cpu: cpu_usage,
+                mem: mem_usage,
+                disk: disk_usage,
+                net: net_usage,
+                temperature,
+                processes,
+            },
+        }
+    }
+
+    /// Create heartbeat with metrics (new format)
+    async fn create_client_heartbeat_message(&self, _metrics_collector: &ServerMetricsCollector) -> ClientMessage {
+        let (cpu_usage, mem_usage, disk_usage, net_usage) = tokio::join!(
+            self.get_cpu_usage(),
+            self.get_memory_usage(),
+            self.get_disk_usage(),
+            self.get_network_usage()
+        );
+        
+        // Use the websocket_protocol HeartbeatMetrics directly
+        ClientMessage::Heartbeat {
+            metrics: WsHeartbeatMetrics {
+                cpu: cpu_usage,
+                memory: mem_usage,
+                disk: disk_usage,
+                network: net_usage,
+            },
+            timestamp: Some(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()),
+        }
+    }
+    
+    /// Submit attestation proof proactively
+    pub async fn submit_attestation_proof(
+        &self,
+        session_token: &str,
+        hardware_info: &HardwareInfo,
+        setup_params: &SetupParams,
+    ) -> Result<(), String> {
+        info!("Proactively submitting hardware attestation proof");
+        
+        // Generate commitment and proof
+        let commitment = hardware_info.generate_zkp_commitment();
+        let proof = crate::zkp_halo2::generate_hardware_proof(hardware_info, &commitment, setup_params)
+            .await
+            .map_err(|e| format!("Failed to generate proof: {}", e))?;
+        
+        // Prepare request
+        let request = AttestationVerifyRequest {
+            proof: ProofData::from(&proof),
+        };
+        
+        let url = format!("{}/api/aeronyx/attestation/verify/", self.api_url);
+        
+        let response = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", session_token))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
+        
+        if response.status().is_success() {
+            info!("✅ Server successfully verified the submitted proof");
+            Ok(())
+        } else {
+            let status = response.status();
+            let error_body = response.text().await.unwrap_or_default();
+            Err(format!("Verification failed with status {}: {}", status, error_body))
+        }
+    }
+
+    /// Get current CPU usage percentage
+    async fn get_cpu_usage(&self) -> f64 {
+        if let Ok(result) = tokio::task::spawn_blocking(|| utils::system::get_load_average()).await {
+            if let Ok((one_min, _, _)) = result {
+                let cpu_count = sys_info::cpu_num().unwrap_or(1) as f64;
+                (one_min / cpu_count * 100.0).min(100.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
+    }
+
+    /// Get current memory usage percentage
+    async fn get_memory_usage(&self) -> f64 {
+        if let Ok(Ok((total, available))) = tokio::task::spawn_blocking(|| utils::system::get_system_memory()).await {
+            let used = total.saturating_sub(available);
+            used as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Get current disk usage percentage
+    async fn get_disk_usage(&self) -> f64 {
+        if let Ok(Ok(usage)) = tokio::task::spawn_blocking(|| utils::system::get_disk_usage()).await {
+            usage as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Get current network usage (placeholder implementation)
+    async fn get_network_usage(&self) -> f64 {
+        // TODO: Implement actual network usage calculation
+        // This would track bytes sent/received over time
+        10.0
+    }
+
+    /// Get CPU temperature if available
+    async fn get_cpu_temperature(&self) -> Option<f64> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::fs;
+            
+            // Try different thermal zone paths
+            let thermal_zones = [
+                "/sys/class/thermal/thermal_zone0/temp",
+                "/sys/class/thermal/thermal_zone1/temp",
+                "/sys/class/hwmon/hwmon0/temp1_input",
+            ];
+            
+            for zone in &thermal_zones {
+                if let Ok(temp_str) = fs::read_to_string(zone) {
+                    if let Ok(temp_millidegrees) = temp_str.trim().parse::<f64>() {
+                        return Some(temp_millidegrees / 1000.0);
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+
+    /// Get current process count
+    async fn get_process_count(&self) -> Option<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::fs;
+            
+            if let Ok(entries) = fs::read_dir("/proc") {
+                let count = entries
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| {
+                        entry.file_name()
+                            .to_str()
+                            .map(|name| name.chars().all(|c| c.is_digit(10)))
+                            .unwrap_or(false)
+                    })
+                    .count();
+                
+                return Some(count as u32);
+            }
+        }
+        
+        None
+    }
+
+    /// Test API connection health
+    pub async fn test_api_connection(&self) -> Result<bool, String> {
+        info!("Testing API connection to {}", self.api_url);
+        
+        let url = format!("{}/api/aeronyx/health/", self.api_url);
+        
+        let response = self.client
+            .get(&url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("Connection test failed: {}", e))?;
+        
+        let status = response.status();
+        
+        if status.is_success() {
+            info!("API connection test successful");
+            Ok(true)
+        } else if status.as_u16() == 404 {
+            // Fallback to node-types endpoint for older API versions
+            let fallback_url = format!("{}/api/aeronyx/node-types/", self.api_url);
+            
+            let fallback_response = self.client
+                .get(&fallback_url)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(|e| format!("Fallback connection test failed: {}", e))?;
+            
+            Ok(fallback_response.status().is_success())
+        } else {
+            warn!("API connection test failed with status: {}", status);
+            Ok(false)
+        }
+    }
+
+    /// Check if node is currently connected to WebSocket
+    pub async fn is_connected(&self) -> bool {
+        *self.websocket_connected.read().await
+    }
+
+    /// Get node uptime in seconds
+    pub fn get_uptime(&self) -> u64 {
+        self.start_time.elapsed().as_secs()
+    }
+
+    /// Request hardware change approval (for future implementation)
+    pub async fn request_hardware_change_approval(&self, reason: &str) -> Result<(), String> {
+        info!("Requesting hardware change approval: {}", reason);
+        
+        // This would require server-side support for hardware change approvals
+        // For now, this is a placeholder for future functionality
+        
+        Err("Hardware change approval not yet implemented".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_websocket_message_serialization() {
+        // Test auth message
+        let auth = WebSocketMessage::Auth {
+            reference_code: "AERO-12345".to_string(),
+            registration_code: Some("AERO-REG123".to_string()),
+        };
+        
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains("\"type\":\"auth\""));
+        assert!(json.contains("AERO-12345"));
+        assert!(json.contains("AERO-REG123"));
+        
+        // Test heartbeat message
+        let heartbeat = WebSocketMessage::Heartbeat {
+            status: "active".to_string(),
+            uptime_seconds: 3600,
+            metrics: LegacyHeartbeatMetrics {
+                cpu: 25.5,
+                mem: 45.2,
+                disk: 60.1,
+                net: 10.3,
+                temperature: Some(65.0),
+                processes: Some(150),
+            },
+        };
+        
+        let json = serde_json::to_string(&heartbeat).unwrap();
+        assert!(json.contains("\"type\":\"heartbeat\""));
+        assert!(json.contains("\"cpu\":25.5"));
+        assert!(json.contains("\"temperature\":65.0"));
+        
+        // Test ZKP attestation message
+        let attestation = WebSocketMessage::HardwareAttestationProof {
+            commitment: "abc123".to_string(),
+            proof: vec![1, 2, 3, 4],
+            nonce: "nonce123".to_string(),
+        };
+        
+        let json = serde_json::to_string(&attestation).unwrap();
+        assert!(json.contains("\"type\":\"hardware_attestation_proof\""));
+        assert!(json.contains("\"commitment\":\"abc123\""));
+    }
+    
+    #[test]
+    fn test_hardware_components_extraction() {
+        let hw_info = HardwareInfo {
+            hostname: "test-node".to_string(),
+            cpu: crate::hardware::CpuInfo {
+                cores: 4,
+                model: "Intel Core i5".to_string(),
+                frequency: 2400000000,
+                architecture: "x86_64".to_string(),
+                vendor_id: Some("GenuineIntel".to_string()),
+            },
+            memory: crate::hardware::MemoryInfo {
+                total: 8000000000,
+                available: 4000000000,
+            },
+            disk: crate::hardware::DiskInfo {
+                total: 500000000000,
+                available: 250000000000,
+                filesystem: "ext4".to_string(),
+            },
+            network: crate::hardware::NetworkInfo {
+                interfaces: vec![
+                    crate::hardware::NetworkInterface {
+                        name: "eth0".to_string(),
+                        ip_address: "192.168.1.100".to_string(),
+                        mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                        interface_type: "ethernet".to_string(),
+                        is_physical: true,
+                    },
+                    crate::hardware::NetworkInterface {
+                        name: "docker0".to_string(),
+                        ip_address: "172.17.0.1".to_string(),
+                        mac_address: "02:42:ac:11:00:01".to_string(),
+                        interface_type: "bridge".to_string(),
+                        is_physical: false,
+                    },
+                ],
+                public_ip: "1.2.3.4".to_string(),
+            },
+            os: crate::hardware::OsInfo {
+                os_type: "linux".to_string(),
+                version: "22.04".to_string(),
+                distribution: "Ubuntu".to_string(),
+                kernel: "5.15.0".to_string(),
+            },
+            system_uuid: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            machine_id: Some("1234567890abcdef".to_string()),
+            bios_info: None,
+        };
+        
+        let components = RegistrationManager::extract_hardware_components(&hw_info);
+        
+        // Should only include physical MAC
+        assert_eq!(components.mac_addresses.len(), 1);
+        assert!(components.mac_addresses.contains("aa:bb:cc:dd:ee:ff"));
+        assert!(!components.mac_addresses.contains("02:42:ac:11:00:01"));
+        
+        assert_eq!(components.cpu_model, "Intel Core i5");
+        assert_eq!(components.system_uuid, Some("550e8400-e29b-41d4-a716-446655440000".to_string()));
+        assert_eq!(components.machine_id, Some("1234567890abcdef".to_string()));
+    }
+    
+    #[test]
+    fn test_tolerance_config() {
+        let config = HardwareToleranceConfig::default();
+        assert!(config.allow_minor_changes);
+        assert!(config.require_mac_match);
+        assert!(!config.allow_cpu_change);
+        assert_eq!(config.max_change_percentage, 0.3);
+    }
+    
+    #[tokio::test]
+    async fn test_registration_manager_creation() {
+        let manager = RegistrationManager::new("https://api.aeronyx.com");
+        assert!(manager.reference_code.is_none());
+        assert!(manager.wallet_address.is_none());
+        assert!(!manager.is_connected().await);
+        assert_eq!(manager.api_url, "https://api.aeronyx.com");
+        assert!(!manager.has_zkp_enabled());
+    }
+    
+    #[test]
+    fn test_client_message_serialization() {
+        // Test auth message
+        let auth = ClientMessage::Auth {
+            code: "AERO-12345".to_string(),
+        };
+        
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains("\"type\":\"auth\""));
+        assert!(json.contains("AERO-12345"));
+        
+        // Test heartbeat message
+        let heartbeat = ClientMessage::Heartbeat {
+            metrics: WsHeartbeatMetrics {
+                cpu: 25.5,
+                memory: 45.2,
+                disk: 60.1,
+                network: 10.3,
+            },
+            timestamp: Some(1234567890),
+        };
+        
+        let json = serde_json::to_string(&heartbeat).unwrap();
+        assert!(json.contains("\"type\":\"heartbeat\""));
+        assert!(json.contains("\"cpu\":25.5"));
+    }
+    
+    #[test]
+    fn test_server_message_deserialization() {
+        // Test connection established
+        let json = r#"{"type":"connection_established"}"#;
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::ConnectionEstablished));
+        
+        // Test auth success
+        let json = r#"{"type":"auth_success","heartbeat_interval":60}"#;
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ServerMessage::AuthSuccess { heartbeat_interval, .. } => {
+                assert_eq!(heartbeat_interval, Some(60));
+            }
+            _ => panic!("Wrong message type"),
+        }
+        
+        // Test challenge request
+        let json = r#"{"type":"challenge_request","challenge_id":"test-123"}"#;
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ServerMessage::ChallengeRequest { challenge_id, .. } => {
+                assert_eq!(challenge_id, "test-123");
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+}
+
+// Re-export the ClientMessage type for external use
+pub use crate::websocket_protocol::ClientMessage;;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,22 +1174,24 @@ use std::collections::HashSet;
 use crate::zkp_halo2::{generate_hardware_proof, verify_hardware_proof, SetupParams, Proof};
 use crate::websocket_protocol::{
     ServerMessage, ClientMessage, ProofData,
-    AttestationVerifyRequest
+    AttestationVerifyRequest, HeartbeatMetrics as WsHeartbeatMetrics
 };
 
 use crate::config::settings::ServerConfig;
 use crate::server::metrics::ServerMetricsCollector;
 use crate::utils;
 use crate::hardware::HardwareInfo;
-use crate::remote_management::{RemoteCommand as RemoteMgmtCommand, RemoteManagementHandler, CommandResponse};
+use crate::remote_management::{RemoteManagementHandler, CommandResponse};
 use crate::remote_command_handler::{
     RemoteCommandData, 
     RemoteCommandHandler, 
     RemoteCommandConfig, 
     RemoteCommandResponse, 
     RemoteCommandError,
+    SecurityMode,
     log_remote_command
 };
+
 /// Generic API response wrapper
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ApiResponse<T> {
@@ -261,72 +1411,72 @@ pub struct RegistrationManager {
     remote_management_enabled: Arc<RwLock<bool>>,
 }
 
-    impl RegistrationManager {
-        /// Create a new registration manager instance
-        pub fn new(api_url: &str) -> Self {
-            let client = Client::builder()
-                .timeout(Duration::from_secs(30))
-                .tcp_keepalive(Some(Duration::from_secs(60)))
-                .user_agent("AeroNyx-Node/1.0.0")
-                .pool_max_idle_per_host(5)
-                .pool_idle_timeout(Some(Duration::from_secs(90)))
-                .build()
-                .unwrap_or_else(|e| {
-                    warn!("Failed to build custom HTTP client: {}, using default", e);
-                    Client::new()
-                });
-            
-            // Use restricted mode by default for security
-            let remote_config = RemoteCommandConfig::default();
-            let remote_command_handler = Arc::new(RemoteCommandHandler::new(remote_config));
-    
-            Self {
-                client,
-                api_url: api_url.to_string(),
-                reference_code: None,
-                registration_code: None,
-                wallet_address: None,
-                hardware_fingerprint: None,
-                hardware_components: None,
-                websocket_connected: Arc::new(RwLock::new(false)),
-                start_time: std::time::Instant::now(),
-                data_dir: PathBuf::from("data"),
-                remote_handler: Arc::new(RemoteManagementHandler::new()),
-                tolerance_config: HardwareToleranceConfig::default(),
-                zkp_params: None,
-                hardware_info: None,
-                remote_command_handler,
-                remote_management_enabled: Arc::new(RwLock::new(false)),
-            }
-        }
+impl RegistrationManager {
+    /// Create a new registration manager instance
+    pub fn new(api_url: &str) -> Self {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .user_agent("AeroNyx-Node/1.0.0")
+            .pool_max_idle_per_host(5)
+            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            .build()
+            .unwrap_or_else(|e| {
+                warn!("Failed to build custom HTTP client: {}, using default", e);
+                Client::new()
+            });
         
-        /// Set security mode for remote commands
-        pub fn set_remote_security_mode(&mut self, mode: crate::remote_command_handler::SecurityMode) {
-            let config = match mode {
-                crate::remote_command_handler::SecurityMode::FullAccess => {
-                    warn!("Setting remote command handler to FULL ACCESS mode - use with caution!");
-                    RemoteCommandConfig::full_access()
-                }
-                crate::remote_command_handler::SecurityMode::Restricted => {
-                    info!("Setting remote command handler to RESTRICTED mode");
-                    // Create restricted config with common paths
-                    RemoteCommandConfig::restricted_with_paths(vec![
-                        PathBuf::from("/"),
-                        PathBuf::from("/home"),
-                        PathBuf::from("/var"),
-                        PathBuf::from("/var/log"),
-                        PathBuf::from("/tmp"),
-                        PathBuf::from("/etc"),
-                        PathBuf::from("/usr"),
-                        PathBuf::from("/opt"),
-                        self.data_dir.clone(),
-                    ])
-                }
-            };
-            
-            self.remote_command_handler = Arc::new(RemoteCommandHandler::new(config));
+        // Use restricted mode by default for security
+        let remote_config = RemoteCommandConfig::default();
+        let remote_command_handler = Arc::new(RemoteCommandHandler::new(remote_config));
+
+        Self {
+            client,
+            api_url: api_url.to_string(),
+            reference_code: None,
+            registration_code: None,
+            wallet_address: None,
+            hardware_fingerprint: None,
+            hardware_components: None,
+            websocket_connected: Arc::new(RwLock::new(false)),
+            start_time: std::time::Instant::now(),
+            data_dir: PathBuf::from("data"),
+            remote_handler: Arc::new(RemoteManagementHandler::new()),
+            tolerance_config: HardwareToleranceConfig::default(),
+            zkp_params: None,
+            hardware_info: None,
+            remote_command_handler,
+            remote_management_enabled: Arc::new(RwLock::new(false)),
         }
     }
+    
+    /// Set security mode for remote commands
+    pub fn set_remote_security_mode(&mut self, mode: SecurityMode) {
+        let config = match mode {
+            SecurityMode::FullAccess => {
+                warn!("Setting remote command handler to FULL ACCESS mode - use with caution!");
+                RemoteCommandConfig::full_access()
+            }
+            SecurityMode::Restricted => {
+                info!("Setting remote command handler to RESTRICTED mode");
+                // Create restricted config with common paths
+                RemoteCommandConfig::restricted_with_paths(vec![
+                    PathBuf::from("/"),
+                    PathBuf::from("/home"),
+                    PathBuf::from("/var"),
+                    PathBuf::from("/var/log"),
+                    PathBuf::from("/tmp"),
+                    PathBuf::from("/etc"),
+                    PathBuf::from("/usr"),
+                    PathBuf::from("/opt"),
+                    self.data_dir.clone(),
+                ])
+            }
+        };
+        
+        self.remote_command_handler = Arc::new(RemoteCommandHandler::new(config));
+    }
+
     /// Initialize ZKP parameters (call this during startup)
     pub async fn initialize_zkp(&self) -> Result<SetupParams, String> {
         info!("Initializing Halo2 zero-knowledge proof parameters");
@@ -502,6 +1652,7 @@ pub struct RegistrationManager {
         
         Ok(has_minimum)
     }
+    
     /// Verify hardware fingerprint with tolerance for minor changes
     pub async fn verify_hardware_fingerprint(&self) -> Result<(), String> {
         if let Some(stored_fingerprint) = &self.hardware_fingerprint {
@@ -733,7 +1884,7 @@ pub struct RegistrationManager {
 
     /// Save registration data locally with enhanced hardware tracking
     fn save_registration_data(&self, node_info: &NodeInfo, hw_info: &HardwareInfo) -> Result<(), String> {
-        let hardware_components = Self::extract_hardware_components(hw_info);
+        let hardware_components = RegistrationManager::extract_hardware_components(hw_info);
         let hardware_fingerprint = hw_info.generate_fingerprint();
         
         // Generate ZKP commitment
@@ -844,7 +1995,7 @@ pub struct RegistrationManager {
                     self.reference_code = Some(data.node.reference_code.clone());
                     self.wallet_address = Some(data.node.wallet_address.clone());
                     self.hardware_fingerprint = Some(hardware_fingerprint);
-                    self.hardware_components = Some(Self::extract_hardware_components(hardware_info));
+                    self.hardware_components = Some(RegistrationManager::extract_hardware_components(hardware_info));
                     self.hardware_info = Some(hardware_info.clone());
                     
                     info!("Registration confirmed successfully!");
@@ -1539,1060 +2690,3 @@ pub struct RegistrationManager {
                     error!("Authentication failed: {}", err_msg);
                     return Err(format!("Authentication failed: {}", err_msg));
                 }
-            }
-            
-            ServerMessage::RemoteCommand { request_id, command, from_session } => {
-                info!("=== REMOTE COMMAND RECEIVED (ServerMessage) ===");
-                info!("Request ID: {}", request_id);
-                info!("From session: {}", from_session);
-                info!("Command: {:?}", command);
-                
-                if *self.remote_management_enabled.read().await {
-                    match serde_json::from_value::<RemoteCommandData>(command.clone()) {
-                        Ok(command_data) => {
-                            info!("Processing remote command: type={}", command_data.command_type);
-                            
-                            // Log the command execution
-                            log_remote_command(
-                                &from_session,
-                                &command_data.command_type,
-                                true,
-                                &format!("request_id={}", request_id)
-                            );
-                            
-                            // Execute command
-                            let handler = self.remote_command_handler.clone();
-                            let response = handler.handle_command(
-                                request_id.clone(), 
-                                command_data
-                            ).await;
-                            
-                            // Build response message
-                            let response_msg = if response.success {
-                                serde_json::json!({
-                                    "type": "remote_command_response",
-                                    "request_id": request_id,
-                                    "success": true,
-                                    "result": response.result,
-                                    "executed_at": response.executed_at
-                                })
-                            } else {
-                                serde_json::json!({
-                                    "type": "remote_command_response",
-                                    "request_id": request_id,
-                                    "success": false,
-                                    "error": response.error,
-                                    "executed_at": response.executed_at
-                                })
-                            };
-                            
-                            // Send response
-                            info!("Sending remote command response for request_id: {}", request_id);
-                            let response_json = response_msg.to_string();
-                            
-                            write.send(Message::Text(response_json)).await
-                                .map_err(|e| format!("Failed to send response: {}", e))?;
-                            
-                            info!("Response sent successfully");
-                        }
-                        Err(e) => {
-                            error!("Failed to parse remote command: {}", e);
-                            
-                            // Send error response
-                            let error_response = serde_json::json!({
-                                "type": "remote_command_response",
-                                "request_id": request_id,
-                                "success": false,
-                                "error": {
-                                    "code": "INVALID_COMMAND",
-                                    "message": format!("Failed to parse command: {}", e)
-                                }
-                            });
-                            
-                            write.send(Message::Text(error_response.to_string())).await
-                                .map_err(|e| format!("Failed to send error response: {}", e))?;
-                        }
-                    }
-                } else {
-                    warn!("Remote management is disabled");
-                    
-                    let error_response = serde_json::json!({
-                        "type": "remote_command_response",
-                        "request_id": request_id,
-                        "success": false,
-                        "error": {
-                            "code": "REMOTE_MANAGEMENT_DISABLED",
-                            "message": "Remote management is disabled on this node"
-                        }
-                    });
-                    
-                    write.send(Message::Text(error_response.to_string())).await
-                        .map_err(|e| format!("Failed to send error response: {}", e))?;
-                }
-            }
-            
-            ServerMessage::RemoteAuth { jwt_token } => {
-                info!("Received remote_auth message");
-                info!("Remote auth JWT token received, length: {}", jwt_token.len());
-                
-                // Enable remote management for this session
-                *self.remote_management_enabled.write().await = true;
-                
-                // Send success response
-                let success_response = serde_json::json!({
-                    "type": "remote_auth_success",
-                    "message": "Remote authentication successful"
-                });
-                
-                write.send(Message::Text(success_response.to_string())).await
-                    .map_err(|e| format!("Failed to send remote auth response: {}", e))?;
-                
-                info!("Remote auth success response sent, remote management enabled");
-            }
-            
-            ServerMessage::ChallengeRequest { challenge_id, nonce: _ } => {
-                info!("✅ Received ZKP challenge request with ID: {}", challenge_id);
-                
-                let commitment = hardware_info.generate_zkp_commitment();
-                
-                match zkp_halo2::generate_hardware_proof(hardware_info, &commitment, setup_params).await {
-                    Ok(proof) => {
-                        let response = ClientMessage::ChallengeResponse {
-                            challenge_id: challenge_id.clone(),
-                            proof: ProofData::from(&proof),
-                        };
-                        
-                        let response_json = serde_json::to_string(&response)
-                            .map_err(|e| format!("Failed to serialize response: {}", e))?;
-                        write.send(Message::Text(response_json)).await
-                            .map_err(|e| format!("Failed to send challenge response: {}", e))?;
-                        
-                        info!("🚀 Successfully sent proof for challenge {}", challenge_id);
-                    }
-                    Err(e) => {
-                        error!("❌ Failed to generate proof: {}", e);
-                    }
-                }
-            }
-            
-            ServerMessage::ChallengeResponseAck { challenge_id, status, message: _ } => {
-                info!("Server acknowledged proof for challenge {}: {}", challenge_id, status);
-            }
-            
-            ServerMessage::HeartbeatAck { received_at: _, next_interval: _ } => {
-                debug!("Heartbeat acknowledged");
-                // Don't update timestamp here - it needs to be updated in the caller
-            }
-            
-            ServerMessage::Error { error_code, message } => {
-                error!("Server error [{}]: {}", error_code, message);
-            }
-            
-            ServerMessage::Unknown => {
-                debug!("Received unknown message type");
-            }
-        }
-        
-        Ok(())
-    }
-
-    
-    /// Handle incoming WebSocket messages (legacy version)
-    async fn handle_websocket_message(
-        &self,
-        text: &str,
-        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
-        authenticated: &mut bool,
-        heartbeat_interval: &mut time::Interval,
-        last_heartbeat_ack: &mut std::time::Instant,
-    ) -> Result<(), String> {
-        debug!("Received WebSocket message: {}", text);
-        
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-            match json.get("type").and_then(|t| t.as_str()) {
-                Some("connection_established") => {
-                    info!("WebSocket connection established, sending authentication");
-                    
-                    let auth_msg = WebSocketMessage::Auth {
-                        reference_code: self.reference_code.clone().unwrap(),
-                        registration_code: self.registration_code.clone(),
-                    };
-                    
-                    let auth_json = serde_json::to_string(&auth_msg)
-                        .map_err(|e| format!("Failed to serialize auth: {}", e))?;
-                    
-                    write.send(Message::Text(auth_json)).await
-                        .map_err(|e| format!("Failed to send auth: {}", e))?;
-                }
-                
-                Some("auth_success") => {
-                    info!("WebSocket authentication successful");
-                    *authenticated = true;
-                    *last_heartbeat_ack = std::time::Instant::now();
-                    
-                    // Get heartbeat interval from server
-                    if let Some(interval_secs) = json.get("heartbeat_interval").and_then(|v| v.as_u64()) {
-                        *heartbeat_interval = time::interval(Duration::from_secs(interval_secs));
-                        info!("Heartbeat interval set to {} seconds", interval_secs);
-                    }
-                    
-                    // Check for additional auth info
-                    if let Some(node_info) = json.get("node_info") {
-                        if let Some(status) = node_info.get("status").and_then(|s| s.as_str()) {
-                            info!("Node status: {}", status);
-                        }
-                    }
-                }
-                
-                Some("heartbeat_ack") => {
-                    debug!("Heartbeat acknowledged by server");
-                    *last_heartbeat_ack = std::time::Instant::now();
-                    
-                    // Update next heartbeat interval if provided
-                    if let Some(next_interval) = json.get("next_interval").and_then(|v| v.as_u64()) {
-                        *heartbeat_interval = time::interval(Duration::from_secs(next_interval));
-                    }
-                }
-                
-                Some("hardware_attestation_request") => {
-                    // Handle ZKP attestation request
-                    if self.zkp_params.is_some() {
-                        info!("Received hardware attestation request");
-                        
-                        let challenge = json.get("challenge")
-                            .and_then(|c| c.as_array())
-                            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect::<Vec<u8>>())
-                            .unwrap_or_default();
-                        
-                        let nonce = json.get("nonce")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        
-                        match self.handle_attestation_request(challenge, nonce).await {
-                            Ok(response_msg) => {
-                                let response_json = serde_json::to_string(&response_msg)
-                                    .map_err(|e| format!("Failed to serialize attestation response: {}", e))?;
-                                
-                                write.send(Message::Text(response_json)).await
-                                    .map_err(|e| format!("Failed to send attestation proof: {}", e))?;
-                                
-                                info!("Hardware attestation proof sent successfully");
-                            }
-                            Err(e) => {
-                                error!("Failed to generate attestation proof: {}", e);
-                            }
-                        }
-                    } else {
-                        warn!("Received hardware attestation request but ZKP is not enabled");
-                    }
-                }
-                
-                Some("error") => {
-                    let error_code = json.get("error_code").and_then(|c| c.as_str()).unwrap_or("unknown");
-                    let message = json.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
-                    error!("Server error [{}]: {}", error_code, message);
-                    
-                    // Handle specific errors
-                    match error_code {
-                        "hardware_fingerprint_conflict" => {
-                            error!("This hardware is already registered with another node");
-                            error!("Each physical device can only run one AeroNyx node");
-                            return Err("Hardware already registered".to_string());
-                        }
-                        "auth_failed" => {
-                            error!("Authentication failed - invalid reference code");
-                            return Err("Authentication failed".to_string());
-                        }
-                        "node_suspended" => {
-                            error!("This node has been suspended");
-                            error!("Please contact support for more information");
-                            return Err("Node suspended".to_string());
-                        }
-                        "node_not_found" => {
-                            error!("Node not found - registration may have been deleted");
-                            return Err("Node not found".to_string());
-                        }
-                        _ => {}
-                    }
-                }
-                
-                Some("command") => {
-                    // Handle remote commands if enabled
-                    if *self.remote_management_enabled.read().await {
-                        self.handle_remote_command(&json, write).await?;
-                    } else {
-                        warn!("Received remote command but remote management is disabled");
-                        
-                        // Send error response
-                        if let Some(request_id) = json.get("request_id").and_then(|id| id.as_str()) {
-                            let error_response = CommandResponse {
-                                success: false,
-                                message: "Remote management is disabled".to_string(),
-                                data: None,
-                                error_code: Some("REMOTE_MANAGEMENT_DISABLED".to_string()),
-                                execution_time_ms: None,
-                            };
-                            
-                            let response_msg = WebSocketMessage::CommandResponse {
-                                request_id: request_id.to_string(),
-                                response: error_response,
-                            };
-                            
-                            let response_json = serde_json::to_string(&response_msg)
-                                .map_err(|e| format!("Failed to serialize error response: {}", e))?;
-                            
-                            write.send(Message::Text(response_json)).await
-                                .map_err(|e| format!("Failed to send error response: {}", e))?;
-                        }
-                    }
-                }
-                
-                Some("ping") => {
-                    // Respond to server ping
-                    if let Some(timestamp) = json.get("timestamp").and_then(|t| t.as_u64()) {
-                        let pong = WebSocketMessage::Ping { timestamp };
-                        let pong_json = serde_json::to_string(&pong)
-                            .map_err(|e| format!("Failed to serialize pong: {}", e))?;
-                        
-                        write.send(Message::Text(pong_json)).await
-                            .map_err(|e| format!("Failed to send pong: {}", e))?;
-                    }
-                }
-                
-                Some("config_update") => {
-                    // Handle configuration updates from server
-                    info!("Received configuration update from server");
-                    if let Some(config) = json.get("config") {
-                        debug!("New configuration: {:?}", config);
-                        // TODO: Apply configuration updates
-                    }
-                }
-                
-                Some("remote_command") => {
-                    info!("=== REMOTE COMMAND RECEIVED ===");
-                    info!("Raw message: {}", text);
-                    
-                    if *self.remote_management_enabled.read().await {
-                        if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(text) {
-                            // Extract fields
-                            let request_id = json_value.get("request_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-                            let from_session = json_value.get("from_session")
-                                .and_then(|v| v.as_str());
-                            
-                            info!("Request ID: {}", request_id);
-                            info!("From session: {:?}", from_session);
-                            
-                            // NOTE: Backend doesn't send node_reference, so we don't check it
-                            // The node is already authenticated, so we trust the command
-                            
-                            if let Some(command_json) = json_value.get("command") {
-                                info!("Command JSON: {:?}", command_json);
-                                
-                                match serde_json::from_value::<RemoteCommandData>(command_json.clone()) {
-                                    Ok(command_data) => {
-                                        info!("Processing remote command: type={}", command_data.command_type);
-                                        
-                                        // Log the command execution
-                                        if let Some(session_id) = from_session {
-                                            log_remote_command(
-                                                session_id,
-                                                &command_data.command_type,
-                                                true,
-                                                &format!("request_id={}", request_id)
-                                            );
-                                        }
-                                        
-                                        // Execute command
-                                        let handler = self.remote_command_handler.clone();
-                                        let response = handler.handle_command(
-                                            request_id.to_string(), 
-                                            command_data
-                                        ).await;
-                                        
-                                        // Build response message
-                                        let response_msg = if response.success {
-                                            serde_json::json!({
-                                                "type": "remote_command_response",
-                                                "request_id": request_id,
-                                                "success": true,
-                                                "result": response.result,
-                                                "executed_at": response.executed_at
-                                            })
-                                        } else {
-                                            serde_json::json!({
-                                                "type": "remote_command_response",
-                                                "request_id": request_id,
-                                                "success": false,
-                                                "error": response.error,
-                                                "executed_at": response.executed_at
-                                            })
-                                        };
-                                        
-                                        // Send response
-                                        info!("Sending remote command response for request_id: {}", request_id);
-                                        let response_json = response_msg.to_string();
-                                        
-                                        match write.send(Message::Text(response_json)).await {
-                                            Ok(_) => info!("Response sent successfully"),
-                                            Err(e) => error!("Failed to send response: {}", e),
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to parse remote command: {}", e);
-                                        error!("Command JSON was: {:?}", command_json);
-                                        
-                                        // Log failed command
-                                        if let Some(session_id) = from_session {
-                                            log_remote_command(
-                                                session_id,
-                                                "unknown",
-                                                false,
-                                                &format!("parse_error={}", e)
-                                            );
-                                        }
-                                        
-                                        // Send error response
-                                        let error_response = serde_json::json!({
-                                            "type": "remote_command_response",
-                                            "request_id": request_id,
-                                            "success": false,
-                                            "error": {
-                                                "code": "INVALID_COMMAND",
-                                                "message": format!("Failed to parse command: {}", e)
-                                            }
-                                        });
-                                        
-                                        let _ = write.send(Message::Text(error_response.to_string())).await;
-                                    }
-                                }
-                            } else {
-                                error!("No 'command' field in message");
-                                
-                                // Send error response
-                                let error_response = serde_json::json!({
-                                    "type": "remote_command_response",
-                                    "request_id": request_id,
-                                    "success": false,
-                                    "error": {
-                                        "code": "MISSING_COMMAND",
-                                        "message": "Command field is missing"
-                                    }
-                                });
-                                
-                                let _ = write.send(Message::Text(error_response.to_string())).await;
-                            }
-                        } else {
-                            error!("Failed to parse JSON message");
-                        }
-                    } else {
-                        warn!("Remote management is disabled");
-                        
-                        // If remote management is disabled, also send response
-                        if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(text) {
-                            if let Some(request_id) = json_value.get("request_id").and_then(|v| v.as_str()) {
-                                let error_response = serde_json::json!({
-                                    "type": "remote_command_response",
-                                    "request_id": request_id,
-                                    "success": false,
-                                    "error": {
-                                        "code": "REMOTE_MANAGEMENT_DISABLED",
-                                        "message": "Remote management is disabled on this node"
-                                    }
-                                });
-                                
-                                let _ = write.send(Message::Text(error_response.to_string())).await;
-                            }
-                        }
-                    }
-                    
-                    info!("=== REMOTE COMMAND PROCESSING COMPLETE ===");
-                }
-
-
-                Some("remote_auth") => {
-                    info!("Received remote_auth message");
-                    
-                    if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(text) {
-                        let jwt_token = json_value.get("jwt_token")
-                            .and_then(|v| v.as_str());
-                        
-                        if let Some(token) = jwt_token {
-                            info!("Remote auth JWT token received, length: {}", token.len());
-                            
-                            // TODO: In production, you should verify the JWT token here
-                            // For now, we'll accept it and enable remote management
-                            
-                            // Enable remote management for this session
-                            *self.remote_management_enabled.write().await = true;
-                            
-                            // Send success response
-                            let success_response = serde_json::json!({
-                                "type": "remote_auth_success",
-                                "message": "Remote authentication successful"
-                            });
-                            
-                            write.send(Message::Text(success_response.to_string())).await
-                                .map_err(|e| format!("Failed to send remote auth response: {}", e))?;
-                            
-                            info!("Remote auth success response sent, remote management enabled");
-                        } else {
-                            // JWT token missing
-                            let error_response = serde_json::json!({
-                                "type": "error",
-                                "error_code": "MISSING_JWT",
-                                "message": "JWT token is required for remote authentication"
-                            });
-                            
-                            write.send(Message::Text(error_response.to_string())).await
-                                .map_err(|e| format!("Failed to send error response: {}", e))?;
-                        }
-                    }
-                }
-                
-                Some("status_request") => {
-                    // Server requesting current status
-                    let status_update = WebSocketMessage::StatusUpdate {
-                        status: "active".to_string(),
-                    };
-                    
-                    let status_json = serde_json::to_string(&status_update)
-                        .map_err(|e| format!("Failed to serialize status: {}", e))?;
-                    
-                    write.send(Message::Text(status_json)).await
-                        .map_err(|e| format!("Failed to send status update: {}", e))?;
-                }
-                
-                _ => {
-                    debug!("Unknown message type: {:?}", json.get("type"));
-                }
-            }
-        } else {
-            warn!("Received non-JSON WebSocket message: {}", text);
-        }
-        
-        Ok(())
-    }
-
-    /// Handle remote command execution
-    async fn handle_remote_command(
-        &self,
-        json: &serde_json::Value,
-        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
-    ) -> Result<(), String> {
-        let request_id = json.get("request_id")
-            .and_then(|id| id.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        
-        info!("Processing remote command with request ID: {}", request_id);
-        
-        // Parse remote command data from the command field instead of parameters
-        if let Some(command_data) = json.get("command") {
-            match serde_json::from_value::<RemoteCommandData>(command_data.clone()) {
-                Ok(remote_cmd_data) => {
-                    info!("Executing remote command: {:?}", remote_cmd_data);
-                    
-                    // Use the new remote command handler
-                    let handler = self.remote_command_handler.clone();
-                    let response = handler.handle_command(
-                        request_id.clone(),
-                        remote_cmd_data
-                    ).await;
-                    
-                    // Send response back using RemoteCommandResponse
-                    let response_msg = WebSocketMessage::RemoteCommandResponse {
-                        response,
-                    };
-                    
-                    let response_json = serde_json::to_string(&response_msg)
-                        .map_err(|e| format!("Failed to serialize response: {}", e))?;
-                    
-                    write.send(Message::Text(response_json)).await
-                        .map_err(|e| format!("Failed to send command response: {}", e))?;
-                }
-                Err(e) => {
-                    warn!("Invalid remote command format: {}", e);
-                    
-                    // Send error response
-                    let error_response = RemoteCommandResponse {
-                        request_id,
-                        success: false,
-                        result: None,
-                        error: Some(crate::remote_command_handler::RemoteCommandError {
-                            code: "INVALID_COMMAND".to_string(),
-                            message: format!("Invalid command format: {}", e),
-                            details: None,
-                        }),
-                        executed_at: chrono::Utc::now().to_rfc3339(),
-                    };
-                    
-                    let response_msg = WebSocketMessage::RemoteCommandResponse {
-                        response: error_response,
-                    };
-                    
-                    let response_json = serde_json::to_string(&response_msg)
-                        .map_err(|e| format!("Failed to serialize error response: {}", e))?;
-                    
-                    write.send(Message::Text(response_json)).await
-                        .map_err(|e| format!("Failed to send error response: {}", e))?;
-                }
-            }
-        } else {
-            warn!("Remote command missing command data");
-            
-            // Send error response
-            let error_response = RemoteCommandResponse {
-                request_id,
-                success: false,
-                result: None,
-                error: Some(crate::remote_command_handler::RemoteCommandError {
-                    code: "INVALID_COMMAND".to_string(),
-                    message: "Missing command data".to_string(),
-                    details: None,
-                }),
-                executed_at: chrono::Utc::now().to_rfc3339(),
-            };
-            
-            let response_msg = WebSocketMessage::RemoteCommandResponse {
-                response: error_response,
-            };
-            
-            let response_json = serde_json::to_string(&response_msg)
-                .map_err(|e| format!("Failed to serialize error response: {}", e))?;
-            
-            write.send(Message::Text(response_json)).await
-                .map_err(|e| format!("Failed to send error response: {}", e))?;
-        }
-        
-        Ok(())
-    }
-
-    /// Create heartbeat message with system metrics (legacy format)
-    async fn create_heartbeat_message(&self, _metrics_collector: &ServerMetricsCollector) -> WebSocketMessage {
-        let uptime_seconds = self.start_time.elapsed().as_secs();
-        
-        let (cpu_usage, mem_usage, disk_usage, net_usage) = tokio::join!(
-            self.get_cpu_usage(),
-            self.get_memory_usage(),
-            self.get_disk_usage(),
-            self.get_network_usage()
-        );
-        
-        let temperature = self.get_cpu_temperature().await;
-        let processes = self.get_process_count().await;
-        
-        WebSocketMessage::Heartbeat {
-            status: "active".to_string(),
-            uptime_seconds,
-            metrics: LegacyHeartbeatMetrics {  // Changed from HeartbeatMetrics
-                cpu: cpu_usage,
-                mem: mem_usage,
-                disk: disk_usage,
-                net: net_usage,
-                temperature,
-                processes,
-            },
-        }
-    }
-
-    /// Create heartbeat with metrics (new format)
-    async fn create_client_heartbeat_message(&self, _metrics_collector: &ServerMetricsCollector) -> ClientMessage {
-        let (cpu_usage, mem_usage, disk_usage, net_usage) = tokio::join!(
-            self.get_cpu_usage(),
-            self.get_memory_usage(),
-            self.get_disk_usage(),
-            self.get_network_usage()
-        );
-        
-        // Use the websocket_protocol HeartbeatMetrics directly
-        ClientMessage::Heartbeat {
-            metrics: crate::websocket_protocol::HeartbeatMetrics {
-                cpu: cpu_usage,
-                memory: mem_usage,
-                disk: disk_usage,
-                network: net_usage,
-            },
-            timestamp: Some(std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()),
-        }
-    }
-    
-    /// Submit attestation proof proactively
-    pub async fn submit_attestation_proof(
-        &self,
-        session_token: &str,
-        hardware_info: &HardwareInfo,
-        setup_params: &SetupParams,
-    ) -> Result<(), String> {
-        info!("Proactively submitting hardware attestation proof");
-        
-        // Generate commitment and proof
-        let commitment = hardware_info.generate_zkp_commitment();
-        let proof = crate::zkp_halo2::generate_hardware_proof(hardware_info, &commitment, setup_params)
-            .await
-            .map_err(|e| format!("Failed to generate proof: {}", e))?;
-        
-        // Prepare request
-        let request = AttestationVerifyRequest {
-            proof: ProofData::from(&proof),
-        };
-        
-        let url = format!("{}/api/aeronyx/attestation/verify/", self.api_url);
-        
-        let response = self.client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", session_token))
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| format!("HTTP request failed: {}", e))?;
-        
-        if response.status().is_success() {
-            info!("✅ Server successfully verified the submitted proof");
-            Ok(())
-        } else {
-            let status = response.status();
-            let error_body = response.text().await.unwrap_or_default();
-            Err(format!("Verification failed with status {}: {}", status, error_body))
-        }
-    }
-
-    /// Get current CPU usage percentage
-    async fn get_cpu_usage(&self) -> f64 {
-        if let Ok(result) = tokio::task::spawn_blocking(|| utils::system::get_load_average()).await {
-            if let Ok((one_min, _, _)) = result {
-                let cpu_count = sys_info::cpu_num().unwrap_or(1) as f64;
-                (one_min / cpu_count * 100.0).min(100.0)
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        }
-    }
-
-    /// Get current memory usage percentage
-    async fn get_memory_usage(&self) -> f64 {
-        if let Ok(Ok((total, available))) = tokio::task::spawn_blocking(|| utils::system::get_system_memory()).await {
-            let used = total.saturating_sub(available);
-            used as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        }
-    }
-
-    /// Get current disk usage percentage
-    async fn get_disk_usage(&self) -> f64 {
-        if let Ok(Ok(usage)) = tokio::task::spawn_blocking(|| utils::system::get_disk_usage()).await {
-            usage as f64
-        } else {
-            0.0
-        }
-    }
-
-    /// Get current network usage (placeholder implementation)
-    async fn get_network_usage(&self) -> f64 {
-        // TODO: Implement actual network usage calculation
-        // This would track bytes sent/received over time
-        10.0
-    }
-
-    /// Get CPU temperature if available
-    async fn get_cpu_temperature(&self) -> Option<f64> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::fs;
-            
-            // Try different thermal zone paths
-            let thermal_zones = [
-                "/sys/class/thermal/thermal_zone0/temp",
-                "/sys/class/thermal/thermal_zone1/temp",
-                "/sys/class/hwmon/hwmon0/temp1_input",
-            ];
-            
-            for zone in &thermal_zones {
-                if let Ok(temp_str) = fs::read_to_string(zone) {
-                    if let Ok(temp_millidegrees) = temp_str.trim().parse::<f64>() {
-                        return Some(temp_millidegrees / 1000.0);
-                    }
-                }
-            }
-        }
-        
-        None
-    }
-
-    /// Get current process count
-    async fn get_process_count(&self) -> Option<u32> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::fs;
-            
-            if let Ok(entries) = fs::read_dir("/proc") {
-                let count = entries
-                    .filter_map(|entry| entry.ok())
-                    .filter(|entry| {
-                        entry.file_name()
-                            .to_str()
-                            .map(|name| name.chars().all(|c| c.is_digit(10)))
-                            .unwrap_or(false)
-                    })
-                    .count();
-                
-                return Some(count as u32);
-            }
-        }
-        
-        None
-    }
-
-    /// Test API connection health
-    pub async fn test_api_connection(&self) -> Result<bool, String> {
-        info!("Testing API connection to {}", self.api_url);
-        
-        let url = format!("{}/api/aeronyx/health/", self.api_url);
-        
-        let response = self.client
-            .get(&url)
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| format!("Connection test failed: {}", e))?;
-        
-        let status = response.status();
-        
-        if status.is_success() {
-            info!("API connection test successful");
-            Ok(true)
-        } else if status.as_u16() == 404 {
-            // Fallback to node-types endpoint for older API versions
-            let fallback_url = format!("{}/api/aeronyx/node-types/", self.api_url);
-            
-            let fallback_response = self.client
-                .get(&fallback_url)
-                .timeout(Duration::from_secs(10))
-                .send()
-                .await
-                .map_err(|e| format!("Fallback connection test failed: {}", e))?;
-            
-            Ok(fallback_response.status().is_success())
-        } else {
-            warn!("API connection test failed with status: {}", status);
-            Ok(false)
-        }
-    }
-
-    /// Check if node is currently connected to WebSocket
-    pub async fn is_connected(&self) -> bool {
-        *self.websocket_connected.read().await
-    }
-
-    /// Get node uptime in seconds
-    pub fn get_uptime(&self) -> u64 {
-        self.start_time.elapsed().as_secs()
-    }
-
-    /// Request hardware change approval (for future implementation)
-    pub async fn request_hardware_change_approval(&self, reason: &str) -> Result<(), String> {
-        info!("Requesting hardware change approval: {}", reason);
-        
-        // This would require server-side support for hardware change approvals
-        // For now, this is a placeholder for future functionality
-        
-        Err("Hardware change approval not yet implemented".to_string())
-    }
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_websocket_message_serialization() {
-        // Test auth message
-        let auth = WebSocketMessage::Auth {
-            reference_code: "AERO-12345".to_string(),
-            registration_code: Some("AERO-REG123".to_string()),
-        };
-        
-        let json = serde_json::to_string(&auth).unwrap();
-        assert!(json.contains("\"type\":\"auth\""));
-        assert!(json.contains("AERO-12345"));
-        assert!(json.contains("AERO-REG123"));
-        
-        // Test heartbeat message
-        let heartbeat = WebSocketMessage::Heartbeat {
-            status: "active".to_string(),
-            uptime_seconds: 3600,
-            metrics: LegacyHeartbeatMetrics {
-                cpu: 25.5,
-                mem: 45.2,
-                disk: 60.1,
-                net: 10.3,
-                temperature: Some(65.0),
-                processes: Some(150),
-            },
-        };
-        
-        let json = serde_json::to_string(&heartbeat).unwrap();
-        assert!(json.contains("\"type\":\"heartbeat\""));
-        assert!(json.contains("\"cpu\":25.5"));
-        assert!(json.contains("\"temperature\":65.0"));
-        
-        // Test ZKP attestation message
-        let attestation = WebSocketMessage::HardwareAttestationProof {
-            commitment: "abc123".to_string(),
-            proof: vec![1, 2, 3, 4],
-            nonce: "nonce123".to_string(),
-        };
-        
-        let json = serde_json::to_string(&attestation).unwrap();
-        assert!(json.contains("\"type\":\"hardware_attestation_proof\""));
-        assert!(json.contains("\"commitment\":\"abc123\""));
-    }
-    
-    #[test]
-    fn test_hardware_components_extraction() {
-        let hw_info = HardwareInfo {
-            hostname: "test-node".to_string(),
-            cpu: crate::hardware::CpuInfo {
-                cores: 4,
-                model: "Intel Core i5".to_string(),
-                frequency: 2400000000,
-                architecture: "x86_64".to_string(),
-                vendor_id: Some("GenuineIntel".to_string()),
-            },
-            memory: crate::hardware::MemoryInfo {
-                total: 8000000000,
-                available: 4000000000,
-            },
-            disk: crate::hardware::DiskInfo {
-                total: 500000000000,
-                available: 250000000000,
-                filesystem: "ext4".to_string(),
-            },
-            network: crate::hardware::NetworkInfo {
-                interfaces: vec![
-                    crate::hardware::NetworkInterface {
-                        name: "eth0".to_string(),
-                        ip_address: "192.168.1.100".to_string(),
-                        mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
-                        interface_type: "ethernet".to_string(),
-                        is_physical: true,
-                    },
-                    crate::hardware::NetworkInterface {
-                        name: "docker0".to_string(),
-                        ip_address: "172.17.0.1".to_string(),
-                        mac_address: "02:42:ac:11:00:01".to_string(),
-                        interface_type: "bridge".to_string(),
-                        is_physical: false,
-                    },
-                ],
-                public_ip: "1.2.3.4".to_string(),
-            },
-            os: crate::hardware::OsInfo {
-                os_type: "linux".to_string(),
-                version: "22.04".to_string(),
-                distribution: "Ubuntu".to_string(),
-                kernel: "5.15.0".to_string(),
-            },
-            system_uuid: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
-            machine_id: Some("1234567890abcdef".to_string()),
-            bios_info: None,
-        };
-        
-        let components = RegistrationManager::extract_hardware_components(&hw_info);
-        
-        // Should only include physical MAC
-        assert_eq!(components.mac_addresses.len(), 1);
-        assert!(components.mac_addresses.contains("aa:bb:cc:dd:ee:ff"));
-        assert!(!components.mac_addresses.contains("02:42:ac:11:00:01"));
-        
-        assert_eq!(components.cpu_model, "Intel Core i5");
-        assert_eq!(components.system_uuid, Some("550e8400-e29b-41d4-a716-446655440000".to_string()));
-        assert_eq!(components.machine_id, Some("1234567890abcdef".to_string()));
-    }
-    
-    #[test]
-    fn test_tolerance_config() {
-        let config = HardwareToleranceConfig::default();
-        assert!(config.allow_minor_changes);
-        assert!(config.require_mac_match);
-        assert!(!config.allow_cpu_change);
-        assert_eq!(config.max_change_percentage, 0.3);
-    }
-    
-    #[tokio::test]
-    async fn test_registration_manager_creation() {
-        let manager = RegistrationManager::new("https://api.aeronyx.com");
-        assert!(manager.reference_code.is_none());
-        assert!(manager.wallet_address.is_none());
-        assert!(!manager.is_connected().await);
-        assert_eq!(manager.api_url, "https://api.aeronyx.com");
-        assert!(!manager.has_zkp_enabled());
-    }
-    
-    #[test]
-    fn test_client_message_serialization() {
-        // Test auth message
-        let auth = ClientMessage::Auth {
-            reference_code: "AERO-12345".to_string(),
-            registration_code: Some("AERO-REG123".to_string()),
-        };
-        
-        let json = serde_json::to_string(&auth).unwrap();
-        assert!(json.contains("\"type\":\"auth\""));
-        assert!(json.contains("AERO-12345"));
-        
-        // Test heartbeat message
-        let heartbeat = ClientMessage::Heartbeat {
-            status: "active".to_string(),
-            uptime_seconds: 3600,
-            metrics: WsHeartbeatMetrics {
-                cpu: 25.5,
-                mem: 45.2,
-                disk: 60.1,
-                net: 10.3,
-                temperature: Some(65.0),
-                processes: Some(150),
-            },
-        };
-        
-        let json = serde_json::to_string(&heartbeat).unwrap();
-        assert!(json.contains("\"type\":\"heartbeat\""));
-        assert!(json.contains("\"cpu\":25.5"));
-    }
-    
-    #[test]
-    fn test_server_message_deserialization() {
-        // Test connection established
-        let json = r#"{"type":"connection_established"}"#;
-        let msg: ServerMessage = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, ServerMessage::ConnectionEstablished));
-        
-        // Test auth success
-        let json = r#"{"type":"auth_success","heartbeat_interval":60}"#;
-        let msg: ServerMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            ServerMessage::AuthSuccess { heartbeat_interval, .. } => {
-                assert_eq!(heartbeat_interval, Some(60));
-            }
-            _ => panic!("Wrong message type"),
-        }
-        
-        // Test challenge request
-        let json = r#"{"type":"challenge_request","payload":{"challenge_id":"test-123","challenge":"AQID","timestamp":1234567890}}"#;
-        let msg: ServerMessage = serde_json::from_str(json).unwrap();
-        match msg {
-            ServerMessage::ChallengeRequest { payload } => {
-                assert_eq!(payload.challenge_id, "test-123");
-            }
-            _ => panic!("Wrong message type"),
-        }
-    }
-}
