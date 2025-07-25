@@ -38,6 +38,20 @@ pub enum ServerMessage {
         node_info: Option<serde_json::Value>,
     },
     
+    /// Remote command from server
+    #[serde(rename = "remote_command")]
+    RemoteCommand {
+        request_id: String,
+        command: serde_json::Value,
+        from_session: String,
+    },
+    
+    /// Remote auth message
+    #[serde(rename = "remote_auth")]
+    RemoteAuth {
+        jwt_token: String,
+    },
+    
     /// ZKP challenge request
     #[serde(rename = "challenge_request")]
     ChallengeRequest {
