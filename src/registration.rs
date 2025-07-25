@@ -971,7 +971,7 @@ use reqwest::{Client, header    }
         
         Err("Hardware change approval not yet implemented".to_string())
     }
-}
+} // End of impl RegistrationManager
 
 #[cfg(test)]
 mod tests {
