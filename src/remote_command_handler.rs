@@ -400,13 +400,13 @@ impl RemoteCommandHandler {
                     // Normal truncation for individual outputs
                     if stdout.len() > MAX_OUTPUT_SIZE {
                         stdout.truncate(MAX_OUTPUT_SIZE);
-                        stdout.push_str("\n\n[OUTPUT TRUNCATED - Exceeded 256KB limit]");
+                        stdout.push_str("\n\n[OUTPUT TRUNCATED - Exceeded 64KB limit]");
                         truncated = true;
                     }
                     
                     if stderr.len() > MAX_OUTPUT_SIZE {
                         stderr.truncate(MAX_OUTPUT_SIZE);
-                        stderr.push_str("\n\n[ERROR OUTPUT TRUNCATED - Exceeded 256KB limit]");
+                        stderr.push_str("\n\n[ERROR OUTPUT TRUNCATED - Exceeded 64KB limit]");
                         truncated = true;
                     }
                 }
@@ -415,10 +415,8 @@ impl RemoteCommandHandler {
                 if truncated {
                     let suggestions = match cmd.as_str() {
                         "ps" => {
-                            if final_args.len() > 2 && final_args[1].contains("head") {
-                                Some("Output was automatically limited to first 100 lines. For more control, try 'ps -x | grep <process_name>'")
-                            } else if args.contains(&"-x".to_string()) {
-                                Some("Try 'ps -x | grep <process_name>' to filter specific processes")
+                            if use_pipe_limit {
+                                Some("Output was truncated. For more control, try 'ps aux | head -20' or 'ps aux | grep <process_name>'")
                             } else {
                                 Some("Consider using 'ps aux | head -20' or filtering with grep")
                             }
