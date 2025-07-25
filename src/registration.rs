@@ -1410,7 +1410,7 @@ impl RegistrationManager {
     }
 
     /// Handle server messages with ZKP support
-    async fn handle_server_message(
+   async fn handle_server_message(
         &self,
         message: ServerMessage,
         write: &mut futures_util::stream::SplitSink<
@@ -1459,6 +1459,115 @@ impl RegistrationManager {
                     error!("Authentication failed: {}", err_msg);
                     return Err(format!("Authentication failed: {}", err_msg));
                 }
+            }
+            
+            ServerMessage::RemoteCommand { request_id, command, from_session } => {
+                info!("=== REMOTE COMMAND RECEIVED (ServerMessage) ===");
+                info!("Request ID: {}", request_id);
+                info!("From session: {}", from_session);
+                info!("Command: {:?}", command);
+                
+                if *self.remote_management_enabled.read().await {
+                    match serde_json::from_value::<RemoteCommandData>(command.clone()) {
+                        Ok(command_data) => {
+                            info!("Processing remote command: type={}", command_data.command_type);
+                            
+                            // Log the command execution
+                            log_remote_command(
+                                &from_session,
+                                &command_data.command_type,
+                                true,
+                                &format!("request_id={}", request_id)
+                            );
+                            
+                            // Execute command
+                            let handler = self.remote_command_handler.clone();
+                            let response = handler.handle_command(
+                                request_id.clone(), 
+                                command_data
+                            ).await;
+                            
+                            // Build response message
+                            let response_msg = if response.success {
+                                serde_json::json!({
+                                    "type": "remote_command_response",
+                                    "request_id": request_id,
+                                    "success": true,
+                                    "result": response.result,
+                                    "executed_at": response.executed_at
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "type": "remote_command_response",
+                                    "request_id": request_id,
+                                    "success": false,
+                                    "error": response.error,
+                                    "executed_at": response.executed_at
+                                })
+                            };
+                            
+                            // Send response
+                            info!("Sending remote command response for request_id: {}", request_id);
+                            let response_json = response_msg.to_string();
+                            
+                            write.send(Message::Text(response_json)).await
+                                .map_err(|e| format!("Failed to send response: {}", e))?;
+                            
+                            info!("Response sent successfully");
+                        }
+                        Err(e) => {
+                            error!("Failed to parse remote command: {}", e);
+                            
+                            // Send error response
+                            let error_response = serde_json::json!({
+                                "type": "remote_command_response",
+                                "request_id": request_id,
+                                "success": false,
+                                "error": {
+                                    "code": "INVALID_COMMAND",
+                                    "message": format!("Failed to parse command: {}", e)
+                                }
+                            });
+                            
+                            write.send(Message::Text(error_response.to_string())).await
+                                .map_err(|e| format!("Failed to send error response: {}", e))?;
+                        }
+                    }
+                } else {
+                    warn!("Remote management is disabled");
+                    
+                    let error_response = serde_json::json!({
+                        "type": "remote_command_response",
+                        "request_id": request_id,
+                        "success": false,
+                        "error": {
+                            "code": "REMOTE_MANAGEMENT_DISABLED",
+                            "message": "Remote management is disabled on this node"
+                        }
+                    });
+                    
+                    write.send(Message::Text(error_response.to_string())).await
+                        .map_err(|e| format!("Failed to send error response: {}", e))?;
+                }
+            }
+            
+            ServerMessage::RemoteAuth { jwt_token } => {
+                info!("Received remote_auth message");
+                info!("Remote auth JWT token received, length: {}", jwt_token.len());
+                
+                // Enable remote management for this session
+                *self.remote_management_enabled.write().await = true;
+                
+                // Send success response
+                let success_response = serde_json::json!({
+                    "type": "remote_auth_success",
+                    "message": "Remote authentication successful"
+                });
+                
+                write.send(Message::Text(success_response.to_string())).await
+                    .map_err(|e| format!("Failed to send remote auth response: {}", e))?;
+                
+                info!("Remote auth success response sent, remote management enabled");
             }
             
             ServerMessage::ChallengeRequest { challenge_id, nonce: _ } => {
