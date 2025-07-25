@@ -155,6 +155,24 @@ async fn run_depin_only(config: ServerConfig) -> anyhow::Result<()> {
     if config.enable_remote_management {
         info!("Remote management enabled");
         reg_manager.set_remote_management_enabled(true);
+        
+        // Set security mode based on configuration
+        use crate::remote_command_handler::SecurityMode;
+        let security_mode = match config.remote_security_mode.as_str() {
+            "full-access" => {
+                warn!("⚠️  WARNING: Remote management is in FULL ACCESS mode!");
+                warn!("⚠️  This allows unrestricted command execution and file access.");
+                warn!("⚠️  Use this mode only in trusted environments!");
+                SecurityMode::FullAccess
+            }
+            _ => {
+                info!("Remote management is in RESTRICTED mode (safer)");
+                SecurityMode::Restricted
+            }
+        };
+        
+        reg_manager.set_remote_security_mode(security_mode);
+        
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
     
@@ -338,6 +356,12 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
             info!("");
             info!("  For DePIN-only mode (recommended for compute nodes):");
             info!("    {} --mode depin-only", env!("CARGO_PKG_NAME"));
+            info!("");
+            info!("  For DePIN-only mode with remote management (restricted mode):");
+            info!("    {} --mode depin-only --enable-remote-management", env!("CARGO_PKG_NAME"));
+            info!("");
+            info!("  For DePIN-only mode with full remote access (use with caution!):");
+            info!("    {} --mode depin-only --enable-remote-management --remote-security-mode full-access", env!("CARGO_PKG_NAME"));
             info!("");
             info!("Your reference code: {}", response.node.reference_code);
             if reg_manager.has_zkp_enabled() {
