@@ -8,7 +8,6 @@ use tokio::sync::{Mutex, RwLock};
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{info, error, warn, debug};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::io::{Read, Write};
 
 /// Terminal session manager
@@ -19,13 +18,17 @@ pub struct TerminalSessionManager {
 /// Individual terminal session
 pub struct TerminalSession {
     pub session_id: String,
-    pub pty_master: Box<dyn MasterPty + Send>,
-    pub child: Box<dyn ChildKiller + Send + Sync>,
-    pub size: PtySize,
+    pub pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    pub child: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    pub size: Arc<Mutex<PtySize>>,
     pub created_at: std::time::Instant,
     reader: Arc<Mutex<Box<dyn Read + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
 }
+
+// Make TerminalSession Send + Sync safe
+unsafe impl Send for TerminalSession {}
+unsafe impl Sync for TerminalSession {}
 
 /// Terminal WebSocket message types
 #[derive(Debug, Serialize, Deserialize)]
@@ -151,16 +154,17 @@ impl TerminalSessionManager {
             .try_clone_reader()
             .map_err(|e| format!("Failed to clone reader: {}", e))?;
         
+        // Clone reader as writer (portable-pty uses the same stream for both)
         let writer = pair.master
-            .try_clone_writer()
+            .try_clone_reader()
             .map_err(|e| format!("Failed to clone writer: {}", e))?;
         
         // Create session
         let session = TerminalSession {
             session_id: session_id.clone(),
-            pty_master: pair.master,
-            child,
-            size: pty_size,
+            pty_master: Arc::new(Mutex::new(pair.master)),
+            child: Arc::new(Mutex::new(child)),
+            size: Arc::new(Mutex::new(pty_size)),
             created_at: std::time::Instant::now(),
             reader: Arc::new(Mutex::new(reader)),
             writer: Arc::new(Mutex::new(writer)),
@@ -226,8 +230,8 @@ impl TerminalSessionManager {
         rows: u16,
         cols: u16,
     ) -> Result<(), String> {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions.get_mut(session_id)
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(session_id)
             .ok_or_else(|| "Session not found".to_string())?;
         
         let new_size = PtySize {
@@ -237,11 +241,13 @@ impl TerminalSessionManager {
             pixel_height: 0,
         };
         
-        session.pty_master
+        let mut pty_master = session.pty_master.lock().await;
+        pty_master
             .resize(new_size)
             .map_err(|e| format!("Failed to resize terminal: {}", e))?;
         
-        session.size = new_size;
+        let mut size = session.size.lock().await;
+        *size = new_size;
         
         debug!("Terminal {} resized to {}x{}", session_id, cols, rows);
         Ok(())
@@ -251,9 +257,10 @@ impl TerminalSessionManager {
     pub async fn close_session(&self, session_id: &str) -> Result<(), String> {
         let mut sessions = self.sessions.write().await;
         
-        if let Some(mut session) = sessions.remove(session_id) {
+        if let Some(session) = sessions.remove(session_id) {
             // Kill the child process
-            if let Err(e) = session.child.kill() {
+            let mut child = session.child.lock().await;
+            if let Err(e) = child.kill() {
                 warn!("Failed to kill terminal process: {}", e);
             }
             
@@ -266,20 +273,21 @@ impl TerminalSessionManager {
     
     /// Clean up stale sessions
     pub async fn cleanup_stale_sessions(&self, max_age: std::time::Duration) {
-        let mut sessions = self.sessions.write().await;
-        let now = std::time::Instant::now();
+        let sessions_to_remove = {
+            let sessions = self.sessions.read().await;
+            let now = std::time::Instant::now();
+            
+            sessions
+                .iter()
+                .filter(|(_, session)| now.duration_since(session.created_at) > max_age)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        };
         
-        let stale_sessions: Vec<String> = sessions
-            .iter()
-            .filter(|(_, session)| now.duration_since(session.created_at) > max_age)
-            .map(|(id, _)| id.clone())
-            .collect();
-        
-        for session_id in stale_sessions {
-            if let Some(mut session) = sessions.remove(&session_id) {
-                if let Err(e) = session.child.kill() {
-                    warn!("Failed to kill stale terminal process: {}", e);
-                }
+        for session_id in sessions_to_remove {
+            if let Err(e) = self.close_session(&session_id).await {
+                warn!("Failed to close stale session {}: {}", session_id, e);
+            } else {
                 info!("Cleaned up stale terminal session: {}", session_id);
             }
         }
@@ -293,7 +301,7 @@ impl TerminalSessionManager {
 
 /// Handle terminal WebSocket messages
 pub async fn handle_terminal_message(
-    manager: &TerminalSessionManager,
+    manager: &Arc<TerminalSessionManager>,
     message: TerminalMessage,
 ) -> Result<Option<TerminalMessage>, String> {
     match message {
