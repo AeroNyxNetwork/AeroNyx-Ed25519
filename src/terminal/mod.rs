@@ -2,7 +2,7 @@
 // AeroNyx Privacy Network - Web Terminal Implementation
 // Version: 1.0.1 - Thread-Safe
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize, MasterPty, ChildKiller};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize, MasterPty, ChildKiller, PtyPair};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use std::collections::HashMap;
