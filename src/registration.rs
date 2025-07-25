@@ -275,9 +275,66 @@ impl RegistrationManager {
                 warn!("Failed to build custom HTTP client: {}, using default", e);
                 Client::new()
             });
-        let remote_config = RemoteCommandConfig::default();
-        let remote_command_handler = Arc::new(RemoteCommandHandler::new(remote_config));
         
+        // Configure remote command handler with more permissive defaults
+        let mut remote_config = RemoteCommandConfig::default();
+        remote_config.allowed_paths = vec![
+            PathBuf::from("/"),
+            PathBuf::from("/home"),
+            PathBuf::from("/var"),
+            PathBuf::from("/var/log"),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/etc"),
+            PathBuf::from("/usr"),
+            PathBuf::from("/opt"),
+            PathBuf::from("/root"),  // Allow root home for admin access
+        ];
+        
+        // Expand command whitelist
+        remote_config.command_whitelist = vec![
+            "ls".to_string(),
+            "cat".to_string(),
+            "grep".to_string(),
+            "tail".to_string(),
+            "head".to_string(),
+            "ps".to_string(),
+            "df".to_string(),
+            "du".to_string(),
+            "free".to_string(),
+            "uptime".to_string(),
+            "whoami".to_string(),
+            "pwd".to_string(),
+            "echo".to_string(),
+            "date".to_string(),
+            "hostname".to_string(),
+            "uname".to_string(),
+            "which".to_string(),
+            "wc".to_string(),
+            "sort".to_string(),
+            "uniq".to_string(),
+            "find".to_string(),
+            "stat".to_string(),
+            "file".to_string(),
+            "id".to_string(),
+            "env".to_string(),
+            "top".to_string(),
+            "htop".to_string(),
+            "netstat".to_string(),
+            "ss".to_string(),
+            "ip".to_string(),
+            "ifconfig".to_string(),
+            "journalctl".to_string(),
+            "systemctl".to_string(),
+            "service".to_string(),
+        ];
+        
+        // Disable whitelist by default for more flexibility
+        remote_config.enable_command_whitelist = false;
+        
+        // Increase command timeout for slower operations
+        remote_config.command_timeout = Duration::from_secs(60);
+        
+        let remote_command_handler = Arc::new(RemoteCommandHandler::new(remote_config));
 
         Self {
             client,
@@ -366,20 +423,56 @@ impl RegistrationManager {
                             if let Some(commitment) = stored_reg.hardware_commitment {
                                 info!("ZKP commitment found: {}...", &commitment[..16.min(commitment.len())]);
                             }
-
-                            if let Some(handler) = Arc::get_mut(&mut self.remote_command_handler) {
-          
-                      
-                                let mut remote_config = RemoteCommandConfig::default();
-                                remote_config.working_dir = config.data_dir.clone();
-                                remote_config.allowed_paths = vec![
-                                    config.data_dir.clone(),
-                                    PathBuf::from("/var/log/aeronyx"),
-                                    PathBuf::from("/tmp"),
-                                ];
-                                
-                                self.remote_command_handler = Arc::new(RemoteCommandHandler::new(remote_config));
-                            }
+    
+                            // Configure remote command handler with appropriate paths
+                            let mut remote_config = RemoteCommandConfig::default();
+                            remote_config.working_dir = config.data_dir.clone();
+                            remote_config.allowed_paths = vec![
+                                PathBuf::from("/"),              // Allow root for listing
+                                PathBuf::from("/home"),
+                                PathBuf::from("/var"),
+                                PathBuf::from("/var/log"),
+                                PathBuf::from("/var/log/aeronyx"),
+                                PathBuf::from("/tmp"),
+                                PathBuf::from("/etc"),           // For reading config files
+                                PathBuf::from("/usr"),           // For system commands
+                                PathBuf::from("/opt"),           // For optional software
+                                config.data_dir.clone(),         // The node's data directory
+                            ];
+                            
+                            // Add more permissive command whitelist for remote management
+                            remote_config.command_whitelist = vec![
+                                "ls".to_string(),
+                                "cat".to_string(),
+                                "grep".to_string(),
+                                "tail".to_string(),
+                                "head".to_string(),
+                                "ps".to_string(),
+                                "df".to_string(),
+                                "du".to_string(),
+                                "free".to_string(),
+                                "uptime".to_string(),
+                                "whoami".to_string(),
+                                "pwd".to_string(),
+                                "echo".to_string(),
+                                "date".to_string(),
+                                "hostname".to_string(),
+                                "uname".to_string(),
+                                "which".to_string(),
+                                "wc".to_string(),
+                                "sort".to_string(),
+                                "uniq".to_string(),
+                                "find".to_string(),
+                                "stat".to_string(),
+                                "file".to_string(),
+                                "id".to_string(),
+                                "env".to_string(),
+                            ];
+                            
+                            // Don't enable whitelist by default (allow all safe commands)
+                            remote_config.enable_command_whitelist = false;
+                            
+                            self.remote_command_handler = Arc::new(RemoteCommandHandler::new(remote_config));
                             
                             return Ok(true);
                         }
@@ -414,6 +507,23 @@ impl RegistrationManager {
         
         if loaded_from_config {
             warn!("Using legacy configuration format. Please re-register for full functionality.");
+            
+            // Still need to configure remote command handler for legacy configs
+            let mut remote_config = RemoteCommandConfig::default();
+            remote_config.working_dir = config.data_dir.clone();
+            remote_config.allowed_paths = vec![
+                PathBuf::from("/"),
+                PathBuf::from("/home"),
+                PathBuf::from("/var"),
+                PathBuf::from("/tmp"),
+                PathBuf::from("/etc"),
+                PathBuf::from("/usr"),
+                PathBuf::from("/opt"),
+                config.data_dir.clone(),
+            ];
+            remote_config.enable_command_whitelist = false;
+            
+            self.remote_command_handler = Arc::new(RemoteCommandHandler::new(remote_config));
         }
         
         let has_minimum = self.reference_code.is_some();
@@ -421,7 +531,6 @@ impl RegistrationManager {
         
         Ok(has_minimum)
     }
-
     /// Verify hardware fingerprint with tolerance for minor changes
     pub async fn verify_hardware_fingerprint(&self) -> Result<(), String> {
         if let Some(stored_fingerprint) = &self.hardware_fingerprint {
