@@ -30,7 +30,7 @@ use std::fs;
 use std::collections::HashSet;
 use crate::zkp_halo2::{generate_hardware_proof, verify_hardware_proof, SetupParams, Proof};
 use crate::websocket_protocol::{
-    ServerMessage, ClientMessage, ProofData,
+    ServerMessage, ProofData,
     AttestationVerifyRequest,
 };
 
