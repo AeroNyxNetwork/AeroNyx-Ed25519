@@ -262,6 +262,15 @@ impl RegistrationManager {
                                 "file".to_string(),
                                 "id".to_string(),
                                 "env".to_string(),
+                                "top".to_string(),
+                                "htop".to_string(),
+                                "iotop".to_string(),
+                                "netstat".to_string(),
+                                "ss".to_string(),
+                                "lsof".to_string(),
+                                "kill".to_string(),
+                                "killall".to_string(),
+                                "pkill".to_string(),
                             ];
                             
                             // Don't enable whitelist by default (allow all safe commands)
