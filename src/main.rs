@@ -20,6 +20,7 @@ mod remote_management;
 mod zkp_halo2;
 mod websocket_protocol;
 mod remote_command_handler;
+mod terminal;
 
 use zkp_halo2::{initialize, SetupParams};
 use config::settings::{ServerConfig, ServerArgs, Command, NodeMode};
