@@ -1099,10 +1099,18 @@ impl RegistrationManager {
                 Some(message) = read.next() => {
                     match message {
                         Ok(Message::Text(text)) => {
-                            debug!("Received WebSocket message: {}", text);
+                            // Add debug logging for ALL messages
+                            info!("=== WEBSOCKET MESSAGE RECEIVED ===");
+                            info!("Raw message: {}", if text.len() > 500 { 
+                                format!("{}... (truncated, total length: {})", &text[..500], text.len()) 
+                            } else { 
+                                text.clone() 
+                            });
                             
                             // First try to parse as structured ServerMessage
                             let handled = if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
+                                info!("Parsed as ServerMessage");
+                                
                                 // Check if this is a heartbeat ack before handling
                                 let is_heartbeat_ack = matches!(server_msg, ServerMessage::HeartbeatAck { .. });
                                 
@@ -1128,6 +1136,8 @@ impl RegistrationManager {
                             if !handled {
                                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                                     if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
+                                        info!("Processing generic message type: {}", msg_type);
+                                        
                                         match msg_type {
                                             "connected" | "connection_established" => {
                                                 info!("Received connection confirmation from server");
@@ -1180,7 +1190,7 @@ impl RegistrationManager {
                                             
                                             "heartbeat_ack" | "heartbeat_response" => {
                                                 debug!("Heartbeat acknowledged");
-                                                last_heartbeat_ack = std::time::Instant::now(); // THIS IS THE KEY LINE!
+                                                last_heartbeat_ack = std::time::Instant::now();
                                             }
                                             
                                             "challenge_request" | "CHALLENGE_REQUEST" => {
@@ -1203,6 +1213,37 @@ impl RegistrationManager {
                                                 }
                                             }
                                             
+                                            "remote_command" => {
+                                                info!("=== REMOTE COMMAND DETECTED ===");
+                                                info!("Full remote command JSON: {}", serde_json::to_string_pretty(&json).unwrap_or_default());
+                                                
+                                                // Call the existing handler
+                                                if let Err(e) = self.handle_websocket_message(
+                                                    &text,
+                                                    &mut write,
+                                                    &mut authenticated,
+                                                    &mut heartbeat_interval,
+                                                    &mut last_heartbeat_ack
+                                                ).await {
+                                                    error!("Failed to handle remote command: {}", e);
+                                                }
+                                            }
+                                            
+                                            "remote_auth" => {
+                                                info!("=== REMOTE AUTH DETECTED ===");
+                                                
+                                                // Also handle remote_auth through the legacy handler
+                                                if let Err(e) = self.handle_websocket_message(
+                                                    &text,
+                                                    &mut write,
+                                                    &mut authenticated,
+                                                    &mut heartbeat_interval,
+                                                    &mut last_heartbeat_ack
+                                                ).await {
+                                                    error!("Failed to handle remote auth: {}", e);
+                                                }
+                                            }
+                                            
                                             "error" => {
                                                 let error_code = json.get("error_code")
                                                     .and_then(|c| c.as_str())
@@ -1221,7 +1262,18 @@ impl RegistrationManager {
                                             }
                                             
                                             _ => {
-                                                debug!("Unhandled message type: {}", msg_type);
+                                                info!("Unhandled message type: {}, trying legacy handler", msg_type);
+                                                
+                                                // For any other message type, try the legacy handler
+                                                if let Err(e) = self.handle_websocket_message(
+                                                    &text,
+                                                    &mut write,
+                                                    &mut authenticated,
+                                                    &mut heartbeat_interval,
+                                                    &mut last_heartbeat_ack
+                                                ).await {
+                                                    error!("Legacy handler failed: {}", e);
+                                                }
                                             }
                                         }
                                     } else {
@@ -1264,6 +1316,10 @@ impl RegistrationManager {
                             break;
                         }
                         
+                        // Log remote management status with heartbeat
+                        let remote_enabled = *self.remote_management_enabled.read().await;
+                        info!("Sending heartbeat - Remote management enabled: {}", remote_enabled);
+                        
                         // Send heartbeat in simple format
                         let heartbeat = serde_json::json!({
                             "type": "heartbeat",
@@ -1275,7 +1331,6 @@ impl RegistrationManager {
                             }
                         });
                         
-                        debug!("Sending heartbeat");
                         if let Err(e) = write.send(Message::Text(heartbeat.to_string())).await {
                             error!("Failed to send heartbeat: {}", e);
                             break;
