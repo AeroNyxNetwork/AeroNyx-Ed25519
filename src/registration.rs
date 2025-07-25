@@ -2406,7 +2406,7 @@ pub struct RegistrationManager {
         
         Err("Hardware change approval not yet implemented".to_string())
     }
-}
+
 
 #[cfg(test)]
 mod tests {
