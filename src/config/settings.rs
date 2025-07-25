@@ -1,4 +1,4 @@
-// Modified src/config/settings.rs
+// src/config/settings.rs
 //! Server configuration settings.
 //!
 //! This module contains the server configuration structures and
@@ -169,6 +169,10 @@ pub struct ServerArgs {
     #[clap(long)]
     pub enable_remote_management: bool,
     
+    /// Remote management security mode (full-access or restricted)
+    #[clap(long, default_value = "restricted", help = "Security mode for remote commands: 'restricted' (default) or 'full-access' (use with caution!)")]
+    pub remote_security_mode: String,
+    
     /// Registration setup command
     #[clap(subcommand)]
     pub command: Option<Command>,
@@ -239,9 +243,17 @@ pub struct ServerConfig {
     #[serde(default)]
     pub enable_remote_management: bool,
     
+    /// Remote management security mode
+    #[serde(default = "default_security_mode")]
+    pub remote_security_mode: String,
+    
     /// Key manager for server keys
     #[serde(skip)]
     pub key_manager: Option<Arc<KeyManager>>,
+}
+
+fn default_security_mode() -> String {
+    "restricted".to_string()
 }
 
 impl ServerConfig {
@@ -299,6 +311,10 @@ impl ServerConfig {
                 if wallet_address.is_some() {
                     config.wallet_address = wallet_address;
                 }
+                
+                // Override remote management settings
+                config.enable_remote_management = args.enable_remote_management;
+                config.remote_security_mode = args.remote_security_mode;
                 
                 // Validate the config
                 config.validate()?;
@@ -361,6 +377,7 @@ impl ServerConfig {
             wallet_address,
             api_url: args.api_url,
             enable_remote_management: args.enable_remote_management,
+            remote_security_mode: args.remote_security_mode,
             key_manager: None,
         };
         
@@ -417,6 +434,15 @@ impl ServerConfig {
             return Err(ConfigError::Invalid(
                 "Session timeout must be at least 300 seconds".to_string()
             ));
+        }
+        
+        // Validate remote security mode
+        match self.remote_security_mode.as_str() {
+            "restricted" | "full-access" => (), // Valid modes
+            _ => return Err(ConfigError::Invalid(format!(
+                "Invalid remote security mode: {}. Must be 'restricted' or 'full-access'", 
+                self.remote_security_mode
+            ))),
         }
         
         Ok(())
@@ -508,6 +534,7 @@ mod tests {
             wallet_address: None,
             api_url: "https://api.aeronyx.network".to_string(),
             enable_remote_management: false,
+            remote_security_mode: "restricted".to_string(),
             key_manager: None,
         };
         
@@ -537,6 +564,7 @@ mod tests {
             wallet_address: None,
             api_url: "https://api.aeronyx.network".to_string(),
             enable_remote_management: false,
+            remote_security_mode: "restricted".to_string(),
             key_manager: None,
         };
         
@@ -570,6 +598,7 @@ mod tests {
             wallet_address: None,
             api_url: "https://api.aeronyx.network".to_string(),
             enable_remote_management: false,
+            remote_security_mode: "restricted".to_string(),
             key_manager: None,
         };
         
@@ -597,5 +626,43 @@ mod tests {
         
         #[cfg(not(target_os = "windows"))]
         assert_eq!(default_dir, PathBuf::from("/var/lib/aeronyx"));
+    }
+    
+    #[test]
+    fn test_security_mode_validation() {
+        let mut config = ServerConfig {
+            mode: NodeMode::DePINOnly,
+            listen_addr: "127.0.0.1:8080".parse().unwrap(),
+            tun_name: "tun0".to_string(),
+            subnet: "10.7.0.0/24".to_string(),
+            cert_file: PathBuf::from("dummy.crt"),
+            key_file: PathBuf::from("dummy.key"),
+            acl_file: PathBuf::from("acl.json"),
+            enable_obfuscation: false,
+            obfuscation_method: "xor".to_string(),
+            enable_padding: false,
+            key_rotation_interval: Duration::from_secs(3600),
+            session_timeout: Duration::from_secs(86400),
+            max_connections_per_ip: 10,
+            data_dir: PathBuf::from("/tmp"),
+            server_key_file: PathBuf::from("/tmp/server_key.json"),
+            registration_code: None,
+            registration_reference_code: None,
+            wallet_address: None,
+            api_url: "https://api.aeronyx.network".to_string(),
+            enable_remote_management: true,
+            remote_security_mode: "invalid-mode".to_string(),
+            key_manager: None,
+        };
+        
+        // Test invalid security mode
+        assert!(config.validate().is_err());
+        
+        // Test valid security modes
+        config.remote_security_mode = "restricted".to_string();
+        assert!(config.validate().is_ok());
+        
+        config.remote_security_mode = "full-access".to_string();
+        assert!(config.validate().is_ok());
     }
 }
