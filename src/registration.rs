@@ -271,6 +271,8 @@ impl RegistrationManager {
                                 "kill".to_string(),
                                 "killall".to_string(),
                                 "pkill".to_string(),
+                                "sh".to_string(),
+                                "bash".to_string(),
                             ];
                             
                             // Don't enable whitelist by default (allow all safe commands)
