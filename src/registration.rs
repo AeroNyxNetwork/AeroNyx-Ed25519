@@ -2783,6 +2783,7 @@ impl RegistrationManager {
             Ok(())
         }
     }
+
     /// Handle ZKP challenge
     async fn handle_zkp_challenge(
         &self,
