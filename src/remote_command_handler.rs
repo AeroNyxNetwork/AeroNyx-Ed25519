@@ -786,7 +786,6 @@ impl RemoteCommandHandler {
             details,
         }
     }
-}
 
 /// Log remote command execution
 pub fn log_remote_command(
