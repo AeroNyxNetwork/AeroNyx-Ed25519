@@ -263,7 +263,7 @@ impl RemoteCommandHandler {
         self.config.command_whitelist.contains(&cmd.to_string())
     }
 
-    /// Execute system command
+    /// Execute system command with restrictions
     async fn handle_execute(&self, command: RemoteCommandData) -> Result<serde_json::Value, RemoteCommandError> {
         let cmd = command.cmd.ok_or_else(|| {
             self.create_error("INVALID_COMMAND", "Missing 'cmd' field".to_string(), None)
@@ -290,7 +290,43 @@ impl RemoteCommandHandler {
         // Prepare command
         let mut process = Command::new(&cmd);
         
-        if let Some(args) = command.args {
+        // Handle special cases for interactive commands
+        let mut args = command.args.unwrap_or_default();
+        match cmd.as_str() {
+            "top" => {
+                // Force batch mode for top
+                if !args.contains(&"-b".to_string()) {
+                    args.insert(0, "-b".to_string());
+                }
+                // Limit iterations
+                if !args.iter().any(|arg| arg.starts_with("-n")) {
+                    args.push("-n".to_string());
+                    args.push("1".to_string());
+                }
+            }
+            "ps" => {
+                // If no args provided, use sensible defaults
+                if args.is_empty() {
+                    args.push("aux".to_string());
+                }
+                // For -x flag which shows all user processes, limit output by default
+                else if args.contains(&"-x".to_string()) && !args.iter().any(|arg| arg.contains("head") || arg.contains("grep")) {
+                    // Add a note about truncation
+                    warn!("ps -x typically produces large output, results will be truncated");
+                }
+            }
+            "htop" => {
+                // htop doesn't have a good batch mode, suggest using top instead
+                return Err(self.create_error(
+                    "UNSUPPORTED_COMMAND",
+                    "htop is interactive only. Use 'top -b -n 1' instead".to_string(),
+                    None,
+                ));
+            }
+            _ => {}
+        }
+        
+        if !args.is_empty() {
             process.args(&args);
         }
     
@@ -326,24 +362,72 @@ impl RemoteCommandHandler {
                 let mut truncated = false;
                 
                 // Check output size and truncate if necessary
-                const MAX_OUTPUT_SIZE: usize = 1024 * 1024; // 1MB limit per output
+                const MAX_OUTPUT_SIZE: usize = 256 * 1024; // 256KB limit per output (further reduced)
+                const MAX_TOTAL_SIZE: usize = 400 * 1024; // 400KB total limit
                 
-                if stdout.len() > MAX_OUTPUT_SIZE {
-                    stdout.truncate(MAX_OUTPUT_SIZE);
-                    stdout.push_str("\n\n[OUTPUT TRUNCATED - Exceeded 1MB limit]");
-                    truncated = true;
-                }
-                
-                if stderr.len() > MAX_OUTPUT_SIZE {
-                    stderr.truncate(MAX_OUTPUT_SIZE);
-                    stderr.push_str("\n\n[ERROR OUTPUT TRUNCATED - Exceeded 1MB limit]");
-                    truncated = true;
-                }
-                
-                // For very large outputs, provide summary information
+                // First check total size
                 let total_output_size = output.stdout.len() + output.stderr.len();
                 
-                Ok(serde_json::json!({
+                if total_output_size > MAX_TOTAL_SIZE {
+                    // For very large outputs, provide a summary and truncate aggressively
+                    info!("Large command output: {} bytes total, truncating to fit message limit", total_output_size);
+                    
+                    // Calculate proportional sizes
+                    let stdout_ratio = output.stdout.len() as f64 / total_output_size as f64;
+                    let stderr_ratio = output.stderr.len() as f64 / total_output_size as f64;
+                    
+                    let stdout_limit = (MAX_TOTAL_SIZE as f64 * stdout_ratio * 0.9) as usize;
+                    let stderr_limit = (MAX_TOTAL_SIZE as f64 * stderr_ratio * 0.9) as usize;
+                    
+                    if output.stdout.len() > stdout_limit {
+                        stdout.truncate(stdout_limit);
+                        stdout.push_str(&format!("\n\n[OUTPUT TRUNCATED - Original size: {} bytes]", output.stdout.len()));
+                        truncated = true;
+                    }
+                    
+                    if output.stderr.len() > stderr_limit {
+                        stderr.truncate(stderr_limit);
+                        stderr.push_str(&format!("\n\n[ERROR OUTPUT TRUNCATED - Original size: {} bytes]", output.stderr.len()));
+                        truncated = true;
+                    }
+                } else {
+                    // Normal truncation for individual outputs
+                    if stdout.len() > MAX_OUTPUT_SIZE {
+                        stdout.truncate(MAX_OUTPUT_SIZE);
+                        stdout.push_str("\n\n[OUTPUT TRUNCATED - Exceeded 256KB limit]");
+                        truncated = true;
+                    }
+                    
+                    if stderr.len() > MAX_OUTPUT_SIZE {
+                        stderr.truncate(MAX_OUTPUT_SIZE);
+                        stderr.push_str("\n\n[ERROR OUTPUT TRUNCATED - Exceeded 256KB limit]");
+                        truncated = true;
+                    }
+                }
+                
+                // Additional suggestions for large outputs
+                if truncated {
+                    let suggestions = match cmd.as_str() {
+                        "ps" => {
+                            if args.contains(&"-x".to_string()) {
+                                Some("Try 'ps -x | grep <process_name>' to filter specific processes, or 'ps -x | head -20' for first 20 lines")
+                            } else {
+                                Some("Consider using 'ps aux | head -20' or filtering with grep")
+                            }
+                        }
+                        "top" => Some("Output captured from single iteration. Use 'top -b -n 1 | head -30' for less output"),
+                        "find" => Some("Consider adding '-maxdepth 2' or piping to 'head -50'"),
+                        "ls" => Some("Try 'ls | head -50' or use more specific paths"),
+                        "cat" => Some("For large files, use 'head -100' or 'tail -100' instead"),
+                        _ => Some("Consider using pipes with 'head', 'tail', or 'grep' to limit output"),
+                    };
+                    
+                    if let Some(suggestion) = suggestions {
+                        stderr.push_str(&format!("\n\nSuggestion: {}", suggestion));
+                    }
+                }
+                
+                let mut response_json = serde_json::json!({
                     "stdout": stdout,
                     "stderr": stderr,
                     "exit_code": output.status.code().unwrap_or(-1),
@@ -352,7 +436,19 @@ impl RemoteCommandHandler {
                     "original_stdout_size": output.stdout.len(),
                     "original_stderr_size": output.stderr.len(),
                     "total_output_size": total_output_size,
-                }))
+                });
+                
+                // Add command alternatives if output was truncated
+                if truncated {
+                    if let Some(alternatives) = self.get_command_alternatives(&cmd, &args) {
+                        response_json["alternatives"] = serde_json::json!(alternatives);
+                        response_json["message"] = serde_json::json!(
+                            "Output was truncated due to size limits. Try one of the suggested alternatives."
+                        );
+                    }
+                }
+                
+                Ok(response_json)
             }
             Ok(Err(e)) => Err(self.create_error(
                 "SYSTEM_ERROR",
@@ -766,6 +862,47 @@ impl RemoteCommandHandler {
             "cpu_percent": 0.0, // Would need more complex calculation
             "memory_mb": memory_mb,
         }))
+    }
+
+    /// Get command alternatives for large output commands
+    fn get_command_alternatives(&self, cmd: &str, args: &[String]) -> Option<Vec<String>> {
+        match cmd {
+            "ps" => {
+                if args.contains(&"-x".to_string()) {
+                    Some(vec![
+                        "ps -x | head -20  # Show first 20 processes".to_string(),
+                        "ps -x | grep <name>  # Filter by process name".to_string(),
+                        "ps -xo pid,comm,pcpu,pmem | head -20  # Show specific columns".to_string(),
+                    ])
+                } else if args.contains(&"aux".to_string()) {
+                    Some(vec![
+                        "ps aux | head -20  # Show first 20 processes".to_string(),
+                        "ps aux | grep <name>  # Filter by process name".to_string(),
+                        "ps aux --sort=-pcpu | head -10  # Top 10 by CPU usage".to_string(),
+                        "ps aux --sort=-pmem | head -10  # Top 10 by memory usage".to_string(),
+                    ])
+                } else {
+                    None
+                }
+            }
+            "top" => Some(vec![
+                "top -b -n 1 | head -30  # Show first 30 lines".to_string(),
+                "top -b -n 1 -o %CPU | head -20  # Sort by CPU usage".to_string(),
+                "top -b -n 1 -o %MEM | head -20  # Sort by memory usage".to_string(),
+            ]),
+            "ls" => {
+                if args.iter().any(|arg| arg == "-la" || arg == "-lR") {
+                    Some(vec![
+                        "ls -la | head -50  # Show first 50 files".to_string(),
+                        "ls -la | grep <pattern>  # Filter by name".to_string(),
+                        "find . -maxdepth 1 -ls  # Alternative with size limits".to_string(),
+                    ])
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Check if command is forbidden
