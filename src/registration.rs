@@ -47,6 +47,7 @@ use crate::remote_command_handler::{
     SecurityMode,
     log_remote_command
 };
+use crate::terminal::TerminalSessionManager;
 
 /// Main registration manager handling node lifecycle
 #[derive(Clone)]
@@ -83,6 +84,8 @@ pub struct RegistrationManager {
     remote_command_handler: Arc<RemoteCommandHandler>,
     /// Remote management enabled flag
     remote_management_enabled: Arc<RwLock<bool>>,
+    /// Terminal session manager
+    terminal_manager: Arc<TerminalSessionManager>,
 }
 
 impl RegistrationManager {
@@ -121,6 +124,7 @@ impl RegistrationManager {
             hardware_info: None,
             remote_command_handler,
             remote_management_enabled: Arc::new(RwLock::new(false)),
+            terminal_manager: Arc::new(TerminalSessionManager::new()),
         }
     }
     
@@ -657,6 +661,11 @@ impl RegistrationManager {
         self.start_time.elapsed().as_secs()
     }
 
+    /// Get terminal manager
+    pub fn get_terminal_manager(&self) -> Arc<TerminalSessionManager> {
+        self.terminal_manager.clone()
+    }
+    
     /// Request hardware change approval (for future implementation)
     pub async fn request_hardware_change_approval(&self, reason: &str) -> Result<(), String> {
         info!("Requesting hardware change approval: {}", reason);
