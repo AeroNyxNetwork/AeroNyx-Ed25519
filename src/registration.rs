@@ -1159,6 +1159,191 @@ mod tests {
 }
 
 // Re-export the ClientMessage type for external use
+pub use crate::websocket_protocol::ClientMessage;
+    use super::*;
+    
+    #[test]
+    fn test_websocket_message_serialization() {
+        // Test auth message
+        let auth = WebSocketMessage::Auth {
+            reference_code: "AERO-12345".to_string(),
+            registration_code: Some("AERO-REG123".to_string()),
+        };
+        
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains("\"type\":\"auth\""));
+        assert!(json.contains("AERO-12345"));
+        assert!(json.contains("AERO-REG123"));
+        
+        // Test heartbeat message
+        let heartbeat = WebSocketMessage::Heartbeat {
+            status: "active".to_string(),
+            uptime_seconds: 3600,
+            metrics: LegacyHeartbeatMetrics {
+                cpu: 25.5,
+                mem: 45.2,
+                disk: 60.1,
+                net: 10.3,
+                temperature: Some(65.0),
+                processes: Some(150),
+            },
+        };
+        
+        let json = serde_json::to_string(&heartbeat).unwrap();
+        assert!(json.contains("\"type\":\"heartbeat\""));
+        assert!(json.contains("\"cpu\":25.5"));
+        assert!(json.contains("\"temperature\":65.0"));
+        
+        // Test ZKP attestation message
+        let attestation = WebSocketMessage::HardwareAttestationProof {
+            commitment: "abc123".to_string(),
+            proof: vec![1, 2, 3, 4],
+            nonce: "nonce123".to_string(),
+        };
+        
+        let json = serde_json::to_string(&attestation).unwrap();
+        assert!(json.contains("\"type\":\"hardware_attestation_proof\""));
+        assert!(json.contains("\"commitment\":\"abc123\""));
+    }
+    
+    #[test]
+    fn test_hardware_components_extraction() {
+        let hw_info = HardwareInfo {
+            hostname: "test-node".to_string(),
+            cpu: crate::hardware::CpuInfo {
+                cores: 4,
+                model: "Intel Core i5".to_string(),
+                frequency: 2400000000,
+                architecture: "x86_64".to_string(),
+                vendor_id: Some("GenuineIntel".to_string()),
+            },
+            memory: crate::hardware::MemoryInfo {
+                total: 8000000000,
+                available: 4000000000,
+            },
+            disk: crate::hardware::DiskInfo {
+                total: 500000000000,
+                available: 250000000000,
+                filesystem: "ext4".to_string(),
+            },
+            network: crate::hardware::NetworkInfo {
+                interfaces: vec![
+                    crate::hardware::NetworkInterface {
+                        name: "eth0".to_string(),
+                        ip_address: "192.168.1.100".to_string(),
+                        mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                        interface_type: "ethernet".to_string(),
+                        is_physical: true,
+                    },
+                    crate::hardware::NetworkInterface {
+                        name: "docker0".to_string(),
+                        ip_address: "172.17.0.1".to_string(),
+                        mac_address: "02:42:ac:11:00:01".to_string(),
+                        interface_type: "bridge".to_string(),
+                        is_physical: false,
+                    },
+                ],
+                public_ip: "1.2.3.4".to_string(),
+            },
+            os: crate::hardware::OsInfo {
+                os_type: "linux".to_string(),
+                version: "22.04".to_string(),
+                distribution: "Ubuntu".to_string(),
+                kernel: "5.15.0".to_string(),
+            },
+            system_uuid: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
+            machine_id: Some("1234567890abcdef".to_string()),
+            bios_info: None,
+        };
+        
+        let components = RegistrationManager::extract_hardware_components(&hw_info);
+        
+        // Should only include physical MAC
+        assert_eq!(components.mac_addresses.len(), 1);
+        assert!(components.mac_addresses.contains("aa:bb:cc:dd:ee:ff"));
+        assert!(!components.mac_addresses.contains("02:42:ac:11:00:01"));
+        
+        assert_eq!(components.cpu_model, "Intel Core i5");
+        assert_eq!(components.system_uuid, Some("550e8400-e29b-41d4-a716-446655440000".to_string()));
+        assert_eq!(components.machine_id, Some("1234567890abcdef".to_string()));
+    }
+    
+    #[test]
+    fn test_tolerance_config() {
+        let config = HardwareToleranceConfig::default();
+        assert!(config.allow_minor_changes);
+        assert!(config.require_mac_match);
+        assert!(!config.allow_cpu_change);
+        assert_eq!(config.max_change_percentage, 0.3);
+    }
+    
+    #[tokio::test]
+    async fn test_registration_manager_creation() {
+        let manager = RegistrationManager::new("https://api.aeronyx.com");
+        assert!(manager.reference_code.is_none());
+        assert!(manager.wallet_address.is_none());
+        assert!(!manager.is_connected().await);
+        assert_eq!(manager.api_url, "https://api.aeronyx.com");
+        assert!(!manager.has_zkp_enabled());
+    }
+    
+    #[test]
+    fn test_client_message_serialization() {
+        // Test auth message
+        let auth = ClientMessage::Auth {
+            code: "AERO-12345".to_string(),
+        };
+        
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains("\"type\":\"auth\""));
+        assert!(json.contains("AERO-12345"));
+        
+        // Test heartbeat message
+        let heartbeat = ClientMessage::Heartbeat {
+            metrics: WsHeartbeatMetrics {
+                cpu: 25.5,
+                memory: 45.2,
+                disk: 60.1,
+                network: 10.3,
+            },
+            timestamp: Some(1234567890),
+        };
+        
+        let json = serde_json::to_string(&heartbeat).unwrap();
+        assert!(json.contains("\"type\":\"heartbeat\""));
+        assert!(json.contains("\"cpu\":25.5"));
+    }
+    
+    #[test]
+    fn test_server_message_deserialization() {
+        // Test connection established
+        let json = r#"{"type":"connection_established"}"#;
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, ServerMessage::ConnectionEstablished));
+        
+        // Test auth success
+        let json = r#"{"type":"auth_success","heartbeat_interval":60}"#;
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ServerMessage::AuthSuccess { heartbeat_interval, .. } => {
+                assert_eq!(heartbeat_interval, Some(60));
+            }
+            _ => panic!("Wrong message type"),
+        }
+        
+        // Test challenge request
+        let json = r#"{"type":"challenge_request","challenge_id":"test-123"}"#;
+        let msg: ServerMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ServerMessage::ChallengeRequest { challenge_id, .. } => {
+                assert_eq!(challenge_id, "test-123");
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+}
+
+// Re-export the ClientMessage type for external use
 pub use crate::websocket_protocol::ClientMessage;;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
