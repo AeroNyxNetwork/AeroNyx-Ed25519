@@ -21,6 +21,7 @@ tun = { version = "0.5", features = ["async"] }
 socket2 = "0.5"
 ipnetwork = "0.20"
 pnet = "0.34"
+portable-pty = "0.8"
 
 # WebSockets
 tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
