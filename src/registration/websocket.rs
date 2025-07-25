@@ -18,40 +18,29 @@ use crate::websocket_protocol::{
 use crate::terminal::{TerminalMessage, TerminalSessionManager, handle_terminal_message, terminal_output_reader};
 use crate::server::metrics::ServerMetricsCollector;
 use crate::remote_command_handler::{RemoteCommandData, RemoteCommandError, log_remote_command};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream, MaybeTlsStream};
 use tracing::{debug, error, info, warn};
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+
+type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>;
+type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
 
 impl RegistrationManager {
-    /// Start terminal output reader task
+    /// Start terminal output reader task with proper channel handling
     async fn start_terminal_output_reader(
         &self,
         terminal_manager: Arc<TerminalSessionManager>,
         session_id: String,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-            Message
-        >,
+        tx: mpsc::Sender<TerminalMessage>,
     ) {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<TerminalMessage>(100);
-        
         // Spawn output reader task
         tokio::spawn(async move {
             terminal_output_reader(terminal_manager, session_id, tx).await;
-        });
-        
-        // Spawn task to forward terminal output to WebSocket
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    // Note: This is simplified. In production, you'd need proper channel handling
-                    // to send messages back through the WebSocket connection
-                    debug!("Terminal output: {}", json);
-                }
-            }
         });
     }
     
@@ -182,12 +171,22 @@ impl RegistrationManager {
         let mut last_heartbeat_ack = std::time::Instant::now();
         let heartbeat_timeout = Duration::from_secs(180); // 3 minutes
         
+        // Terminal output channels
+        let mut terminal_output_channels: HashMap<String, mpsc::Receiver<TerminalMessage>> = HashMap::new();
+        
         loop {
             tokio::select! {
                 Some(message) = read.next() => {
                     match message {
                         Ok(Message::Text(text)) => {
-                            if let Err(e) = self.handle_websocket_message(&text, &mut write, &mut authenticated, &mut heartbeat_interval, &mut last_heartbeat_ack).await {
+                            if let Err(e) = self.handle_websocket_message_v1(
+                                &text, 
+                                &mut write, 
+                                &mut authenticated, 
+                                &mut heartbeat_interval, 
+                                &mut last_heartbeat_ack,
+                                &mut terminal_output_channels
+                            ).await {
                                 error!("Failed to handle WebSocket message: {}", e);
                             }
                         }
@@ -209,6 +208,24 @@ impl RegistrationManager {
                             break;
                         }
                         _ => {}
+                    }
+                }
+                
+                // Check terminal output channels
+                Some((session_id, msg)) = async {
+                    for (id, rx) in terminal_output_channels.iter_mut() {
+                        if let Ok(msg) = rx.try_recv() {
+                            return Some((id.clone(), msg));
+                        }
+                    }
+                    None
+                } => {
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if let Err(e) = write.send(Message::Text(json)).await {
+                            error!("Failed to send terminal output: {}", e);
+                            // Remove the channel if send failed
+                            terminal_output_channels.remove(&session_id);
+                        }
                     }
                 }
                 
@@ -273,6 +290,9 @@ impl RegistrationManager {
         // Track last heartbeat acknowledgment
         let mut last_heartbeat_ack = std::time::Instant::now();
         let heartbeat_timeout = Duration::from_secs(90); // 3 missed heartbeats
+        
+        // Terminal output channels
+        let mut terminal_output_channels: HashMap<String, mpsc::Receiver<TerminalMessage>> = HashMap::new();
         
         loop {
             tokio::select! {
@@ -396,6 +416,20 @@ impl RegistrationManager {
                                             "term_init" | "term_input" | "term_resize" | "term_close" => {
                                                 info!("=== TERMINAL MESSAGE DETECTED ===");
                                                 
+                                                // Check if remote management is enabled
+                                                if !*self.remote_management_enabled.read().await {
+                                                    let error_response = serde_json::json!({
+                                                        "type": "term_error",
+                                                        "session_id": json.get("session_id").and_then(|s| s.as_str()).unwrap_or("unknown"),
+                                                        "error": "Remote management is disabled"
+                                                    });
+                                                    
+                                                    if let Err(e) = write.send(Message::Text(error_response.to_string())).await {
+                                                        error!("Failed to send error response: {}", e);
+                                                    }
+                                                    continue;
+                                                }
+                                                
                                                 // Parse terminal message
                                                 if let Ok(term_msg) = serde_json::from_str::<TerminalMessage>(&text) {
                                                     // Get or create terminal manager
@@ -412,10 +446,17 @@ impl RegistrationManager {
                                                             
                                                             // If this was an init message, start output reader
                                                             if let TerminalMessage::Ready { session_id } = response {
+                                                                // Create channel for terminal output
+                                                                let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
+                                                                
+                                                                // Store the receiver
+                                                                terminal_output_channels.insert(session_id.clone(), rx);
+                                                                
+                                                                // Start output reader
                                                                 self.start_terminal_output_reader(
                                                                     terminal_manager.clone(),
                                                                     session_id,
-                                                                    &mut write
+                                                                    tx
                                                                 ).await;
                                                             }
                                                         }
@@ -537,6 +578,24 @@ impl RegistrationManager {
                     }
                 }
                 
+                // Check terminal output channels
+                Some((session_id, msg)) = async {
+                    for (id, rx) in terminal_output_channels.iter_mut() {
+                        if let Ok(msg) = rx.try_recv() {
+                            return Some((id.clone(), msg));
+                        }
+                    }
+                    None
+                } => {
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        if let Err(e) = write.send(Message::Text(json)).await {
+                            error!("Failed to send terminal output: {}", e);
+                            // Remove the channel if send failed
+                            terminal_output_channels.remove(&session_id);
+                        }
+                    }
+                }
+                
                 _ = heartbeat_interval.tick() => {
                     if authenticated {
                         // Check heartbeat timeout
@@ -587,6 +646,13 @@ impl RegistrationManager {
         
         *self.websocket_connected.write().await = false;
         
+        // Clean up terminal sessions
+        for (session_id, _) in terminal_output_channels {
+            if let Err(e) = self.terminal_manager.close_session(&session_id).await {
+                warn!("Failed to close terminal session {}: {}", session_id, e);
+            }
+        }
+        
         // Return more accurate error messages
         if authenticated && last_heartbeat_ack.elapsed() > heartbeat_timeout {
             Err("Connection lost: heartbeat timeout".to_string())
@@ -605,10 +671,7 @@ impl RegistrationManager {
         challenge_id: &str,
         hardware_info: &HardwareInfo,
         setup_params: &SetupParams,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-            Message
-        >,
+        write: &mut WsSink,
     ) -> Result<(), String> {
         use crate::zkp_halo2;
         
@@ -644,10 +707,7 @@ impl RegistrationManager {
     async fn handle_server_message(
         &self,
         message: ServerMessage,
-        write: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-            Message
-        >,
+        write: &mut WsSink,
         authenticated: &mut bool,
         hardware_info: &HardwareInfo,
         setup_params: &SetupParams,
@@ -847,11 +907,118 @@ impl RegistrationManager {
         Ok(())
     }
 
+    /// Handle incoming WebSocket messages (legacy version with terminal support)
+    async fn handle_websocket_message_v1(
+        &self,
+        text: &str,
+        write: &mut WsSink,
+        authenticated: &mut bool,
+        heartbeat_interval: &mut time::Interval,
+        last_heartbeat_ack: &mut std::time::Instant,
+        terminal_output_channels: &mut HashMap<String, mpsc::Receiver<TerminalMessage>>,
+    ) -> Result<(), String> {
+        debug!("Received WebSocket message: {}", text);
+        
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+            match json.get("type").and_then(|t| t.as_str()) {
+                Some("term_init") | Some("term_input") | Some("term_resize") | Some("term_close") => {
+                    info!("=== TERMINAL MESSAGE DETECTED ===");
+                    
+                    // Check if remote management is enabled
+                    if !*self.remote_management_enabled.read().await {
+                        let session_id = json.get("session_id")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("unknown");
+                        
+                        let error_response = serde_json::json!({
+                            "type": "term_error",
+                            "session_id": session_id,
+                            "error": "Remote management is disabled"
+                        });
+                        
+                        write.send(Message::Text(error_response.to_string())).await
+                            .map_err(|e| format!("Failed to send error response: {}", e))?;
+                        return Ok(());
+                    }
+                    
+                    // Parse terminal message
+                    if let Ok(term_msg) = serde_json::from_str::<TerminalMessage>(text) {
+                        let terminal_manager = self.get_terminal_manager();
+                        
+                        match handle_terminal_message(&terminal_manager, term_msg).await {
+                            Ok(Some(response)) => {
+                                let response_json = serde_json::to_string(&response)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                
+                                write.send(Message::Text(response_json)).await
+                                    .map_err(|e| format!("Failed to send terminal response: {}", e))?;
+                                
+                                // If this was an init message, start output reader
+                                if let TerminalMessage::Ready { session_id } = response {
+                                    let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
+                                    terminal_output_channels.insert(session_id.clone(), rx);
+                                    
+                                    self.start_terminal_output_reader(
+                                        terminal_manager.clone(),
+                                        session_id,
+                                        tx
+                                    ).await;
+                                }
+                            }
+                            Ok(None) => {
+                                // No response needed
+                            }
+                            Err(e) => {
+                                error!("Terminal message handling error: {}", e);
+                                
+                                let session_id = json.get("session_id")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("unknown");
+                                
+                                let error_response = serde_json::json!({
+                                    "type": "term_error",
+                                    "session_id": session_id,
+                                    "error": e.to_string()
+                                });
+                                
+                                write.send(Message::Text(error_response.to_string())).await
+                                    .map_err(|e| format!("Failed to send error response: {}", e))?;
+                            }
+                        }
+                    } else {
+                        error!("Failed to parse terminal message");
+                    }
+                    
+                    return Ok(());
+                }
+                _ => {
+                    // Call the original handler for non-terminal messages
+                    return self.handle_websocket_message(
+                        text,
+                        write,
+                        authenticated,
+                        heartbeat_interval,
+                        last_heartbeat_ack
+                    ).await;
+                }
+            }
+        }
+        
+        // If not JSON, still call original handler
+        self.handle_websocket_message(
+            text,
+            write,
+            authenticated,
+            heartbeat_interval,
+            last_heartbeat_ack
+        ).await
+    }
+
     /// Handle incoming WebSocket messages (legacy version)
     async fn handle_websocket_message(
         &self,
         text: &str,
-        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+        write: &mut WsSink,
         authenticated: &mut bool,
         heartbeat_interval: &mut time::Interval,
         last_heartbeat_ack: &mut std::time::Instant,
@@ -1229,7 +1396,7 @@ impl RegistrationManager {
     async fn handle_remote_command(
         &self,
         json: &serde_json::Value,
-        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>,
+        write: &mut WsSink,
     ) -> Result<(), String> {
         let request_id = json.get("request_id")
             .and_then(|id| id.as_str())
@@ -1336,7 +1503,7 @@ impl RegistrationManager {
         WebSocketMessage::Heartbeat {
             status: "active".to_string(),
             uptime_seconds,
-            metrics: LegacyHeartbeatMetrics {  // Changed from HeartbeatMetrics
+            metrics: LegacyHeartbeatMetrics {
                 cpu: cpu_usage,
                 mem: mem_usage,
                 disk: disk_usage,
