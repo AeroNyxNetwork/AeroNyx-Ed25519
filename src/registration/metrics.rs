@@ -83,18 +83,18 @@ impl RegistrationManager {
     pub async fn get_process_count(&self) -> Option<u32> {
         #[cfg(target_os = "linux")]
         {
-            if let Ok(entries) = fs::read_dir("/proc").await {
-                let count = entries
-                    .filter_map(|entry| entry.ok())
-                    .filter(|entry| {
-                        entry.file_name()
-                            .to_str()
-                            .map(|name| name.chars().all(|c| c.is_digit(10)))
-                            .unwrap_or(false)
-                    })
-                    .count();
+            if let Ok(mut entries) = fs::read_dir("/proc").await {
+                let mut count = 0;
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    if entry.file_name()
+                        .to_str()
+                        .map(|name| name.chars().all(|c| c.is_digit(10)))
+                        .unwrap_or(false) {
+                        count += 1;
+                    }
+                }
                 
-                return Some(count as u32);
+                return Some(count);
             }
         }
         
