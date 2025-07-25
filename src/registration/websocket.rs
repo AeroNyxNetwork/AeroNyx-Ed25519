@@ -15,6 +15,7 @@ use crate::websocket_protocol::{
     ServerMessage, ClientMessage, ProofData,
     HeartbeatMetrics as WsHeartbeatMetrics
 };
+use crate::terminal::{TerminalMessage, TerminalSessionManager, handle_terminal_message, terminal_output_reader};
 use crate::server::metrics::ServerMetricsCollector;
 use crate::remote_command_handler::{RemoteCommandData, RemoteCommandError, log_remote_command};
 use futures_util::{SinkExt, StreamExt};
@@ -25,6 +26,35 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 impl RegistrationManager {
+    /// Start terminal output reader task
+    async fn start_terminal_output_reader(
+        &self,
+        terminal_manager: Arc<TerminalSessionManager>,
+        session_id: String,
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            Message
+        >,
+    ) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TerminalMessage>(100);
+        
+        // Spawn output reader task
+        tokio::spawn(async move {
+            terminal_output_reader(terminal_manager, session_id, tx).await;
+        });
+        
+        // Spawn task to forward terminal output to WebSocket
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    // Note: This is simplified. In production, you'd need proper channel handling
+                    // to send messages back through the WebSocket connection
+                    debug!("Terminal output: {}", json);
+                }
+            }
+        });
+    }
+    
     /// Start WebSocket connection for real-time communication (original version for compatibility)
     pub async fn start_websocket_connection(
         &mut self,
@@ -360,6 +390,51 @@ impl RegistrationManager {
                                                     &mut write
                                                 ).await {
                                                     error!("Failed to handle ZKP challenge: {}", e);
+                                                }
+                                            }
+                                            
+                                            "term_init" | "term_input" | "term_resize" | "term_close" => {
+                                                info!("=== TERMINAL MESSAGE DETECTED ===");
+                                                
+                                                // Parse terminal message
+                                                if let Ok(term_msg) = serde_json::from_str::<TerminalMessage>(&text) {
+                                                    // Get or create terminal manager
+                                                    let terminal_manager = self.get_terminal_manager();
+                                                    
+                                                    match handle_terminal_message(&terminal_manager, term_msg).await {
+                                                        Ok(Some(response)) => {
+                                                            let response_json = serde_json::to_string(&response)
+                                                                .unwrap_or_else(|_| "{}".to_string());
+                                                            
+                                                            if let Err(e) = write.send(Message::Text(response_json)).await {
+                                                                error!("Failed to send terminal response: {}", e);
+                                                            }
+                                                            
+                                                            // If this was an init message, start output reader
+                                                            if let TerminalMessage::Ready { session_id } = response {
+                                                                self.start_terminal_output_reader(
+                                                                    terminal_manager.clone(),
+                                                                    session_id,
+                                                                    &mut write
+                                                                ).await;
+                                                            }
+                                                        }
+                                                        Ok(None) => {
+                                                            // No response needed
+                                                        }
+                                                        Err(e) => {
+                                                            error!("Terminal message handling error: {}", e);
+                                                            
+                                                            let error_response = serde_json::json!({
+                                                                "type": "term_error",
+                                                                "error": e.to_string()
+                                                            });
+                                                            
+                                                            let _ = write.send(Message::Text(error_response.to_string())).await;
+                                                        }
+                                                    }
+                                                } else {
+                                                    error!("Failed to parse terminal message");
                                                 }
                                             }
                                             
