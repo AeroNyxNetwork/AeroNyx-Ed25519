@@ -115,6 +115,9 @@ impl Default for RemoteCommandConfig {
                 "pwd".to_string(),
                 "echo".to_string(),
                 "date".to_string(),
+                "sh".to_string(),
+                "bash".to_string(),
+                "head".to_string(),
             ],
             working_dir: PathBuf::from("/var/aeronyx"),
         }
@@ -292,6 +295,8 @@ impl RemoteCommandHandler {
         
         // Handle special cases for interactive commands
         let mut args = command.args.unwrap_or_default();
+        let mut use_pipe_limit = false;
+        
         match cmd.as_str() {
             "top" => {
                 // Force batch mode for top
@@ -309,10 +314,11 @@ impl RemoteCommandHandler {
                 if args.is_empty() {
                     args.push("aux".to_string());
                 }
-                // For -x flag which shows all user processes, limit output by default
-                else if args.contains(&"-x".to_string()) && !args.iter().any(|arg| arg.contains("head") || arg.contains("grep")) {
-                    // Add a note about truncation
-                    warn!("ps -x typically produces large output, results will be truncated");
+                // For -x flag which shows all user processes, we need to limit output
+                if args.contains(&"-x".to_string()) || args.contains(&"aux".to_string()) {
+                    // Mark that we should use pipe limiting
+                    use_pipe_limit = true;
+                    warn!("ps command typically produces large output, will limit results");
                 }
             }
             "htop" => {
@@ -362,8 +368,8 @@ impl RemoteCommandHandler {
                 let mut truncated = false;
                 
                 // Check output size and truncate if necessary
-                const MAX_OUTPUT_SIZE: usize = 256 * 1024; // 256KB limit per output (further reduced)
-                const MAX_TOTAL_SIZE: usize = 400 * 1024; // 400KB total limit
+                const MAX_OUTPUT_SIZE: usize = 64 * 1024; // 64KB limit per output (much more aggressive)
+                const MAX_TOTAL_SIZE: usize = 100 * 1024; // 100KB total limit for WebSocket safety
                 
                 // First check total size
                 let total_output_size = output.stdout.len() + output.stderr.len();
@@ -409,8 +415,10 @@ impl RemoteCommandHandler {
                 if truncated {
                     let suggestions = match cmd.as_str() {
                         "ps" => {
-                            if args.contains(&"-x".to_string()) {
-                                Some("Try 'ps -x | grep <process_name>' to filter specific processes, or 'ps -x | head -20' for first 20 lines")
+                            if final_args.len() > 2 && final_args[1].contains("head") {
+                                Some("Output was automatically limited to first 100 lines. For more control, try 'ps -x | grep <process_name>'")
+                            } else if args.contains(&"-x".to_string()) {
+                                Some("Try 'ps -x | grep <process_name>' to filter specific processes")
                             } else {
                                 Some("Consider using 'ps aux | head -20' or filtering with grep")
                             }
