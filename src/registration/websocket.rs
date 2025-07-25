@@ -404,6 +404,11 @@ impl RegistrationManager {
                                                 
                                                 error!("Server error [{}]: {}", error_code, message);
                                                 
+                                                // Handle specific errors
+                                                if message.contains("Message too large") {
+                                                    warn!("Command output exceeded size limit. Consider using pagination or filtering.");
+                                                }
+                                                
                                                 if error_code == "AUTH_TIMEOUT" || 
                                                    error_code == "INVALID_CODE" || 
                                                    error_code == "auth_failed" {
