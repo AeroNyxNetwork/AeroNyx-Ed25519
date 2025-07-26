@@ -308,6 +308,8 @@ impl RemoteCommandHandler {
                     args.push("-n".to_string());
                     args.push("1".to_string());
                 }
+                // Pipe through head to limit output
+                use_pipe_limit = true;
             }
             "ps" => {
                 // If no args provided, use sensible defaults
@@ -368,8 +370,8 @@ impl RemoteCommandHandler {
                 let mut truncated = false;
                 
                 // Check output size and truncate if necessary
-                const MAX_OUTPUT_SIZE: usize = 64 * 1024; // 64KB limit per output (much more aggressive)
-                const MAX_TOTAL_SIZE: usize = 100 * 1024; // 100KB total limit for WebSocket safety
+                const MAX_OUTPUT_SIZE: usize = 32 * 1024; // 32KB limit per output
+                const MAX_TOTAL_SIZE: usize = 50 * 1024; // 50KB total limit for WebSocket safety
                 
                 // First check total size
                 let total_output_size = output.stdout.len() + output.stderr.len();
