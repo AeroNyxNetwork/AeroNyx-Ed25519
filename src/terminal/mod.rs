@@ -1,6 +1,6 @@
 // src/terminal/mod.rs
 // AeroNyx Privacy Network - Web Terminal Implementation
-// Version: 1.0.2 - Thread-Safe with proper PTY handling
+// Version: 1.0.3 - Thread-Safe with PTY file descriptor handling
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize, MasterPty, ChildKiller};
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use tokio::sync::{Mutex, RwLock};
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{info, error, warn, debug};
-use std::io::Write;
+use std::io::{Read, Write};
 use tokio::task;
 
 /// Terminal session manager
@@ -21,8 +21,6 @@ pub struct TerminalSession {
     pub session_id: String,
     pub size: Arc<Mutex<PtySize>>,
     pub created_at: std::time::Instant,
-    // Store file descriptors for async reading
-    reader_fd: Arc<Mutex<i32>>,
     // Use blocking tasks for PTY operations
     pty_handle: Arc<Mutex<PtyHandle>>,
 }
@@ -187,34 +185,20 @@ impl TerminalSessionManager {
                 .spawn_command(cmd)
                 .map_err(|e| format!("Failed to spawn shell: {}", e))?;
             
-            // Get file descriptor for reading
-            #[cfg(unix)]
-            let reader_fd = {
-                use std::os::unix::io::AsRawFd;
-                let reader = pair.master.try_clone_reader()
-                    .map_err(|e| format!("Failed to clone reader: {}", e))?;
-                reader.as_raw_fd()
-            };
-            
-            #[cfg(not(unix))]
-            let reader_fd = -1; // Windows not supported yet
-            
-            Ok::<(Box<dyn MasterPty + Send>, Box<dyn ChildKiller + Send + Sync>, PtySize, i32), String>((
+            Ok::<(Box<dyn MasterPty + Send>, Box<dyn ChildKiller + Send + Sync>, PtySize), String>((
                 pair.master,
                 child,
                 pty_size,
-                reader_fd,
             ))
         }).await.map_err(|e| format!("Failed to create PTY task: {}", e))??;
         
-        let (master, child, pty_size, reader_fd) = pty_result;
+        let (master, child, pty_size) = pty_result;
         
         // Create session
         let session = Arc::new(TerminalSession {
             session_id: session_id.clone(),
             size: Arc::new(Mutex::new(pty_size)),
             created_at: std::time::Instant::now(),
-            reader_fd: Arc::new(Mutex::new(reader_fd)),
             pty_handle: Arc::new(Mutex::new(PtyHandle {
                 master,
                 child,
@@ -282,64 +266,20 @@ impl TerminalSessionManager {
             let mut reader = master.try_clone_reader()
                 .map_err(|e| format!("Failed to get reader: {}", e))?;
             
-            // Use a separate buffer and reader
             let mut buffer = vec![0u8; buffer_size];
             
-            // For Unix systems, we can use the file descriptor
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::{AsRawFd, FromRawFd};
-                use std::fs::File;
-                use std::io::Read;
-                
-                let fd = reader.as_raw_fd();
-                
-                // Set non-blocking mode using fcntl
-                unsafe {
-                    let flags = libc::fcntl(fd, libc::F_GETFL, 0);
-                    if flags < 0 {
-                        return Err("Failed to get file flags".to_string());
-                    }
-                    if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                        return Err("Failed to set non-blocking mode".to_string());
-                    }
+            // portable-pty handles non-blocking I/O internally
+            // Try to read available data
+            match reader.read(&mut buffer) {
+                Ok(n) => {
+                    buffer.truncate(n);
+                    Ok(buffer)
                 }
-                
-                // Read from the file descriptor
-                let mut file = unsafe { File::from_raw_fd(fd) };
-                match file.read(&mut buffer) {
-                    Ok(n) => {
-                        // Important: don't drop the file, it would close the fd
-                        std::mem::forget(file);
-                        buffer.truncate(n);
-                        Ok(buffer)
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No data available
-                        std::mem::forget(file);
-                        Ok(vec![])
-                    }
-                    Err(e) => {
-                        std::mem::forget(file);
-                        Err(format!("Failed to read from terminal: {}", e))
-                    }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No data available
+                    Ok(vec![])
                 }
-            }
-            
-            #[cfg(not(unix))]
-            {
-                // For Windows, just try to read normally
-                use std::io::Read;
-                match reader.read(&mut buffer) {
-                    Ok(n) => {
-                        buffer.truncate(n);
-                        Ok(buffer)
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        Ok(vec![])
-                    }
-                    Err(e) => Err(format!("Failed to read from terminal: {}", e)),
-                }
+                Err(e) => Err(format!("Failed to read from terminal: {}", e)),
             }
         }).await.map_err(|e| format!("Failed to read task: {}", e))?
     }
@@ -611,4 +551,11 @@ pub async fn terminal_output_reader(
     }
     
     info!("Output reader stopped for terminal session: {}", session_id);
+}
+
+// Implement Default for TerminalSessionManager
+impl Default for TerminalSessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
