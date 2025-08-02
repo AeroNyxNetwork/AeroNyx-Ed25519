@@ -836,6 +836,122 @@ impl RegistrationManager {
             ServerMessage::Unknown => {
                 debug!("Received unknown message type");
             }
+            
+            // Handle terminal-related messages
+            ServerMessage::TermInit { session_id, rows, cols, cwd, env, from_user } => {
+                info!("Received TermInit request: session_id={}, user={}, size={}x{}", 
+                    session_id, from_user, cols, rows);
+                
+                // Check if remote management is enabled
+                if !*self.remote_management_enabled.read().await {
+                    let error_response = serde_json::json!({
+                        "type": "term_error",
+                        "session_id": session_id,
+                        "error": "Remote management is disabled"
+                    });
+                    
+                    write.send(Message::Text(error_response.to_string())).await
+                        .map_err(|e| format!("Failed to send error response: {}", e))?;
+                    return Ok(());
+                }
+                
+                // Get terminal manager
+                let terminal_manager = self.get_terminal_manager();
+                
+                // Create terminal session
+                match terminal_manager.create_session(
+                    session_id.clone(),
+                    from_user,
+                    rows,
+                    cols,
+                    cwd,
+                    env,
+                ).await {
+                    Ok(_) => {
+                        // Send ready response
+                        let ready_msg = serde_json::json!({
+                            "type": "term_ready",
+                            "session_id": session_id,
+                        });
+                        
+                        write.send(Message::Text(ready_msg.to_string())).await
+                            .map_err(|e| format!("Failed to send ready message: {}", e))?;
+                        
+                        info!("Terminal session {} created and ready", session_id);
+                    }
+                    Err(e) => {
+                        error!("Failed to create terminal session: {}", e);
+                        let error_response = serde_json::json!({
+                            "type": "term_error",
+                            "session_id": session_id,
+                            "error": e.to_string(),
+                        });
+                        
+                        write.send(Message::Text(error_response.to_string())).await
+                            .map_err(|e| format!("Failed to send error response: {}", e))?;
+                    }
+                }
+            }
+            
+            ServerMessage::TermInput { session_id, data } => {
+                debug!("Received TermInput: session_id={}, data_len={}", session_id, data.len());
+                
+                // Check if remote management is enabled
+                if !*self.remote_management_enabled.read().await {
+                    return Ok(());
+                }
+                
+                let terminal_manager = self.get_terminal_manager();
+                
+                // Decode input data
+                let input_data = if let Ok(decoded) = base64::decode(&data) {
+                    decoded
+                } else {
+                    data.as_bytes().to_vec()
+                };
+                
+                // Write to terminal
+                if let Err(e) = terminal_manager.write_input(&session_id, &input_data).await {
+                    error!("Failed to write to terminal {}: {}", session_id, e);
+                }
+            }
+            
+            ServerMessage::TermResize { session_id, rows, cols } => {
+                info!("Received TermResize: session_id={}, size={}x{}", session_id, cols, rows);
+                
+                if !*self.remote_management_enabled.read().await {
+                    return Ok(());
+                }
+                
+                let terminal_manager = self.get_terminal_manager();
+                
+                if let Err(e) = terminal_manager.resize_terminal(&session_id, rows, cols).await {
+                    error!("Failed to resize terminal {}: {}", session_id, e);
+                }
+            }
+            
+            ServerMessage::TermClose { session_id } => {
+                info!("Received TermClose: session_id={}", session_id);
+                
+                if !*self.remote_management_enabled.read().await {
+                    return Ok(());
+                }
+                
+                let terminal_manager = self.get_terminal_manager();
+                
+                if let Err(e) = terminal_manager.close_session(&session_id).await {
+                    error!("Failed to close terminal {}: {}", session_id, e);
+                }
+                
+                // Send closed confirmation
+                let closed_msg = serde_json::json!({
+                    "type": "term_closed",
+                    "session_id": session_id,
+                });
+                
+                write.send(Message::Text(closed_msg.to_string())).await
+                    .map_err(|e| format!("Failed to send closed message: {}", e))?;
+            }
         }
         
         Ok(())
