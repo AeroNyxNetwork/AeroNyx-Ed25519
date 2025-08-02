@@ -8,11 +8,6 @@
 // This module handles WebSocket connections for real-time communication
 // with the AeroNyx control plane.
 
-// Re-export all sub-modules for backward compatibility
-pub use connection::*;
-pub use handlers::*;
-pub use terminal::*;
-
 use super::{RegistrationManager, WebSocketMessage, LegacyHeartbeatMetrics};
 use crate::hardware::HardwareInfo;
 use crate::zkp_halo2::SetupParams;
@@ -22,12 +17,20 @@ use crate::websocket_protocol::{
 use crate::server::metrics::ServerMetricsCollector;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 
 // Sub-modules
 mod connection;
 mod handlers;
 mod terminal;
+
+// Re-export for backward compatibility (even if not used, to maintain API)
+#[allow(unused_imports)]
+pub use connection::*;
+#[allow(unused_imports)]
+pub use handlers::*;
+#[allow(unused_imports)]
+pub use terminal::*;
 
 impl RegistrationManager {
     /// Start WebSocket connection for real-time communication (original version for compatibility)
