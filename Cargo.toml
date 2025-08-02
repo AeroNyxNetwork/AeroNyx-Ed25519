@@ -97,7 +97,7 @@ once_cell = "1.17"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 bytes = "1.4"
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 tokio-stream = "0.1"
 tempfile = "3.3"
 flate2 = "1.0"
