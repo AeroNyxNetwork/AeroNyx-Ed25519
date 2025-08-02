@@ -957,6 +957,7 @@ impl RegistrationManager {
                 // Use terminal message handler for close
                 let close_msg = TerminalMessage::Close {
                     session_id: session_id.clone(),
+                    reason: "Session closed by user".to_string(),
                 };
                 
                 if let Err(e) = handle_terminal_message(&terminal_manager, close_msg).await {
