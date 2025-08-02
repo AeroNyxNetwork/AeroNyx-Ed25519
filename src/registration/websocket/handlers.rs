@@ -858,26 +858,29 @@ impl RegistrationManager {
                 // Get terminal manager
                 let terminal_manager = self.get_terminal_manager();
                 
-                // Create terminal session
-                match terminal_manager.create_session(
-                    session_id.clone(),
-                    from_user,
+                // Create terminal message for initialization
+                // Note: The from_user field is stored in the websocket protocol but not used by terminal manager
+                let init_msg = TerminalMessage::Init {
+                    session_id: session_id.clone(),
                     rows,
                     cols,
-                    cwd,
-                    env,
-                ).await {
-                    Ok(_) => {
-                        // Send ready response
-                        let ready_msg = serde_json::json!({
-                            "type": "term_ready",
-                            "session_id": session_id,
-                        });
+                    cwd: Some(cwd),
+                    env: Some(env),
+                };
+                
+                // Handle terminal initialization
+                match handle_terminal_message(&terminal_manager, init_msg).await {
+                    Ok(Some(response)) => {
+                        let response_json = serde_json::to_string(&response)
+                            .unwrap_or_else(|_| "{}".to_string());
                         
-                        write.send(Message::Text(ready_msg.to_string())).await
+                        write.send(Message::Text(response_json)).await
                             .map_err(|e| format!("Failed to send ready message: {}", e))?;
                         
-                        info!("Terminal session {} created and ready", session_id);
+                        info!("Terminal session {} created and ready for user {}", session_id, from_user);
+                    }
+                    Ok(None) => {
+                        // No response expected
                     }
                     Err(e) => {
                         error!("Failed to create terminal session: {}", e);
@@ -910,8 +913,13 @@ impl RegistrationManager {
                     data.as_bytes().to_vec()
                 };
                 
-                // Write to terminal
-                if let Err(e) = terminal_manager.write_input(&session_id, &input_data).await {
+                // Write to terminal using the terminal message handler
+                let input_msg = TerminalMessage::Input {
+                    session_id: session_id.clone(),
+                    data: base64::encode(&input_data),
+                };
+                
+                if let Err(e) = handle_terminal_message(&terminal_manager, input_msg).await {
                     error!("Failed to write to terminal {}: {}", session_id, e);
                 }
             }
@@ -925,7 +933,14 @@ impl RegistrationManager {
                 
                 let terminal_manager = self.get_terminal_manager();
                 
-                if let Err(e) = terminal_manager.resize_terminal(&session_id, rows, cols).await {
+                // Use terminal message handler for resize
+                let resize_msg = TerminalMessage::Resize {
+                    session_id: session_id.clone(),
+                    rows,
+                    cols,
+                };
+                
+                if let Err(e) = handle_terminal_message(&terminal_manager, resize_msg).await {
                     error!("Failed to resize terminal {}: {}", session_id, e);
                 }
             }
@@ -939,7 +954,12 @@ impl RegistrationManager {
                 
                 let terminal_manager = self.get_terminal_manager();
                 
-                if let Err(e) = terminal_manager.close_session(&session_id).await {
+                // Use terminal message handler for close
+                let close_msg = TerminalMessage::Close {
+                    session_id: session_id.clone(),
+                };
+                
+                if let Err(e) = handle_terminal_message(&terminal_manager, close_msg).await {
                     error!("Failed to close terminal {}: {}", session_id, e);
                 }
                 
