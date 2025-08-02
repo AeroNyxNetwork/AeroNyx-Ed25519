@@ -9,7 +9,6 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize, MasterPty, Child}
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 use tracing::{info, warn, error, debug};
 use std::path::PathBuf;
@@ -144,13 +143,16 @@ impl TerminalManager {
         let session_id_clone = session_id.clone();
         let sessions_clone = self.sessions.clone();
 
+        // Clone the arc before moving into the spawn
+        let session_arc_for_task = session_arc.clone();
+
         // Spawn a task to read from the PTY
         let read_task = tokio::spawn(async move {
             // Use a blocking thread for the synchronous PTY read operations
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
             
             // Spawn blocking task for PTY reading
-            let session_arc_clone = session_arc.clone();
+            let session_arc_clone = session_arc_for_task.clone();
             let session_id_for_blocking = session_id_clone.clone();
             
             std::thread::spawn(move || {
