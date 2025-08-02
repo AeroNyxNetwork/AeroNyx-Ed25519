@@ -5,7 +5,6 @@ use crate::registration::RegistrationManager;
 use crate::terminal::{TerminalMessage, TerminalSessionManager, terminal_output_reader};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::error;
 
 impl RegistrationManager {
     /// Start terminal output reader task with proper channel handling
@@ -26,9 +25,9 @@ impl RegistrationManager {
 pub async fn handle_terminal_message(
     terminal_manager: &Arc<TerminalSessionManager>,
     message: TerminalMessage,
-) -> Result<Option<TerminalMessage>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<TerminalMessage>, String> {
     use crate::terminal::handle_terminal_message as internal_handler;
     
-    // Forward to the actual terminal handler
-    internal_handler(terminal_manager, message).await
+    // Forward to the actual terminal handler and convert error type
+    internal_handler(terminal_manager, message).await.map_err(|e| e.to_string())
 }
