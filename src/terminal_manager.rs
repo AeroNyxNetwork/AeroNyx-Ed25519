@@ -9,7 +9,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize, MasterPty, Child}
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 use tracing::{info, warn, error, debug};
 use std::path::PathBuf;
@@ -146,51 +146,64 @@ impl TerminalManager {
 
         // Spawn a task to read from the PTY
         let read_task = tokio::spawn(async move {
-            let mut buffer = vec![0u8; 4096];
+            // Use a blocking thread for the synchronous PTY read operations
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
             
-            loop {
-                let mut session = session_arc.lock().await;
-                
-                // Try to get a reader from the master PTY
-                let reader_result = session.pty_master.try_clone_reader();
-                drop(session); // Release lock while reading
-                
-                match reader_result {
-                    Ok(mut reader) => {
-                        // Convert to async reader
-                        let mut async_reader = tokio::io::BufReader::new(
-                            tokio_util::compat::FuturesAsyncReadCompatExt::compat(reader)
-                        );
-                        
-                        match async_reader.read(&mut buffer).await {
-                            Ok(0) => {
-                                // EOF - terminal closed
-                                info!("Terminal session {} closed (EOF)", session_id_clone);
-                                break;
-                            }
-                            Ok(n) => {
-                                // Update last activity
-                                if let Some(session) = sessions_clone.read().await.get(&session_id_clone) {
-                                    session.lock().await.last_activity = std::time::Instant::now();
+            // Spawn blocking task for PTY reading
+            let session_arc_clone = session_arc.clone();
+            let session_id_for_blocking = session_id_clone.clone();
+            
+            std::thread::spawn(move || {
+                let mut buffer = vec![0u8; 4096];
+                loop {
+                    // Try to get a reader from the master PTY
+                    let reader_result = {
+                        let session = futures::executor::block_on(session_arc_clone.lock());
+                        session.pty_master.try_clone_reader()
+                    };
+                    
+                    match reader_result {
+                        Ok(mut reader) => {
+                            // Blocking read
+                            match std::io::Read::read(&mut reader, &mut buffer) {
+                                Ok(0) => {
+                                    // EOF - terminal closed
+                                    info!("Terminal session {} closed (EOF)", session_id_for_blocking);
+                                    break;
                                 }
-                                
-                                // Send output to handler
-                                output_handler(buffer[..n].to_vec());
-                            }
-                            Err(e) => {
-                                error!("Error reading from terminal {}: {}", session_id_clone, e);
-                                break;
+                                Ok(n) => {
+                                    // Send data through channel
+                                    if tx.blocking_send(buffer[..n].to_vec()).is_err() {
+                                        error!("Failed to send terminal output - receiver dropped");
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Error reading from terminal {}: {}", session_id_for_blocking, e);
+                                    break;
+                                }
                             }
                         }
+                        Err(e) => {
+                            error!("Failed to clone PTY reader for session {}: {}", session_id_for_blocking, e);
+                            break;
+                        }
                     }
-                    Err(e) => {
-                        error!("Failed to clone PTY reader for session {}: {}", session_id_clone, e);
-                        break;
-                    }
+                    
+                    // Small delay to prevent busy loop
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            });
+            
+            // Process data from the channel in async context
+            while let Some(data) = rx.recv().await {
+                // Update last activity
+                if let Some(session) = sessions_clone.read().await.get(&session_id_clone) {
+                    session.lock().await.last_activity = std::time::Instant::now();
                 }
                 
-                // Small delay to prevent busy loop
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                // Send output to handler
+                output_handler(data);
             }
             
             // Clean up session when read loop exits
