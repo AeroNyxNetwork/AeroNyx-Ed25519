@@ -16,6 +16,9 @@ use tokio::time;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
+// Import SinkExt to enable the send method on WsSink
+use futures_util::sink::SinkExt;
+
 impl RegistrationManager {
     /// Handle incoming WebSocket messages (legacy version with terminal support)
     pub(super) async fn handle_websocket_message_v1(
