@@ -1,5 +1,5 @@
 // src/websocket_protocol.rs
-// Fixed version with correct message structures
+// Updated version with terminal support
 
 use serde::{Deserialize, Serialize};
 use crate::zkp_halo2::types::Proof;
@@ -52,6 +52,40 @@ pub enum ServerMessage {
         jwt_token: String,
     },
     
+    /// Terminal initialization request
+    #[serde(rename = "term_init")]
+    TermInit {
+        session_id: String,
+        rows: u16,
+        cols: u16,
+        #[serde(default = "default_cwd")]
+        cwd: String,
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
+        from_user: String,
+    },
+    
+    /// Terminal input data
+    #[serde(rename = "term_input")]
+    TermInput {
+        session_id: String,
+        data: String, // Base64 or raw terminal input
+    },
+    
+    /// Terminal resize
+    #[serde(rename = "term_resize")]
+    TermResize {
+        session_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    
+    /// Terminal close
+    #[serde(rename = "term_close")]
+    TermClose {
+        session_id: String,
+    },
+    
     /// ZKP challenge request
     #[serde(rename = "challenge_request")]
     ChallengeRequest {
@@ -90,6 +124,10 @@ pub enum ServerMessage {
     Unknown,
 }
 
+fn default_cwd() -> String {
+    "/home".to_string()
+}
+
 /// Client messages sent via WebSocket
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "type")]
@@ -113,6 +151,41 @@ pub enum ClientMessage {
         metrics: HeartbeatMetrics,
         #[serde(skip_serializing_if = "Option::is_none")]
         timestamp: Option<u64>,
+    },
+    
+    /// Terminal initialization success
+    #[serde(rename = "term_init_success")]
+    TermInitSuccess {
+        session_id: String,
+    },
+    
+    /// Terminal output data
+    #[serde(rename = "term_output")]
+    TermOutput {
+        session_id: String,
+        data: String, // Base64 encoded terminal output
+    },
+    
+    /// Terminal error
+    #[serde(rename = "term_error")]
+    TermError {
+        session_id: String,
+        error: String,
+    },
+    
+    /// Terminal closed
+    #[serde(rename = "term_closed")]
+    TermClosed {
+        session_id: String,
+    },
+    
+    /// Remote command response
+    #[serde(rename = "remote_command_response")]
+    RemoteCommandResponse {
+        request_id: String,
+        success: bool,
+        result: Option<serde_json::Value>,
+        error: Option<String>,
     },
 }
 
