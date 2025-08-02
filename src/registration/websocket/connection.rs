@@ -34,7 +34,7 @@ impl RegistrationManager {
         // Set up heartbeat interval
         let mut heartbeat_interval = time::interval(Duration::from_secs(60));
         let mut authenticated = false;
-        let metrics_collector = Arc::new(ServerMetricsCollector::new(
+        let _metrics_collector = Arc::new(ServerMetricsCollector::new(
             Duration::from_secs(60),
             60,
         ));
@@ -109,7 +109,7 @@ impl RegistrationManager {
                             break;
                         }
                         
-                        let heartbeat = self.create_heartbeat_message(&metrics_collector).await;
+                        let heartbeat = self.create_heartbeat_message(&_metrics_collector).await;
                         let heartbeat_json = serde_json::to_string(&heartbeat)
                             .map_err(|e| format!("Failed to serialize heartbeat: {}", e))?;
                         
@@ -154,7 +154,7 @@ impl RegistrationManager {
         
         let mut authenticated = false;
         let mut auth_sent = false;
-        let metrics_collector = Arc::new(ServerMetricsCollector::new(
+        let _metrics_collector = Arc::new(ServerMetricsCollector::new(
             Duration::from_secs(60),
             60,
         ));
