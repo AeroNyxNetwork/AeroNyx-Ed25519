@@ -1,5 +1,5 @@
 // src/registration/websocket/connection.rs
-// WebSocket connection management and lifecycle
+// WebSocket connection management and lifecycle - Optimized version
 
 use crate::registration::{RegistrationManager, WebSocketMessage};
 use crate::hardware::HardwareInfo;
@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
 use std::sync::Arc;
 use std::time::Duration;
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time;
 use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream, MaybeTlsStream};
 use tracing::{debug, error, info, warn};
@@ -19,313 +19,547 @@ use tracing::{debug, error, info, warn};
 pub type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>;
 pub type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
 
-impl RegistrationManager {
-    /// Internal WebSocket connection handler (original version)
-    pub(crate) async fn connect_and_run_websocket(&self, ws_url: &str) -> Result<(), String> {
-        let (ws_stream, _) = connect_async(ws_url)
-            .await
-            .map_err(|e| format!("WebSocket connection failed: {}", e))?;
-        
-        info!("WebSocket connected successfully");
-        *self.websocket_connected.write().await = true;
-        
-        let (mut write, mut read) = ws_stream.split();
-        
-        // Set up heartbeat interval
-        let mut heartbeat_interval = time::interval(Duration::from_secs(60));
-        let mut authenticated = false;
-        let _metrics_collector = Arc::new(ServerMetricsCollector::new(
-            Duration::from_secs(60),
-            60,
-        ));
-        
-        // Track last heartbeat time for connection health
-        let mut last_heartbeat_ack = std::time::Instant::now();
-        let heartbeat_timeout = Duration::from_secs(180); // 3 minutes
-        
-        // Terminal output channels
-        let mut terminal_output_channels: HashMap<String, mpsc::Receiver<TerminalMessage>> = HashMap::new();
-        
-        loop {
-            tokio::select! {
-                Some(message) = read.next() => {
-                    match message {
-                        Ok(Message::Text(text)) => {
-                            if let Err(e) = self.handle_websocket_message_v1(
-                                &text, 
-                                &mut write, 
-                                &mut authenticated, 
-                                &mut heartbeat_interval, 
-                                &mut last_heartbeat_ack,
-                                &mut terminal_output_channels
-                            ).await {
-                                error!("Failed to handle WebSocket message: {}", e);
-                            }
-                        }
-                        Ok(Message::Close(_)) => {
-                            info!("WebSocket closed by server");
-                            break;
-                        }
-                        Ok(Message::Ping(data)) => {
-                            debug!("Received ping, sending pong");
-                            write.send(Message::Pong(data)).await
-                                .map_err(|e| format!("Failed to send pong: {}", e))?;
-                        }
-                        Ok(Message::Pong(_)) => {
-                            debug!("Received pong");
-                            last_heartbeat_ack = std::time::Instant::now();
-                        }
-                        Err(e) => {
-                            error!("WebSocket error: {}", e);
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                
-                // Check terminal output channels
-                Some((session_id, msg)) = async {
-                    for (id, rx) in terminal_output_channels.iter_mut() {
-                        if let Ok(msg) = rx.try_recv() {
-                            return Some((id.clone(), msg));
-                        }
-                    }
-                    None
-                } => {
-                    if let Ok(json) = serde_json::to_string(&msg) {
-                        if let Err(e) = write.send(Message::Text(json)).await {
-                            error!("Failed to send terminal output: {}", e);
-                            // Remove the channel if send failed
-                            terminal_output_channels.remove(&session_id);
-                        }
-                    }
-                }
-                
-                _ = heartbeat_interval.tick() => {
-                    if authenticated {
-                        // Check heartbeat timeout
-                        if last_heartbeat_ack.elapsed() > heartbeat_timeout {
-                            error!("Heartbeat timeout - no response from server");
-                            break;
-                        }
-                        
-                        let heartbeat = self.create_heartbeat_message(&_metrics_collector).await;
-                        let heartbeat_json = serde_json::to_string(&heartbeat)
-                            .map_err(|e| format!("Failed to serialize heartbeat: {}", e))?;
-                        
-                        if let Err(e) = write.send(Message::Text(heartbeat_json)).await {
-                            error!("Failed to send heartbeat: {}", e);
-                            break;
-                        }
-                        debug!("Heartbeat sent via WebSocket");
-                    }
-                }
-            }
-        }
-        
-        *self.websocket_connected.write().await = false;
-        
-        if !authenticated {
-            Err("Failed to authenticate with WebSocket server".to_string())
-        } else {
-            Ok(())
+// 心跳配置
+#[derive(Clone)]
+struct HeartbeatConfig {
+    interval: Duration,
+    timeout: Duration,
+    max_missed: u32,
+    grace_period: Duration,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(180),     // 6分钟基础超时
+            max_missed: 3,                        // 允许错过3次
+            grace_period: Duration::from_secs(30), // 额外宽限期
         }
     }
+}
 
-    /// Updated WebSocket connection handler that properly handles initial messages
+// 终端会话管理器
+struct TerminalSessionTracker {
+    channels: HashMap<String, mpsc::Receiver<TerminalMessage>>,
+    last_cleanup: std::time::Instant,
+}
+
+impl TerminalSessionTracker {
+    fn new() -> Self {
+        Self {
+            channels: HashMap::new(),
+            last_cleanup: std::time::Instant::now(),
+        }
+    }
+    
+    fn insert(&mut self, session_id: String, rx: mpsc::Receiver<TerminalMessage>) {
+        self.channels.insert(session_id, rx);
+    }
+    
+    fn remove(&mut self, session_id: &str) -> Option<mpsc::Receiver<TerminalMessage>> {
+        self.channels.remove(session_id)
+    }
+    
+    fn cleanup_closed(&mut self) {
+        let closed_sessions: Vec<String> = self.channels
+            .iter()
+            .filter(|(_, rx)| rx.is_closed())
+            .map(|(id, _)| id.clone())
+            .collect();
+            
+        for session_id in closed_sessions {
+            self.channels.remove(&session_id);
+            info!("Cleaned up closed terminal channel: {}", session_id);
+        }
+    }
+    
+    async fn check_for_output(&mut self) -> Option<(String, TerminalMessage)> {
+        for (id, rx) in self.channels.iter_mut() {
+            if let Ok(msg) = rx.try_recv() {
+                return Some((id.clone(), msg));
+            }
+        }
+        None
+    }
+    
+    fn should_cleanup(&self) -> bool {
+        self.last_cleanup.elapsed() > Duration::from_secs(60)
+    }
+    
+    fn mark_cleanup(&mut self) {
+        self.last_cleanup = std::time::Instant::now();
+    }
+}
+
+impl RegistrationManager {
+    /// Optimized WebSocket connection handler with improved error handling and resource management
     pub(crate) async fn connect_and_run_websocket_v2(
         &self,
         ws_url: &str,
         hardware_info: &HardwareInfo,
         setup_params: &SetupParams,
     ) -> Result<(), String> {
-        let (ws_stream, _) = connect_async(ws_url)
-            .await
-            .map_err(|e| format!("WebSocket connection failed: {}", e))?;
+        // Establish connection with retry logic
+        let ws_stream = self.connect_with_retry(ws_url, 3).await?;
         
         info!("WebSocket TCP connection established, waiting for server handshake");
         *self.websocket_connected.write().await = true;
         
         let (mut write, mut read) = ws_stream.split();
         
-        // Set up heartbeat interval (30 seconds to match test script)
-        let mut heartbeat_interval = time::interval(Duration::from_secs(30));
-        heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-        
-        let mut authenticated = false;
-        let mut auth_sent = false;
+        // Initialize connection state
+        let mut connection_state = ConnectionState::new();
+        let heartbeat_config = HeartbeatConfig::default();
         let _metrics_collector = Arc::new(ServerMetricsCollector::new(
             Duration::from_secs(60),
             60,
         ));
         
-        // Track last heartbeat acknowledgment
-        let mut last_heartbeat_ack = std::time::Instant::now();
-        let heartbeat_timeout = Duration::from_secs(90); // 3 missed heartbeats
+        // Terminal session tracking
+        let mut terminal_tracker = TerminalSessionTracker::new();
         
-        // Terminal output channels
-        let mut terminal_output_channels: HashMap<String, mpsc::Receiver<TerminalMessage>> = HashMap::new();
+        // Main event loop
+        let result = self.run_event_loop(
+            &mut write,
+            &mut read,
+            &mut connection_state,
+            &heartbeat_config,
+            &_metrics_collector,
+            &mut terminal_tracker,
+            hardware_info,
+            setup_params,
+        ).await;
+        
+        // Cleanup
+        *self.websocket_connected.write().await = false;
+        self.cleanup_resources(&mut terminal_tracker).await;
+        
+        result
+    }
+    
+    /// Connect with retry logic
+    async fn connect_with_retry(&self, ws_url: &str, max_retries: u32) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, String> {
+        let mut retry_count = 0;
+        let mut backoff = Duration::from_secs(1);
+        
+        loop {
+            match connect_async(ws_url).await {
+                Ok((stream, _)) => return Ok(stream),
+                Err(e) if retry_count < max_retries => {
+                    retry_count += 1;
+                    warn!("WebSocket connection attempt {} failed: {}. Retrying in {:?}...", 
+                          retry_count, e, backoff);
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.mul_f32(1.5).min(Duration::from_secs(10));
+                }
+                Err(e) => {
+                    return Err(format!("WebSocket connection failed after {} attempts: {}", max_retries, e));
+                }
+            }
+        }
+    }
+    
+    /// Main event loop
+    async fn run_event_loop(
+        &self,
+        write: &mut WsSink,
+        read: &mut WsStream,
+        state: &mut ConnectionState,
+        heartbeat_config: &HeartbeatConfig,
+        metrics_collector: &Arc<ServerMetricsCollector>,
+        terminal_tracker: &mut TerminalSessionTracker,
+        hardware_info: &HardwareInfo,
+        setup_params: &SetupParams,
+    ) -> Result<(), String> {
+        // Set up intervals
+        let mut heartbeat_interval = time::interval(heartbeat_config.interval);
+        heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        
+        let mut cleanup_interval = time::interval(Duration::from_secs(60));
+        cleanup_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        
+        // Authentication timeout
+        let auth_timeout = time::sleep(Duration::from_secs(35));
+        tokio::pin!(auth_timeout);
         
         loop {
             tokio::select! {
+                // Handle incoming messages
                 Some(message) = read.next() => {
-                    match message {
-                        Ok(Message::Text(text)) => {
-                            // Add debug logging for ALL messages
-                            info!("=== WEBSOCKET MESSAGE RECEIVED ===");
-                            info!("Raw message: {}", if text.len() > 500 { 
-                                format!("{}... (truncated, total length: {})", &text[..500], text.len()) 
-                            } else { 
-                                text.clone() 
-                            });
-                            
-                            // First try to parse as structured ServerMessage
-                            let handled = if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
-                                info!("Parsed as ServerMessage");
-                                
-                                // Check if this is a heartbeat ack before handling
-                                let is_heartbeat_ack = matches!(server_msg, ServerMessage::HeartbeatAck { .. });
-                                
-                                let result = self.handle_server_message(
-                                    server_msg,
-                                    &mut write,
-                                    &mut authenticated,
-                                    hardware_info,
-                                    setup_params,
-                                ).await;
-                                
-                                // Update timestamp for heartbeat ack
-                                if is_heartbeat_ack && result.is_ok() {
-                                    last_heartbeat_ack = std::time::Instant::now();
-                                }
-                                
-                                result.is_ok()
-                            } else {
-                                false
-                            };
-                            
-                            // If structured parsing failed, try generic JSON handling
-                            if !handled {
-                                self.handle_generic_message(
-                                    &text,
-                                    &mut write,
-                                    &mut authenticated,
-                                    &mut auth_sent,
-                                    &mut heartbeat_interval,
-                                    &mut last_heartbeat_ack,
-                                    &mut terminal_output_channels,
-                                    hardware_info,
-                                    setup_params,
-                                ).await?;
-                            }
-                        }
-                        Ok(Message::Close(_)) => {
-                            info!("WebSocket closed by server");
-                            break;
-                        }
-                        Ok(Message::Ping(data)) => {
-                            debug!("Received ping, sending pong");
-                            if let Err(e) = write.send(Message::Pong(data)).await {
-                                error!("Failed to send pong: {}", e);
+                    match self.handle_incoming_message(
+                        message, 
+                        write, 
+                        state, 
+                        terminal_tracker,
+                        hardware_info,
+                        setup_params,
+                    ).await {
+                        Ok(should_continue) => {
+                            if !should_continue {
                                 break;
                             }
                         }
-                        Ok(Message::Pong(_)) => {
-                            debug!("Received pong");
-                            last_heartbeat_ack = std::time::Instant::now();
-                        }
                         Err(e) => {
-                            error!("WebSocket read error: {}", e);
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                
-                // Check terminal output channels
-                Some((session_id, msg)) = async {
-                    for (id, rx) in terminal_output_channels.iter_mut() {
-                        if let Ok(msg) = rx.try_recv() {
-                            return Some((id.clone(), msg));
-                        }
-                    }
-                    None
-                } => {
-                    if let Ok(json) = serde_json::to_string(&msg) {
-                        if let Err(e) = write.send(Message::Text(json)).await {
-                            error!("Failed to send terminal output: {}", e);
-                            // Remove the channel if send failed
-                            terminal_output_channels.remove(&session_id);
+                            error!("Error handling message: {}", e);
+                            return Err(e);
                         }
                     }
                 }
                 
+                // Check terminal outputs
+                Some((session_id, msg)) = terminal_tracker.check_for_output() => {
+                    if let Err(e) = self.send_terminal_output(write, &session_id, msg).await {
+                        error!("Failed to send terminal output: {}", e);
+                        terminal_tracker.remove(&session_id);
+                    }
+                }
+                
+                // Heartbeat
                 _ = heartbeat_interval.tick() => {
-                    if authenticated {
-                        // Check heartbeat timeout
-                        if last_heartbeat_ack.elapsed() > heartbeat_timeout {
-                            error!("Heartbeat timeout - no response from server for {:?}", 
-                                   last_heartbeat_ack.elapsed());
+                    if state.authenticated {
+                        if let Err(e) = self.handle_heartbeat(
+                            write, 
+                            state, 
+                            &heartbeat_config,
+                            metrics_collector,
+                        ).await {
+                            error!("Heartbeat error: {}", e);
                             break;
                         }
-                        
-                        // Log remote management status with heartbeat
-                        let remote_enabled = *self.remote_management_enabled.read().await;
-                        info!("Sending heartbeat - Remote management enabled: {}", remote_enabled);
-                        
-                        // Send heartbeat in simple format
-                        let heartbeat = serde_json::json!({
-                            "type": "heartbeat",
-                            "metrics": {
-                                "cpu": self.get_cpu_usage().await,
-                                "memory": self.get_memory_usage().await,
-                                "disk": self.get_disk_usage().await,
-                                "network": self.get_network_usage().await
-                            }
-                        });
-                        
-                        if let Err(e) = write.send(Message::Text(heartbeat.to_string())).await {
-                            error!("Failed to send heartbeat: {}", e);
-                            break;
-                        }
-                        
-                        info!("Sent heartbeat at {}", std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs());
-                    } else if auth_sent && self.start_time.elapsed() > Duration::from_secs(25) {
-                        warn!("Not authenticated after 25 seconds despite sending auth");
                     }
                 }
                 
-                // Timeout for initial connection/auth sequence
-                _ = tokio::time::sleep(Duration::from_secs(35)) => {
-                    if !authenticated && !auth_sent {
-                        error!("No server message received within 35 seconds of connection");
-                        break;
+                // Periodic cleanup
+                _ = cleanup_interval.tick() => {
+                    if terminal_tracker.should_cleanup() {
+                        terminal_tracker.cleanup_closed();
+                        terminal_tracker.mark_cleanup();
+                    }
+                }
+                
+                // Authentication timeout
+                _ = &mut auth_timeout, if !state.authenticated => {
+                    error!("Authentication timeout - no server response within 35 seconds");
+                    return Err("Authentication timeout".to_string());
+                }
+            }
+        }
+        
+        // Determine exit reason
+        self.determine_exit_reason(state, &heartbeat_config)
+    }
+    
+    /// Handle incoming WebSocket message
+    async fn handle_incoming_message(
+        &self,
+        message: Result<Message, tokio_tungstenite::tungstenite::Error>,
+        write: &mut WsSink,
+        state: &mut ConnectionState,
+        terminal_tracker: &mut TerminalSessionTracker,
+        hardware_info: &HardwareInfo,
+        setup_params: &SetupParams,
+    ) -> Result<bool, String> {
+        match message {
+            Ok(Message::Text(text)) => {
+                debug!("Received message: {} bytes", text.len());
+                
+                // Try structured message first
+                if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
+                    // Update heartbeat ack for relevant messages
+                    if matches!(server_msg, ServerMessage::HeartbeatAck { .. }) {
+                        state.last_heartbeat_ack = std::time::Instant::now();
+                        state.missed_heartbeats = 0;
+                    }
+                    
+                    self.handle_server_message(
+                        server_msg,
+                        write,
+                        &mut state.authenticated,
+                        hardware_info,
+                        setup_params,
+                    ).await?;
+                } else {
+                    // Handle generic message
+                    self.handle_generic_message(
+                        &text,
+                        write,
+                        &mut state.authenticated,
+                        &mut state.auth_sent,
+                        &mut state.heartbeat_interval,
+                        &mut state.last_heartbeat_ack,
+                        terminal_tracker,
+                        hardware_info,
+                        setup_params,
+                    ).await?;
+                }
+                Ok(true)
+            }
+            Ok(Message::Close(_)) => {
+                info!("WebSocket closed by server");
+                Ok(false)
+            }
+            Ok(Message::Ping(data)) => {
+                debug!("Received ping, sending pong");
+                write.send(Message::Pong(data)).await
+                    .map_err(|e| format!("Failed to send pong: {}", e))?;
+                Ok(true)
+            }
+            Ok(Message::Pong(_)) => {
+                debug!("Received pong");
+                state.last_heartbeat_ack = std::time::Instant::now();
+                state.missed_heartbeats = 0;
+                Ok(true)
+            }
+            Err(e) => {
+                error!("WebSocket error: {}", e);
+                Err(format!("WebSocket error: {}", e))
+            }
+            _ => Ok(true)
+        }
+    }
+    
+    /// Handle heartbeat logic
+    async fn handle_heartbeat(
+        &self,
+        write: &mut WsSink,
+        state: &mut ConnectionState,
+        config: &HeartbeatConfig,
+        metrics_collector: &Arc<ServerMetricsCollector>,
+    ) -> Result<(), String> {
+        let elapsed = state.last_heartbeat_ack.elapsed();
+        
+        // Check for timeout
+        if elapsed > config.timeout {
+            state.missed_heartbeats += 1;
+            
+            if state.missed_heartbeats >= config.max_missed {
+                if elapsed > config.timeout + config.grace_period {
+                    return Err(format!(
+                        "Heartbeat timeout after {} missed beats, elapsed: {:?}", 
+                        state.missed_heartbeats, elapsed
+                    ));
+                } else {
+                    // In grace period, send urgent ping
+                    warn!("In heartbeat grace period, sending urgent ping");
+                    write.send(Message::Ping(vec![])).await.ok();
+                }
+            }
+        }
+        
+        // Send regular heartbeat
+        let heartbeat = self.create_heartbeat_message(metrics_collector).await;
+        let heartbeat_json = serde_json::to_string(&heartbeat)
+            .map_err(|e| format!("Failed to serialize heartbeat: {}", e))?;
+        
+        write.send(Message::Text(heartbeat_json)).await
+            .map_err(|e| format!("Failed to send heartbeat: {}", e))?;
+        
+        debug!("Heartbeat sent");
+        Ok(())
+    }
+    
+    /// Send terminal output
+    async fn send_terminal_output(
+        &self,
+        write: &mut WsSink,
+        session_id: &str,
+        msg: TerminalMessage,
+    ) -> Result<(), String> {
+        let json = serde_json::to_string(&msg)
+            .map_err(|e| format!("Failed to serialize terminal message: {}", e))?;
+        
+        write.send(Message::Text(json)).await
+            .map_err(|e| format!("Failed to send terminal output: {}", e))
+    }
+    
+    /// Clean up resources
+    async fn cleanup_resources(&self, terminal_tracker: &mut TerminalSessionTracker) {
+        // Close all terminal sessions
+        let session_ids: Vec<String> = terminal_tracker.channels.keys().cloned().collect();
+        
+        for session_id in session_ids {
+            if let Some(mut rx) = terminal_tracker.remove(&session_id) {
+                rx.close();
+                
+                if let Some(manager) = &self.terminal_manager {
+                    if let Err(e) = manager.close_session(&session_id).await {
+                        warn!("Failed to close terminal session {}: {}", session_id, e);
                     }
                 }
             }
         }
         
-        *self.websocket_connected.write().await = false;
-        
-        // Clean up terminal sessions
-        for (session_id, _) in terminal_output_channels {
-            if let Err(e) = self.terminal_manager.close_session(&session_id).await {
-                warn!("Failed to close terminal session {}: {}", session_id, e);
-            }
-        }
-        
-        // Return more accurate error messages
-        if authenticated && last_heartbeat_ack.elapsed() > heartbeat_timeout {
+        info!("Cleaned up {} terminal sessions", terminal_tracker.channels.len());
+    }
+    
+    /// Determine exit reason
+    fn determine_exit_reason(&self, state: &ConnectionState, config: &HeartbeatConfig) -> Result<(), String> {
+        if state.authenticated && state.last_heartbeat_ack.elapsed() > config.timeout {
             Err("Connection lost: heartbeat timeout".to_string())
-        } else if !authenticated && auth_sent {
+        } else if !state.authenticated && state.auth_sent {
             Err("WebSocket connection closed without successful authentication".to_string())
-        } else if !auth_sent {
+        } else if !state.auth_sent {
             Err("Server did not send initial connection message".to_string())
         } else {
             Ok(())
+        }
+    }
+    
+    /// Handle generic message with terminal support
+    async fn handle_generic_message(
+        &self,
+        text: &str,
+        write: &mut WsSink,
+        authenticated: &mut bool,
+        auth_sent: &mut bool,
+        heartbeat_interval: &mut time::Interval,
+        last_heartbeat_ack: &mut std::time::Instant,
+        terminal_tracker: &mut TerminalSessionTracker,
+        hardware_info: &HardwareInfo,
+        setup_params: &SetupParams,
+    ) -> Result<(), String> {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+            if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
+                match msg_type {
+                    // Terminal messages
+                    "term_init" | "term_input" | "term_resize" | "term_close" => {
+                        self.handle_terminal_message_json(&json, write, terminal_tracker).await?;
+                    }
+                    
+                    // Terminal response messages
+                    "term_ready" => {
+                        if let Ok(msg) = serde_json::from_value::<TerminalMessage>(json) {
+                            if let TerminalMessage::Ready { session_id } = msg {
+                                // Create channel for terminal output
+                                let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
+                                terminal_tracker.insert(session_id.clone(), rx);
+                                
+                                // Start output reader
+                                if let Some(manager) = &self.terminal_manager {
+                                    self.start_terminal_output_reader(
+                                        manager.clone(),
+                                        session_id,
+                                        tx
+                                    ).await;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Other messages - delegate to original handler
+                    _ => {
+                        return self.handle_websocket_message(
+                            text,
+                            write,
+                            authenticated,
+                            heartbeat_interval,
+                            last_heartbeat_ack
+                        ).await;
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Handle terminal message from JSON
+    async fn handle_terminal_message_json(
+        &self,
+        json: &serde_json::Value,
+        write: &mut WsSink,
+        terminal_tracker: &mut TerminalSessionTracker,
+    ) -> Result<(), String> {
+        // Check if remote management is enabled
+        if !*self.remote_management_enabled.read().await {
+            let session_id = json.get("session_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown");
+            
+            let error_response = serde_json::json!({
+                "type": "term_error",
+                "session_id": session_id,
+                "error": "Remote management is disabled"
+            });
+            
+            write.send(Message::Text(error_response.to_string())).await
+                .map_err(|e| format!("Failed to send error response: {}", e))?;
+            return Ok(());
+        }
+        
+        // Parse and handle terminal message
+        if let Ok(term_msg) = serde_json::from_value::<TerminalMessage>(json.clone()) {
+            let terminal_manager = self.get_terminal_manager();
+            
+            match super::terminal::handle_terminal_message(&terminal_manager, term_msg).await {
+                Ok(Some(response)) => {
+                    let response_json = serde_json::to_string(&response)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    
+                    write.send(Message::Text(response_json)).await
+                        .map_err(|e| format!("Failed to send terminal response: {}", e))?;
+                    
+                    // Handle special responses
+                    if let TerminalMessage::Ready { session_id } = response {
+                        // Create channel for output
+                        let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
+                        terminal_tracker.insert(session_id.clone(), rx);
+                        
+                        // Start output reader
+                        self.start_terminal_output_reader(
+                            terminal_manager.clone(),
+                            session_id,
+                            tx
+                        ).await;
+                    }
+                }
+                Ok(None) => {
+                    // No response needed
+                }
+                Err(e) => {
+                    error!("Terminal message handling error: {}", e);
+                    
+                    let session_id = json.get("session_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    
+                    let error_response = serde_json::json!({
+                        "type": "term_error",
+                        "session_id": session_id,
+                        "error": e.to_string()
+                    });
+                    
+                    write.send(Message::Text(error_response.to_string())).await
+                        .map_err(|e| format!("Failed to send error response: {}", e))?;
+                }
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+// Connection state management
+struct ConnectionState {
+    authenticated: bool,
+    auth_sent: bool,
+    last_heartbeat_ack: std::time::Instant,
+    missed_heartbeats: u32,
+    heartbeat_interval: time::Interval,
+}
+
+impl ConnectionState {
+    fn new() -> Self {
+        let mut heartbeat_interval = time::interval(Duration::from_secs(30));
+        heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        
+        Self {
+            authenticated: false,
+            auth_sent: false,
+            last_heartbeat_ack: std::time::Instant::now(),
+            missed_heartbeats: 0,
+            heartbeat_interval,
         }
     }
 }
