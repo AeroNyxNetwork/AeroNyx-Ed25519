@@ -1,5 +1,5 @@
 // src/registration/websocket/handlers.rs
-// WebSocket message handling logic
+// WebSocket message handling logic - Optimized version with all features preserved
 
 use crate::registration::{RegistrationManager, WebSocketMessage};
 use crate::hardware::HardwareInfo;
