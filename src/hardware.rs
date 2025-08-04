@@ -9,11 +9,20 @@
 // and generating stable hardware fingerprints for node identification and security.
 // The fingerprint algorithm focuses on stable hardware characteristics that rarely
 // change in cloud environments, avoiding volatile attributes like disk size or memory.
+//
+// MOBILE SUPPORT: This module now supports mobile devices (iOS/Android) through
+// conditional compilation and platform-specific implementations.
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn, info};
 use sha2::{Sha256, Digest};
 use std::collections::BTreeSet;
+
+// Mobile platform detection
+#[cfg(any(target_os = "ios", target_os = "android"))]
+const IS_MOBILE: bool = true;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+const IS_MOBILE: bool = false;
 
 /// Represents comprehensive hardware information collected from the system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +48,25 @@ pub struct HardwareInfo {
     /// BIOS/UEFI information
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bios_info: Option<BiosInfo>,
+    /// Mobile device information (if applicable)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mobile_info: Option<MobileInfo>,
+}
+
+/// Mobile device specific information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileInfo {
+    /// Device unique identifier (IDFV on iOS, Android ID on Android)
+    pub device_id: String,
+    /// Device model (e.g., "iPhone 13 Pro", "Pixel 6")
+    pub device_model: String,
+    /// Device manufacturer (e.g., "Apple", "Samsung")
+    pub manufacturer: String,
+    /// Whether the device is physical or emulator/simulator
+    pub is_physical: bool,
+    /// Optional advertising ID (if permissions granted)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertising_id: Option<String>,
 }
 
 /// CPU information structure
@@ -105,7 +133,7 @@ pub struct NetworkInterface {
 /// Operating system information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OsInfo {
-    /// OS type (linux, macos, windows)
+    /// OS type (linux, macos, windows, ios, android)
     #[serde(rename = "type")]
     pub os_type: String,
     /// OS version
@@ -135,36 +163,48 @@ impl HardwareInfo {
     pub fn generate_fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
         
-        // 1. Primary identifier: MAC addresses (very stable)
-        let mac_addresses: BTreeSet<String> = self.network.interfaces
-            .iter()
-            .filter(|iface| {
-                iface.is_physical && 
-                !iface.mac_address.is_empty() && 
-                iface.mac_address != "00:00:00:00:00:00"
-            })
-            .map(|iface| iface.mac_address.to_lowercase())
-            .collect();
-        
-        // Include all physical MAC addresses in sorted order
-        for mac in &mac_addresses {
-            hasher.update(mac.as_bytes());
+        // For mobile devices, use mobile-specific identifiers
+        if let Some(mobile_info) = &self.mobile_info {
+            hasher.update(mobile_info.device_id.as_bytes());
             hasher.update(b"|");
+            hasher.update(mobile_info.device_model.as_bytes());
+            hasher.update(b"|");
+            hasher.update(mobile_info.manufacturer.as_bytes());
+            hasher.update(b"|");
+        } else {
+            // Original server fingerprint logic
+            // 1. Primary identifier: MAC addresses (very stable)
+            let mac_addresses: BTreeSet<String> = self.network.interfaces
+                .iter()
+                .filter(|iface| {
+                    iface.is_physical && 
+                    !iface.mac_address.is_empty() && 
+                    iface.mac_address != "00:00:00:00:00:00"
+                })
+                .map(|iface| iface.mac_address.to_lowercase())
+                .collect();
+            
+            // Include all physical MAC addresses in sorted order
+            for mac in &mac_addresses {
+                hasher.update(mac.as_bytes());
+                hasher.update(b"|");
+            }
+            
+            // 2. System UUID (extremely stable on VMs and cloud instances)
+            if let Some(uuid) = &self.system_uuid {
+                hasher.update(uuid.as_bytes());
+                hasher.update(b"|");
+            }
+            
+            // 3. Machine ID (very stable on Linux systems)
+            if let Some(machine_id) = &self.machine_id {
+                hasher.update(machine_id.as_bytes());
+                hasher.update(b"|");
+            }
         }
         
-        // 2. System UUID (extremely stable on VMs and cloud instances)
-        if let Some(uuid) = &self.system_uuid {
-            hasher.update(uuid.as_bytes());
-            hasher.update(b"|");
-        }
-        
-        // 3. Machine ID (very stable on Linux systems)
-        if let Some(machine_id) = &self.machine_id {
-            hasher.update(machine_id.as_bytes());
-            hasher.update(b"|");
-        }
-        
-        // 4. CPU model and architecture (stable on cloud VMs)
+        // Common identifiers for both mobile and server
+        // 4. CPU model and architecture (stable on cloud VMs and devices)
         hasher.update(self.cpu.model.as_bytes());
         hasher.update(b"|");
         hasher.update(self.cpu.architecture.as_bytes());
@@ -193,7 +233,16 @@ impl HardwareInfo {
     pub fn generate_zkp_commitment(&self) -> Vec<u8> {
         use crate::zkp_halo2::commitment::PoseidonCommitment;
         
-        // Get the first physical MAC address
+        // For mobile devices, use device ID as the second parameter
+        if let Some(mobile_info) = &self.mobile_info {
+            let commitment = PoseidonCommitment::commit_combined(
+                &self.cpu.model,
+                &mobile_info.device_id
+            );
+            return commitment.to_vec();
+        }
+        
+        // Original server logic
         let default_mac = "00:00:00:00:00:00".to_string();
         let mac = self.network.interfaces
             .iter()
@@ -201,7 +250,6 @@ impl HardwareInfo {
             .map(|iface| &iface.mac_address)
             .unwrap_or(&default_mac);
         
-        // Generate combined commitment (CPU + MAC)
         let commitment = PoseidonCommitment::commit_combined(
             &self.cpu.model,
             mac
@@ -212,7 +260,6 @@ impl HardwareInfo {
     
     /// Create a deterministic serialization for ZKP circuit input
     pub fn to_zkp_bytes(&self) -> Result<Vec<u8>, String> {
-        // Use the commitment generation method which already handles serialization
         Ok(self.generate_zkp_commitment())
     }
     
@@ -224,6 +271,26 @@ impl HardwareInfo {
     
     /// Generate a human-readable summary of the fingerprint components
     pub fn generate_fingerprint_summary(&self) -> String {
+        if let Some(mobile_info) = &self.mobile_info {
+            return format!(
+                "Device: {} {}, ID: {}, CPU: {}, Physical: {}",
+                mobile_info.manufacturer,
+                mobile_info.device_model,
+                if mobile_info.device_id.len() > 8 {
+                    format!("{}...", &mobile_info.device_id[..8])
+                } else {
+                    mobile_info.device_id.clone()
+                },
+                if self.cpu.model.len() > 20 {
+                    format!("{}...", &self.cpu.model[..20])
+                } else {
+                    self.cpu.model.clone()
+                },
+                mobile_info.is_physical
+            );
+        }
+        
+        // Original server summary
         let physical_macs = self.network.interfaces
             .iter()
             .filter(|iface| iface.is_physical && iface.mac_address != "00:00:00:00:00:00")
@@ -248,7 +315,7 @@ impl HardwareInfo {
         info!("Starting hardware information collection");
         
         let mut hw_info = HardwareInfo {
-            hostname: gethostname::gethostname().to_string_lossy().to_string(),
+            hostname: Self::get_hostname(),
             cpu: Self::collect_cpu_info()?,
             memory: Self::collect_memory_info()?,
             disk: Self::collect_disk_info()?,
@@ -257,35 +324,124 @@ impl HardwareInfo {
             system_uuid: None,
             machine_id: None,
             bios_info: None,
+            mobile_info: None,
         };
         
-        // Collect additional stable identifiers
-        hw_info.system_uuid = Self::get_system_uuid();
-        hw_info.machine_id = Self::get_machine_id();
-        hw_info.bios_info = Self::collect_bios_info();
+        // Platform-specific collection
+        if IS_MOBILE {
+            hw_info.mobile_info = Self::collect_mobile_info();
+        } else {
+            hw_info.system_uuid = Self::get_system_uuid();
+            hw_info.machine_id = Self::get_machine_id();
+            hw_info.bios_info = Self::collect_bios_info();
+        }
         
         debug!("Hardware information collection completed");
         Ok(hw_info)
     }
     
+    /// Get hostname with mobile device support
+    fn get_hostname() -> String {
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        {
+            // On mobile, use a generic hostname or device name
+            "mobile-device".to_string()
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            gethostname::gethostname().to_string_lossy().to_string()
+        }
+    }
+    
+    /// Collect mobile device information
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    fn collect_mobile_info() -> Option<MobileInfo> {
+        // This is a placeholder - actual implementation would use
+        // platform-specific APIs through FFI or platform channels
+        Some(MobileInfo {
+            device_id: Self::get_mobile_device_id(),
+            device_model: Self::get_mobile_device_model(),
+            manufacturer: Self::get_mobile_manufacturer(),
+            is_physical: Self::is_physical_device(),
+            advertising_id: Self::get_advertising_id(),
+        })
+    }
+    
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    fn collect_mobile_info() -> Option<MobileInfo> {
+        None
+    }
+    
+    // Mobile-specific helper functions (placeholders for actual implementation)
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    fn get_mobile_device_id() -> String {
+        // In actual implementation:
+        // iOS: Use identifierForVendor
+        // Android: Use Settings.Secure.ANDROID_ID
+        "placeholder-device-id".to_string()
+    }
+    
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    fn get_mobile_device_model() -> String {
+        // In actual implementation:
+        // iOS: Use UIDevice.current.model
+        // Android: Use Build.MODEL
+        "placeholder-model".to_string()
+    }
+    
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    fn get_mobile_manufacturer() -> String {
+        #[cfg(target_os = "ios")]
+        return "Apple".to_string();
+        #[cfg(target_os = "android")]
+        return "placeholder-manufacturer".to_string(); // Use Build.MANUFACTURER
+    }
+    
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    fn is_physical_device() -> bool {
+        // Detect if running on simulator/emulator
+        true // Placeholder
+    }
+    
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    fn get_advertising_id() -> Option<String> {
+        // Requires user permission
+        None
+    }
+    
     /// Collect CPU information from the system
     fn collect_cpu_info() -> Result<CpuInfo, String> {
-        let cores = sys_info::cpu_num()
-            .map_err(|e| format!("Failed to get CPU count: {}", e))?;
-        
-        let frequency = sys_info::cpu_speed()
-            .unwrap_or(0) as u64 * 1_000_000; // Convert MHz to Hz
-        
-        let model = Self::get_cpu_model().unwrap_or_else(|| "Unknown CPU".to_string());
-        let vendor_id = Self::get_cpu_vendor_id();
-        
-        Ok(CpuInfo {
-            cores,
-            model,
-            frequency,
-            architecture: std::env::consts::ARCH.to_string(),
-            vendor_id,
-        })
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        {
+            // Mobile-specific CPU info collection
+            Ok(CpuInfo {
+                cores: num_cpus::get() as u32,
+                model: "Mobile Processor".to_string(), // Would need platform API
+                frequency: 0, // Not easily accessible on mobile
+                architecture: std::env::consts::ARCH.to_string(),
+                vendor_id: None,
+            })
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            // Original server implementation
+            let cores = sys_info::cpu_num()
+                .map_err(|e| format!("Failed to get CPU count: {}", e))?;
+            
+            let frequency = sys_info::cpu_speed()
+                .unwrap_or(0) as u64 * 1_000_000;
+            
+            let model = Self::get_cpu_model().unwrap_or_else(|| "Unknown CPU".to_string());
+            let vendor_id = Self::get_cpu_vendor_id();
+            
+            Ok(CpuInfo {
+                cores,
+                model,
+                frequency,
+                architecture: std::env::consts::ARCH.to_string(),
+                vendor_id,
+            })
+        }
     }
     
     /// Get CPU model name from system
@@ -358,25 +514,48 @@ impl HardwareInfo {
     
     /// Collect memory information
     fn collect_memory_info() -> Result<MemoryInfo, String> {
-        let mem_info = sys_info::mem_info()
-            .map_err(|e| format!("Failed to get memory info: {}", e))?;
-        
-        Ok(MemoryInfo {
-            total: mem_info.total * 1024, // Convert KB to bytes
-            available: mem_info.avail * 1024,
-        })
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            let mem_info = sys_info::mem_info()
+                .map_err(|e| format!("Failed to get memory info: {}", e))?;
+            
+            Ok(MemoryInfo {
+                total: mem_info.total * 1024,
+                available: mem_info.avail * 1024,
+            })
+        }
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        {
+            // Mobile platforms - would need platform-specific APIs
+            Ok(MemoryInfo {
+                total: 4 * 1024 * 1024 * 1024, // 4GB placeholder
+                available: 2 * 1024 * 1024 * 1024, // 2GB placeholder
+            })
+        }
     }
     
     /// Collect disk information
     fn collect_disk_info() -> Result<DiskInfo, String> {
-        let disk_info = sys_info::disk_info()
-            .map_err(|e| format!("Failed to get disk info: {}", e))?;
-        
-        Ok(DiskInfo {
-            total: disk_info.total * 1024, // Convert KB to bytes
-            available: disk_info.free * 1024,
-            filesystem: Self::get_filesystem_type().unwrap_or_else(|| "Unknown".to_string()),
-        })
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            let disk_info = sys_info::disk_info()
+                .map_err(|e| format!("Failed to get disk info: {}", e))?;
+            
+            Ok(DiskInfo {
+                total: disk_info.total * 1024,
+                available: disk_info.free * 1024,
+                filesystem: Self::get_filesystem_type().unwrap_or_else(|| "Unknown".to_string()),
+            })
+        }
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        {
+            // Mobile platforms - would need platform-specific APIs
+            Ok(DiskInfo {
+                total: 64 * 1024 * 1024 * 1024, // 64GB placeholder
+                available: 32 * 1024 * 1024 * 1024, // 32GB placeholder
+                filesystem: "mobile".to_string(),
+            })
+        }
     }
     
     /// Get filesystem type for root partition
@@ -396,12 +575,12 @@ impl HardwareInfo {
         
         #[cfg(target_os = "macos")]
         {
-            return Some("apfs".to_string()); // Default for modern macOS
+            return Some("apfs".to_string());
         }
         
         #[cfg(target_os = "windows")]
         {
-            return Some("ntfs".to_string()); // Default for Windows
+            return Some("ntfs".to_string());
         }
         
         None
@@ -422,39 +601,50 @@ impl HardwareInfo {
     fn get_network_interfaces() -> Result<Vec<NetworkInterface>, String> {
         let mut interfaces = Vec::new();
         
-        use pnet::datalink;
-        
-        for interface in datalink::interfaces() {
-            // Skip loopback
-            if interface.is_loopback() {
-                continue;
-            }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            use pnet::datalink;
             
-            // Determine if this is a physical interface
-            let is_physical = !interface.name.starts_with("veth") &&
-                            !interface.name.starts_with("docker") &&
-                            !interface.name.starts_with("br-") &&
-                            !interface.name.starts_with("virbr") &&
-                            !interface.name.starts_with("lo") &&
-                            !interface.name.contains("tun");
-            
-            // Get MAC address
-            let mac_address = interface.mac
-                .map(|mac| mac.to_string())
-                .unwrap_or_else(|| "00:00:00:00:00:00".to_string());
-            
-            // Get IP addresses
-            for ip_network in &interface.ips {
-                if let Some(ip) = ip_network.ip().to_string().split('/').next() {
-                    interfaces.push(NetworkInterface {
-                        name: interface.name.clone(),
-                        ip_address: ip.to_string(),
-                        mac_address: mac_address.clone(),
-                        interface_type: Self::determine_interface_type(&interface.name),
-                        is_physical,
-                    });
+            for interface in datalink::interfaces() {
+                if interface.is_loopback() {
+                    continue;
+                }
+                
+                let is_physical = !interface.name.starts_with("veth") &&
+                                !interface.name.starts_with("docker") &&
+                                !interface.name.starts_with("br-") &&
+                                !interface.name.starts_with("virbr") &&
+                                !interface.name.starts_with("lo") &&
+                                !interface.name.contains("tun");
+                
+                let mac_address = interface.mac
+                    .map(|mac| mac.to_string())
+                    .unwrap_or_else(|| "00:00:00:00:00:00".to_string());
+                
+                for ip_network in &interface.ips {
+                    if let Some(ip) = ip_network.ip().to_string().split('/').next() {
+                        interfaces.push(NetworkInterface {
+                            name: interface.name.clone(),
+                            ip_address: ip.to_string(),
+                            mac_address: mac_address.clone(),
+                            interface_type: Self::determine_interface_type(&interface.name),
+                            is_physical,
+                        });
+                    }
                 }
             }
+        }
+        
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        {
+            // Mobile platforms typically have WiFi and cellular interfaces
+            interfaces.push(NetworkInterface {
+                name: "wifi0".to_string(),
+                ip_address: "192.168.1.100".to_string(),
+                mac_address: "00:00:00:00:00:00".to_string(),
+                interface_type: "wifi".to_string(),
+                is_physical: true,
+            });
         }
         
         if interfaces.is_empty() {
@@ -488,7 +678,6 @@ impl HardwareInfo {
     
     /// Get public IP address
     async fn get_public_ip() -> Result<String, String> {
-        // Try multiple services for redundancy
         let services = [
             "https://api.ipify.org",
             "https://ipinfo.io/ip",
@@ -521,9 +710,23 @@ impl HardwareInfo {
     
     /// Collect operating system information
     fn collect_os_info() -> Result<OsInfo, String> {
-        let os_type = std::env::consts::OS.to_string();
+        let mut os_type = std::env::consts::OS.to_string();
+        
+        // Detect mobile OS types
+        #[cfg(target_os = "ios")]
+        {
+            os_type = "ios".to_string();
+        }
+        #[cfg(target_os = "android")]
+        {
+            os_type = "android".to_string();
+        }
+        
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
         let kernel = sys_info::os_release()
             .unwrap_or_else(|_| "Unknown".to_string());
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        let kernel = "mobile".to_string();
         
         let (version, distribution) = Self::get_os_details();
         
@@ -541,7 +744,6 @@ impl HardwareInfo {
         {
             use std::fs;
             
-            // Try /etc/os-release first (systemd standard)
             if let Ok(os_release) = fs::read_to_string("/etc/os-release") {
                 let mut version = "Unknown".to_string();
                 let mut distribution = "Unknown".to_string();
@@ -563,7 +765,6 @@ impl HardwareInfo {
                 return (version, distribution);
             }
             
-            // Fallback to lsb_release
             if let Ok(lsb) = fs::read_to_string("/etc/lsb-release") {
                 let mut version = "Unknown".to_string();
                 let mut distribution = "Unknown".to_string();
@@ -609,6 +810,16 @@ impl HardwareInfo {
             return (version, "Windows".to_string());
         }
         
+        #[cfg(target_os = "ios")]
+        {
+            return ("Unknown".to_string(), "iOS".to_string());
+        }
+        
+        #[cfg(target_os = "android")]
+        {
+            return ("Unknown".to_string(), "Android".to_string());
+        }
+        
         ("Unknown".to_string(), "Unknown".to_string())
     }
     
@@ -618,7 +829,6 @@ impl HardwareInfo {
         {
             use std::fs;
             
-            // Try to read DMI system UUID
             let uuid_paths = [
                 "/sys/class/dmi/id/product_uuid",
                 "/sys/devices/virtual/dmi/id/product_uuid",
@@ -633,7 +843,6 @@ impl HardwareInfo {
                 }
             }
             
-            // Fallback to product serial
             if let Ok(serial) = fs::read_to_string("/sys/class/dmi/id/product_serial") {
                 let serial = serial.trim();
                 if !serial.is_empty() && serial != "0" && serial != "System Serial Number" {
@@ -671,7 +880,6 @@ impl HardwareInfo {
         {
             use std::fs;
             
-            // Try systemd machine-id first
             if let Ok(id) = fs::read_to_string("/etc/machine-id") {
                 let id = id.trim().to_string();
                 if !id.is_empty() {
@@ -679,7 +887,6 @@ impl HardwareInfo {
                 }
             }
             
-            // Fallback to dbus machine-id
             if let Ok(id) = fs::read_to_string("/var/lib/dbus/machine-id") {
                 let id = id.trim().to_string();
                 if !id.is_empty() {
@@ -714,7 +921,6 @@ impl HardwareInfo {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|_| "Unknown".to_string());
             
-            // Only return if we have meaningful data
             if vendor != "Unknown" || system_manufacturer != "Unknown" {
                 return Some(BiosInfo {
                     vendor,
@@ -730,18 +936,21 @@ impl HardwareInfo {
     
     /// Detect cloud provider based on system characteristics
     pub fn detect_cloud_provider(&self) -> Option<String> {
+        // Mobile devices are not cloud providers
+        if self.mobile_info.is_some() {
+            return None;
+        }
+        
         #[cfg(target_os = "linux")]
         {
             use std::fs;
             
-            // Check for AWS
             if let Ok(uuid) = fs::read_to_string("/sys/hypervisor/uuid") {
                 if uuid.to_lowercase().starts_with("ec2") {
                     return Some("AWS".to_string());
                 }
             }
             
-            // Check DMI for cloud providers
             if let Some(bios) = &self.bios_info {
                 let manufacturer = bios.system_manufacturer.to_lowercase();
                 let product = bios.system_product.to_lowercase();
@@ -759,7 +968,6 @@ impl HardwareInfo {
                 }
             }
             
-            // Check for cloud-init
             if fs::metadata("/var/lib/cloud").is_ok() {
                 return Some("Cloud/Generic".to_string());
             }
@@ -786,11 +994,11 @@ mod tests {
         
         // Test fingerprint generation
         let fingerprint = info.generate_fingerprint();
-        assert_eq!(fingerprint.len(), 64); // SHA256 hex string length
+        assert_eq!(fingerprint.len(), 64);
         
         // Test ZKP commitment generation
         let commitment = info.generate_zkp_commitment();
-        assert_eq!(commitment.len(), 32); // SHA256 bytes
+        assert_eq!(commitment.len(), 32);
         
         // Test commitment verification
         assert!(info.verify_commitment(&commitment));
@@ -799,11 +1007,74 @@ mod tests {
         let summary = info.generate_fingerprint_summary();
         assert!(!summary.is_empty());
         println!("Fingerprint summary: {}", summary);
+        
+        // Test mobile info on mobile platforms
+        if IS_MOBILE {
+            assert!(info.mobile_info.is_some());
+        } else {
+            assert!(info.mobile_info.is_none());
+        }
     }
     
     #[test]
     fn test_fingerprint_stability() {
-        // Create two identical hardware info structures
+        // Test with mobile device
+        let mobile_hw_info = HardwareInfo {
+            hostname: "mobile-device".to_string(),
+            cpu: CpuInfo {
+                cores: 8,
+                model: "Apple A15 Bionic".to_string(),
+                frequency: 0,
+                architecture: "aarch64".to_string(),
+                vendor_id: None,
+            },
+            memory: MemoryInfo {
+                total: 6000000000,
+                available: 3000000000,
+            },
+            disk: DiskInfo {
+                total: 128000000000,
+                available: 64000000000,
+                filesystem: "apfs".to_string(),
+            },
+            network: NetworkInfo {
+                interfaces: vec![],
+                public_ip: "1.2.3.4".to_string(),
+            },
+            os: OsInfo {
+                os_type: "ios".to_string(),
+                version: "16.0".to_string(),
+                distribution: "iOS".to_string(),
+                kernel: "mobile".to_string(),
+            },
+            system_uuid: None,
+            machine_id: None,
+            bios_info: None,
+            mobile_info: Some(MobileInfo {
+                device_id: "1234-5678-9ABC-DEF0".to_string(),
+                device_model: "iPhone 14 Pro".to_string(),
+                manufacturer: "Apple".to_string(),
+                is_physical: true,
+                advertising_id: None,
+            }),
+        };
+        
+        let fingerprint1 = mobile_hw_info.generate_fingerprint();
+        let mut mobile_hw_info2 = mobile_hw_info.clone();
+        
+        // Change volatile attributes
+        mobile_hw_info2.memory.available = 2000000000;
+        mobile_hw_info2.network.public_ip = "5.6.7.8".to_string();
+        
+        let fingerprint2 = mobile_hw_info2.generate_fingerprint();
+        assert_eq!(fingerprint1, fingerprint2, "Mobile fingerprint changed with volatile data");
+        
+        // Change stable attribute (device ID)
+        mobile_hw_info2.mobile_info.as_mut().unwrap().device_id = "FFFF-FFFF-FFFF-FFFF".to_string();
+        let fingerprint3 = mobile_hw_info2.generate_fingerprint();
+        assert_ne!(fingerprint1, fingerprint3, "Mobile fingerprint didn't change when device ID changed");
+        
+        // Test server hardware (original test)
         let hw_info1 = HardwareInfo {
             hostname: "test-host".to_string(),
             cpu: CpuInfo {
@@ -843,38 +1114,37 @@ mod tests {
             system_uuid: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
             machine_id: Some("abcdef1234567890".to_string()),
             bios_info: None,
+            mobile_info: None,
         };
         
         let mut hw_info2 = hw_info1.clone();
         
-        // Change volatile attributes that shouldn't affect fingerprint
+        // Change volatile attributes
         hw_info2.memory.available = 7000000000;
         hw_info2.disk.total = 2000000000000;
         hw_info2.disk.available = 1500000000000;
         hw_info2.network.public_ip = "5.6.7.8".to_string();
-        hw_info2.os.kernel = "5.19.0".to_string(); // Kernel updates shouldn't break fingerprint
+        hw_info2.os.kernel = "5.19.0".to_string();
         
-        let fingerprint1 = hw_info1.generate_fingerprint();
-        let fingerprint2 = hw_info2.generate_fingerprint();
+        let server_fingerprint1 = hw_info1.generate_fingerprint();
+        let server_fingerprint2 = hw_info2.generate_fingerprint();
         
-        // Fingerprints should remain the same despite these changes
-        assert_eq!(fingerprint1, fingerprint2, 
-                   "Fingerprint changed despite only volatile attributes changing");
+        assert_eq!(server_fingerprint1, server_fingerprint2, 
+                   "Server fingerprint changed despite only volatile attributes changing");
         
-        // Test ZKP commitments also remain stable
+        // Test ZKP commitments
         let commitment1 = hw_info1.generate_zkp_commitment();
         let commitment2 = hw_info2.generate_zkp_commitment();
         assert_eq!(commitment1, commitment2,
                    "ZKP commitment changed despite only volatile attributes changing");
         
-        // Now change a stable attribute
+        // Change stable attribute
         hw_info2.network.interfaces[0].mac_address = "11:22:33:44:55:66".to_string();
-        let fingerprint3 = hw_info2.generate_fingerprint();
+        let server_fingerprint3 = hw_info2.generate_fingerprint();
         let commitment3 = hw_info2.generate_zkp_commitment();
         
-        // Fingerprint and commitment should change when MAC address changes
-        assert_ne!(fingerprint1, fingerprint3, 
-                   "Fingerprint didn't change when MAC address changed");
+        assert_ne!(server_fingerprint1, server_fingerprint3, 
+                   "Server fingerprint didn't change when MAC address changed");
         assert_ne!(commitment1, commitment3,
                    "ZKP commitment didn't change when MAC address changed");
     }
@@ -901,7 +1171,53 @@ mod tests {
     
     #[test]
     fn test_zkp_serialization() {
-        let hw_info = HardwareInfo {
+        // Test mobile hardware
+        let mobile_hw = HardwareInfo {
+            hostname: "mobile".to_string(),
+            cpu: CpuInfo {
+                cores: 6,
+                model: "Snapdragon 888".to_string(),
+                frequency: 0,
+                architecture: "aarch64".to_string(),
+                vendor_id: None,
+            },
+            memory: MemoryInfo {
+                total: 8000000000,
+                available: 4000000000,
+            },
+            disk: DiskInfo {
+                total: 256000000000,
+                available: 128000000000,
+                filesystem: "f2fs".to_string(),
+            },
+            network: NetworkInfo {
+                interfaces: vec![],
+                public_ip: "1.2.3.4".to_string(),
+            },
+            os: OsInfo {
+                os_type: "android".to_string(),
+                version: "13".to_string(),
+                distribution: "Android".to_string(),
+                kernel: "mobile".to_string(),
+            },
+            system_uuid: None,
+            machine_id: None,
+            bios_info: None,
+            mobile_info: Some(MobileInfo {
+                device_id: "android-id-12345".to_string(),
+                device_model: "Pixel 7".to_string(),
+                manufacturer: "Google".to_string(),
+                is_physical: true,
+                advertising_id: None,
+            }),
+        };
+        
+        let mobile_zkp_bytes = mobile_hw.to_zkp_bytes();
+        assert!(mobile_zkp_bytes.is_ok());
+        assert!(!mobile_zkp_bytes.unwrap().is_empty());
+        
+        // Test server hardware
+        let server_hw = HardwareInfo {
             hostname: "test".to_string(),
             cpu: CpuInfo {
                 cores: 4,
@@ -932,11 +1248,11 @@ mod tests {
             system_uuid: None,
             machine_id: None,
             bios_info: None,
+            mobile_info: None,
         };
         
-        // Test serialization
-        let zkp_bytes = hw_info.to_zkp_bytes();
-        assert!(zkp_bytes.is_ok());
-        assert!(!zkp_bytes.unwrap().is_empty());
+        let server_zkp_bytes = server_hw.to_zkp_bytes();
+        assert!(server_zkp_bytes.is_ok());
+        assert!(!server_zkp_bytes.unwrap().is_empty());
     }
 }
