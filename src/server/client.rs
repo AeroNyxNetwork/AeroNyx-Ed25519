@@ -8,11 +8,12 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tokio::net::TcpStream;
+use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, trace, warn};
 
 use crate::auth::AuthManager;
@@ -30,6 +31,49 @@ use crate::utils::{current_timestamp_millis, random_string};
 use crate::utils::security::StringValidator;
 use solana_sdk::pubkey::Pubkey;
 
+/// Handle a RAW (non-TLS) client connection
+pub async fn handle_client_raw(
+    stream: TcpStream,
+    addr: SocketAddr,
+    key_manager: Arc<KeyManager>,
+    auth_manager: Arc<AuthManager>,
+    ip_pool: Arc<IpPoolManager>,
+    session_manager: Arc<SessionManager>,
+    session_key_manager: Arc<SessionKeyManager>,
+    network_monitor: Arc<NetworkMonitor>,
+    packet_router: Arc<PacketRouter>,
+    metrics: Arc<ServerMetricsCollector>,
+    server_state: Arc<RwLock<ServerState>>,
+) -> Result<(), ServerError> {
+    // Directly upgrade TCP connection to WebSocket
+    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+        Ok(stream) => {
+            debug!("RAW WebSocket connection established with {}", addr);
+            stream
+        }
+        Err(e) => {
+            return Err(ServerError::WebSocket(e));
+        }
+    };
+
+    // Split the WebSocket stream and process the session
+    let (ws_sender, ws_receiver) = ws_stream.split();
+    
+    process_websocket_session(
+        ws_sender,
+        ws_receiver,
+        addr,
+        key_manager,
+        auth_manager,
+        ip_pool,
+        session_manager,
+        session_key_manager,
+        network_monitor,
+        packet_router,
+        metrics,
+        server_state,
+    ).await
+}
 
 /// Handle a client connection
 pub async fn handle_client(
@@ -75,9 +119,43 @@ pub async fn handle_client(
         }
     };
 
-    // Split the WebSocket stream
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    // Split the WebSocket stream and process the session
+    let (ws_sender, ws_receiver) = ws_stream.split();
+    
+    process_websocket_session(
+        ws_sender,
+        ws_receiver,
+        addr,
+        key_manager,
+        auth_manager,
+        ip_pool,
+        session_manager,
+        session_key_manager,
+        network_monitor,
+        packet_router,
+        metrics,
+        server_state,
+    ).await
+}
 
+/// Process a WebSocket session after the connection is established
+async fn process_websocket_session<S>(
+    mut ws_sender: SplitSink<WebSocketStream<S>, tokio_tungstenite::tungstenite::Message>,
+    mut ws_receiver: SplitStream<WebSocketStream<S>>,
+    addr: SocketAddr,
+    key_manager: Arc<KeyManager>,
+    auth_manager: Arc<AuthManager>,
+    ip_pool: Arc<IpPoolManager>,
+    session_manager: Arc<SessionManager>,
+    session_key_manager: Arc<SessionKeyManager>,
+    network_monitor: Arc<NetworkMonitor>,
+    packet_router: Arc<PacketRouter>,
+    metrics: Arc<ServerMetricsCollector>,
+    server_state: Arc<RwLock<ServerState>>,
+) -> Result<(), ServerError> 
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     // --- Authentication Phase ---
     let (public_key_string, client_encryption_preference) = match time::timeout(Duration::from_secs(30), ws_receiver.next()).await {
         Ok(Some(Ok(msg))) => {
