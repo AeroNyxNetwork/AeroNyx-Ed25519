@@ -19,7 +19,7 @@ use rustls::{Certificate, PrivateKey, ServerConfig as RustlsServerConfig};
 
 use crate::auth::AuthManager;
 use crate::auth::challenge::ChallengeError;
-use crate::config::settings::ServerConfig;
+use crate::config::settings::{ServerConfig, TransportSecurity};
 use crate::crypto::{KeyManager, SessionKeyManager};
 use crate::network::{IpPoolManager, NetworkMonitor, setup_tun_device, configure_nat, get_first_ip_from_subnet};
 use crate::network::tun::TunConfig;
@@ -27,7 +27,7 @@ use crate::protocol::MessageError;
 use crate::server::session::{SessionManager, SessionError};
 use crate::server::routing::PacketRouter;
 use crate::server::metrics::ServerMetricsCollector;
-use crate::server::client::handle_client;
+use crate::server::client::{handle_client, handle_client_raw};
 use crate::server::packet::start_tun_packet_processor;
 use crate::utils::security::RateLimiter;
 use crate::registration::RegistrationManager;
@@ -91,8 +91,8 @@ pub enum ServerState {
 pub struct VpnServer {
     /// Server configuration
     pub config: ServerConfig,
-    /// TLS acceptor for secure connections
-    pub tls_acceptor: Arc<TlsAcceptor>,
+    /// TLS acceptor for secure connections (Option for RAW mode)
+    pub tls_acceptor: Option<Arc<TlsAcceptor>>,
     /// TUN device for packet routing
     pub tun_device: Arc<Mutex<Device>>,
     /// Key manager for the server
@@ -159,9 +159,13 @@ impl VpnServer {
         // Initialize global TUN device reference
         crate::server::globals::init_globals(tun_device_arc.clone());
 
-        // Parse TLS certificates
-        let tls_config = Self::setup_tls(&config)?;
-        let tls_acceptor = Arc::new(TlsAcceptor::from(tls_config));
+        // Setup TLS acceptor only if in TLS mode
+        let tls_acceptor = if config.transport_security == TransportSecurity::Tls {
+            let tls_config = Self::setup_tls(&config)?;
+            Some(Arc::new(TlsAcceptor::from(tls_config)))
+        } else {
+            None
+        };
 
         // Initialize auth manager
         let auth_manager = Arc::new(AuthManager::new(
@@ -344,7 +348,13 @@ impl VpnServer {
             *state = ServerState::Starting;
         }
 
-        info!("Starting AeroNyx Privacy Network Server on {}", self.config.listen_addr);
+        let transport_mode = if self.config.transport_security == TransportSecurity::Tls {
+            "TLS mode (wss://)"
+        } else {
+            "RAW mode (ws://) - no TLS"
+        };
+        
+        info!("Starting AeroNyx Privacy Network Server on {} in {}", self.config.listen_addr, transport_mode);
         
         // Check if all global references are properly initialized
         if !crate::server::globals::all_initialized() {
@@ -410,7 +420,6 @@ impl VpnServer {
         }
 
         // --- Prepare for Main Loop ---
-        let tls_acceptor = self.tls_acceptor.clone();
         let key_manager = self.key_manager.clone();
         let auth_manager = self.auth_manager.clone();
         let ip_pool = self.ip_pool.clone();
@@ -422,125 +431,252 @@ impl VpnServer {
         let rate_limiter = self.rate_limiter.clone();
         let state = self.state.clone();
         let listen_addr = self.config.listen_addr;
+        let transport_security = self.config.transport_security;
 
         // --- Main Server Loop Task (Accepting Connections) ---
-         let main_server_handle = tokio::spawn(async move {
-             let listener = match TcpListener::bind(&listen_addr).await {
-                 Ok(l) => {
-                     info!("Server listening on {}", listen_addr);
-                     {
-                         let mut state_guard = state.write().await;
-                         if *state_guard == ServerState::Starting {
-                            *state_guard = ServerState::Running;
-                         } else {
-                              error!("Server state changed during bind, stopping listener task.");
-                             return;
-                         }
-                     }
-                     l
-                 }
-                 Err(e) => {
-                     error!("Failed to bind to {}: {}", listen_addr, e);
-                     let mut state_guard = state.write().await;
-                     *state_guard = ServerState::Stopped;
-                     return;
-                 }
-             };
+        let main_server_handle = if transport_security == TransportSecurity::Tls {
+            // --- TLS Mode Logic (original logic) ---
+            info!("Starting server in TLS mode (wss://)");
+            let tls_acceptor = self.tls_acceptor.clone()
+                .ok_or_else(|| ServerError::Internal("TLS acceptor not initialized".to_string()))?;
 
-             // --- Accept Loop ---
-             loop {
-                 let current_state = *state.read().await;
-                 if current_state != ServerState::Running {
-                     info!("Server state is {:?}, stopping accept loop.", current_state);
-                     break;
-                 }
+            tokio::spawn(async move {
+                let listener = match TcpListener::bind(&listen_addr).await {
+                    Ok(l) => {
+                        info!("Server listening on {} (TLS mode)", listen_addr);
+                        {
+                            let mut state_guard = state.write().await;
+                            if *state_guard == ServerState::Starting {
+                                *state_guard = ServerState::Running;
+                            } else {
+                                error!("Server state changed during bind, stopping listener task.");
+                                return;
+                            }
+                        }
+                        l
+                    }
+                    Err(e) => {
+                        error!("Failed to bind to {}: {}", listen_addr, e);
+                        let mut state_guard = state.write().await;
+                        *state_guard = ServerState::Stopped;
+                        return;
+                    }
+                };
 
-                 match listener.accept().await {
-                     Ok((stream, addr)) => {
-                         trace!("Accepted connection from {}", addr);
+                // --- Accept Loop ---
+                loop {
+                    let current_state = *state.read().await;
+                    if current_state != ServerState::Running {
+                        info!("Server state is {:?}, stopping accept loop.", current_state);
+                        break;
+                    }
 
-                         if !rate_limiter.check_rate_limit(&addr.ip()).await {
-                             warn!("Rate limit exceeded for {}, rejecting connection", addr);
-                             drop(stream);
-                             continue;
-                         }
+                    match listener.accept().await {
+                        Ok((stream, addr)) => {
+                            trace!("Accepted connection from {}", addr);
 
-                         metrics.record_new_connection().await;
+                            if !rate_limiter.check_rate_limit(&addr.ip()).await {
+                                warn!("Rate limit exceeded for {}, rejecting connection", addr);
+                                drop(stream);
+                                continue;
+                            }
 
-                         // Clone Arcs for the client handling task
-                         let tls_acceptor_clone = tls_acceptor.clone();
-                         let key_manager_clone = key_manager.clone();
-                         let auth_manager_clone = auth_manager.clone();
-                         let ip_pool_clone = ip_pool.clone();
-                         let session_manager_clone = session_manager.clone();
-                         let session_key_manager_clone = session_key_manager.clone();
-                         let network_monitor_clone = network_monitor.clone();
-                         let packet_router_clone = packet_router.clone();
-                         let metrics_clone = metrics.clone();
-                         let server_state_clone = state.clone();
+                            metrics.record_new_connection().await;
 
-                         // Spawn a task for each client
-                          tokio::spawn(async move {
-                             let client_metrics = metrics_clone;
-                             let result = handle_client(
-                                 stream,
-                                 addr,
-                                 tls_acceptor_clone,
-                                 key_manager_clone,
-                                 auth_manager_clone,
-                                 ip_pool_clone,
-                                 session_manager_clone,
-                                 session_key_manager_clone,
-                                 network_monitor_clone,
-                                 packet_router_clone,
-                                 client_metrics.clone(),
-                                 server_state_clone,
-                             ).await;
+                            // Clone Arcs for the client handling task
+                            let tls_acceptor_clone = tls_acceptor.clone();
+                            let key_manager_clone = key_manager.clone();
+                            let auth_manager_clone = auth_manager.clone();
+                            let ip_pool_clone = ip_pool.clone();
+                            let session_manager_clone = session_manager.clone();
+                            let session_key_manager_clone = session_key_manager.clone();
+                            let network_monitor_clone = network_monitor.clone();
+                            let packet_router_clone = packet_router.clone();
+                            let metrics_clone = metrics.clone();
+                            let server_state_clone = state.clone();
 
-                             // Log client disconnection reason
-                             if let Err(e) = result {
-                                 match e {
-                                     ServerError::WebSocket(ws_err) => {
-                                         use tokio_tungstenite::tungstenite::error::Error as WsError;
-                                         match ws_err {
-                                             WsError::ConnectionClosed | WsError::Protocol(_) | WsError::Io(_) => {
-                                                 trace!("WebSocket connection closed for {}: {}", addr, ws_err);
-                                             },
-                                             _ => {
-                                                 debug!("WebSocket error for {}: {}", addr, ws_err);
-                                             }
-                                         }
-                                     }
-                                     ServerError::Authentication(_) | ServerError::Tls(_) => {
-                                         debug!("Client {} disconnected due to auth/TLS error: {}", addr, e);
-                                     }
-                                      ServerError::Internal(ref msg) if msg == "Server shutting down" => {
-                                         debug!("Client {} disconnected due to server shutdown.", addr);
-                                      }
-                                     _ => {
-                                         error!("Error handling client {}: {}", addr, e);
-                                     }
-                                 }
-                             }
-                             client_metrics.record_connection_close().await;
-                         });
-                     }
-                     Err(e) => {
-                         let current_state = *state.read().await;
-                         if current_state == ServerState::Running {
-                             error!("Error accepting connection: {}", e);
-                             // Avoid busy-looping on accept errors
-                             time::sleep(Duration::from_millis(100)).await;
-                         } else {
-                              info!("Accept loop terminated due to server state change.");
-                             break; // Exit loop if server is stopping/stopped
-                         }
-                     }
-                 }
-             }
-             // Accept loop finished
-             info!("Server listener task stopped.");
-        });
+                            // Spawn a task for each client
+                            tokio::spawn(async move {
+                                let client_metrics = metrics_clone;
+                                let result = handle_client(
+                                    stream,
+                                    addr,
+                                    tls_acceptor_clone,
+                                    key_manager_clone,
+                                    auth_manager_clone,
+                                    ip_pool_clone,
+                                    session_manager_clone,
+                                    session_key_manager_clone,
+                                    network_monitor_clone,
+                                    packet_router_clone,
+                                    client_metrics.clone(),
+                                    server_state_clone,
+                                ).await;
+
+                                // Log client disconnection reason
+                                if let Err(e) = result {
+                                    match e {
+                                        ServerError::WebSocket(ws_err) => {
+                                            use tokio_tungstenite::tungstenite::error::Error as WsError;
+                                            match ws_err {
+                                                WsError::ConnectionClosed | WsError::Protocol(_) | WsError::Io(_) => {
+                                                    trace!("WebSocket connection closed for {}: {}", addr, ws_err);
+                                                },
+                                                _ => {
+                                                    debug!("WebSocket error for {}: {}", addr, ws_err);
+                                                }
+                                            }
+                                        }
+                                        ServerError::Authentication(_) | ServerError::Tls(_) => {
+                                            debug!("Client {} disconnected due to auth/TLS error: {}", addr, e);
+                                        }
+                                        ServerError::Internal(ref msg) if msg == "Server shutting down" => {
+                                            debug!("Client {} disconnected due to server shutdown.", addr);
+                                        }
+                                        _ => {
+                                            error!("Error handling client {}: {}", addr, e);
+                                        }
+                                    }
+                                }
+                                client_metrics.record_connection_close().await;
+                            });
+                        }
+                        Err(e) => {
+                            let current_state = *state.read().await;
+                            if current_state == ServerState::Running {
+                                error!("Error accepting connection: {}", e);
+                                // Avoid busy-looping on accept errors
+                                time::sleep(Duration::from_millis(100)).await;
+                            } else {
+                                info!("Accept loop terminated due to server state change.");
+                                break; // Exit loop if server is stopping/stopped
+                            }
+                        }
+                    }
+                }
+                // Accept loop finished
+                info!("Server listener task stopped (TLS mode).");
+            })
+        } else {
+            // --- RAW Mode Logic (new logic) ---
+            info!("Starting server in RAW mode (ws://) - no TLS");
+            
+            tokio::spawn(async move {
+                let listener = match TcpListener::bind(&listen_addr).await {
+                    Ok(l) => {
+                        info!("Server listening on {} (RAW mode)", listen_addr);
+                        {
+                            let mut state_guard = state.write().await;
+                            if *state_guard == ServerState::Starting {
+                                *state_guard = ServerState::Running;
+                            } else {
+                                error!("Server state changed during bind, stopping listener task.");
+                                return;
+                            }
+                        }
+                        l
+                    }
+                    Err(e) => {
+                        error!("Failed to bind to {}: {}", listen_addr, e);
+                        let mut state_guard = state.write().await;
+                        *state_guard = ServerState::Stopped;
+                        return;
+                    }
+                };
+
+                // --- Accept Loop ---
+                loop {
+                    let current_state = *state.read().await;
+                    if current_state != ServerState::Running {
+                        info!("Server state is {:?}, stopping accept loop.", current_state);
+                        break;
+                    }
+
+                    match listener.accept().await {
+                        Ok((stream, addr)) => {
+                            trace!("Accepted connection from {}", addr);
+
+                            if !rate_limiter.check_rate_limit(&addr.ip()).await {
+                                warn!("Rate limit exceeded for {}, rejecting connection", addr);
+                                drop(stream);
+                                continue;
+                            }
+
+                            metrics.record_new_connection().await;
+
+                            // Clone Arcs for the client handling task
+                            let key_manager_clone = key_manager.clone();
+                            let auth_manager_clone = auth_manager.clone();
+                            let ip_pool_clone = ip_pool.clone();
+                            let session_manager_clone = session_manager.clone();
+                            let session_key_manager_clone = session_key_manager.clone();
+                            let network_monitor_clone = network_monitor.clone();
+                            let packet_router_clone = packet_router.clone();
+                            let metrics_clone = metrics.clone();
+                            let server_state_clone = state.clone();
+
+                            // Spawn a task for each client
+                            tokio::spawn(async move {
+                                let client_metrics = metrics_clone;
+                                let result = handle_client_raw(
+                                    stream,
+                                    addr,
+                                    key_manager_clone,
+                                    auth_manager_clone,
+                                    ip_pool_clone,
+                                    session_manager_clone,
+                                    session_key_manager_clone,
+                                    network_monitor_clone,
+                                    packet_router_clone,
+                                    client_metrics.clone(),
+                                    server_state_clone,
+                                ).await;
+
+                                // Log client disconnection reason
+                                if let Err(e) = result {
+                                    match e {
+                                        ServerError::WebSocket(ws_err) => {
+                                            use tokio_tungstenite::tungstenite::error::Error as WsError;
+                                            match ws_err {
+                                                WsError::ConnectionClosed | WsError::Protocol(_) | WsError::Io(_) => {
+                                                    trace!("WebSocket connection closed for {}: {}", addr, ws_err);
+                                                },
+                                                _ => {
+                                                    debug!("WebSocket error for {}: {}", addr, ws_err);
+                                                }
+                                            }
+                                        }
+                                        ServerError::Authentication(_) => {
+                                            debug!("Client {} disconnected due to auth error: {}", addr, e);
+                                        }
+                                        ServerError::Internal(ref msg) if msg == "Server shutting down" => {
+                                            debug!("Client {} disconnected due to server shutdown.", addr);
+                                        }
+                                        _ => {
+                                            error!("Error handling client {}: {}", addr, e);
+                                        }
+                                    }
+                                }
+                                client_metrics.record_connection_close().await;
+                            });
+                        }
+                        Err(e) => {
+                            let current_state = *state.read().await;
+                            if current_state == ServerState::Running {
+                                error!("Error accepting connection: {}", e);
+                                // Avoid busy-looping on accept errors
+                                time::sleep(Duration::from_millis(100)).await;
+                            } else {
+                                info!("Accept loop terminated due to server state change.");
+                                break; // Exit loop if server is stopping/stopped
+                            }
+                        }
+                    }
+                }
+                // Accept loop finished
+                info!("Server listener task stopped (RAW mode).");
+            })
+        };
 
         Ok(main_server_handle)
     }
@@ -801,7 +937,11 @@ mod tests {
             registration_reference_code: None,
             wallet_address: None,
             api_url: "https://api.aeronyx.network".to_string(),
+            enable_remote_management: false,
+            remote_security_mode: "restricted".to_string(),
+            transport_security: TransportSecurity::Tls,
             key_manager: None, // Let KeyManager be created internally if needed
+            mode: crate::config::settings::NodeMode::VPNEnabled,
         };
 
          println!("Testing TLS setup...");
