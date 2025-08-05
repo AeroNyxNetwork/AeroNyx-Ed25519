@@ -382,7 +382,7 @@ where
         addr,
         ws_sender_mutex.clone(),
         ws_receiver_mutex.clone(),
-        Some(encrypted_key_packet.algorithm.as_str().to_string()), // FIX: Wrap in Some()
+        Some(encrypted_key_packet.algorithm.as_str().to_string()), // Encryption algorithm
     )?;
 
     // Create IP assignment packet with encryption algorithm info
