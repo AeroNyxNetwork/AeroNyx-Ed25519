@@ -374,7 +374,6 @@ where
     let ws_receiver_mutex = Arc::new(Mutex::new(ws_receiver));
 
     // Create the ClientSession with encryption algorithm from the encrypted packet
-    // Fix: Wrap the algorithm string in Some() since ClientSession::new expects Option<String>
     let session = ClientSession::new(
         session_id.clone(),
         public_key_string.clone(),
