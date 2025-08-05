@@ -56,12 +56,9 @@ pub async fn handle_client_raw(
         }
     };
 
-    // Split the WebSocket stream and process the session
-    let (ws_sender, ws_receiver) = ws_stream.split();
-    
-    process_websocket_session(
-        ws_sender,
-        ws_receiver,
+    // Process the WebSocket session
+    process_raw_websocket_session(
+        ws_stream,
         addr,
         key_manager,
         auth_manager,
@@ -119,10 +116,39 @@ pub async fn handle_client(
         }
     };
 
-    // Split the WebSocket stream and process the session
+    // Process the WebSocket session
+    process_tls_websocket_session(
+        ws_stream,
+        addr,
+        key_manager,
+        auth_manager,
+        ip_pool,
+        session_manager,
+        session_key_manager,
+        network_monitor,
+        packet_router,
+        metrics,
+        server_state,
+    ).await
+}
+
+/// Process a RAW WebSocket session
+async fn process_raw_websocket_session(
+    ws_stream: WebSocketStream<TcpStream>,
+    addr: SocketAddr,
+    key_manager: Arc<KeyManager>,
+    auth_manager: Arc<AuthManager>,
+    ip_pool: Arc<IpPoolManager>,
+    session_manager: Arc<SessionManager>,
+    session_key_manager: Arc<SessionKeyManager>,
+    network_monitor: Arc<NetworkMonitor>,
+    packet_router: Arc<PacketRouter>,
+    metrics: Arc<ServerMetricsCollector>,
+    server_state: Arc<RwLock<ServerState>>,
+) -> Result<(), ServerError> {
     let (ws_sender, ws_receiver) = ws_stream.split();
     
-    process_websocket_session(
+    process_websocket_session_common(
         ws_sender,
         ws_receiver,
         addr,
@@ -138,10 +164,9 @@ pub async fn handle_client(
     ).await
 }
 
-/// Process a WebSocket session after the connection is established
-async fn process_websocket_session<S>(
-    mut ws_sender: SplitSink<WebSocketStream<S>, tokio_tungstenite::tungstenite::Message>,
-    mut ws_receiver: SplitStream<WebSocketStream<S>>,
+/// Process a TLS WebSocket session
+async fn process_tls_websocket_session(
+    ws_stream: WebSocketStream<TlsStream<TcpStream>>,
     addr: SocketAddr,
     key_manager: Arc<KeyManager>,
     auth_manager: Arc<AuthManager>,
@@ -152,9 +177,44 @@ async fn process_websocket_session<S>(
     packet_router: Arc<PacketRouter>,
     metrics: Arc<ServerMetricsCollector>,
     server_state: Arc<RwLock<ServerState>>,
-) -> Result<(), ServerError> 
+) -> Result<(), ServerError> {
+    let (ws_sender, ws_receiver) = ws_stream.split();
+    
+    process_websocket_session_common(
+        ws_sender,
+        ws_receiver,
+        addr,
+        key_manager,
+        auth_manager,
+        ip_pool,
+        session_manager,
+        session_key_manager,
+        network_monitor,
+        packet_router,
+        metrics,
+        server_state,
+    ).await
+}
+
+/// Common WebSocket session processing logic
+async fn process_websocket_session_common<S, R>(
+    mut ws_sender: S,
+    mut ws_receiver: R,
+    addr: SocketAddr,
+    key_manager: Arc<KeyManager>,
+    auth_manager: Arc<AuthManager>,
+    ip_pool: Arc<IpPoolManager>,
+    session_manager: Arc<SessionManager>,
+    session_key_manager: Arc<SessionKeyManager>,
+    network_monitor: Arc<NetworkMonitor>,
+    packet_router: Arc<PacketRouter>,
+    metrics: Arc<ServerMetricsCollector>,
+    server_state: Arc<RwLock<ServerState>>,
+) -> Result<(), ServerError>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: SinkExt<tokio_tungstenite::tungstenite::Message> + Unpin + Send + 'static,
+    R: StreamExt<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Unpin + Send + 'static,
+    S::Error: Into<tokio_tungstenite::tungstenite::Error>,
 {
     // --- Authentication Phase ---
     let (public_key_string, client_encryption_preference) = match time::timeout(Duration::from_secs(30), ws_receiver.next()).await {
@@ -370,19 +430,27 @@ where
         }
     };
 
-    let ws_sender_mutex = Arc::new(Mutex::new(ws_sender));
-    let ws_receiver_mutex = Arc::new(Mutex::new(ws_receiver));
+    // Box the sender and receiver to make them trait objects
+    let ws_sender_boxed: Box<dyn futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error> + Send + Sync + Unpin> = 
+        Box::new(ws_sender.sink_map_err(|e| e.into()));
+    let ws_receiver_boxed: Box<dyn futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Send + Sync + Unpin> = 
+        Box::new(ws_receiver);
 
-    // Create the ClientSession with encryption algorithm from the encrypted packet
-    let session = ClientSession::new(
-        session_id.clone(),
-        public_key_string.clone(),
-        ip_address.clone(),
-        addr,
-        ws_sender_mutex.clone(),
-        ws_receiver_mutex.clone(),
-        Some(encrypted_key_packet.algorithm.as_str().to_string()), // Encryption algorithm
-    )?;
+    let ws_sender_mutex = Arc::new(Mutex::new(ws_sender_boxed));
+    let ws_receiver_mutex = Arc::new(Mutex::new(ws_receiver_boxed));
+
+    // Create the ClientSession
+    let session = ClientSession {
+        id: session_id.clone(),
+        client_id: public_key_string.clone(),
+        ip_address: ip_address.clone(),
+        address: addr,
+        last_activity: Arc::new(RwLock::new(std::time::Instant::now())),
+        encryption_algorithm: encrypted_key_packet.algorithm.as_str().to_string(),
+        stream_taken: Arc::new(RwLock::new(false)),
+        ws_sender: ws_sender_mutex.clone(),
+        ws_receiver: ws_receiver_mutex.clone(),
+    };
 
     // Create IP assignment packet with encryption algorithm info
     let ip_assign = PacketType::IpAssign {
