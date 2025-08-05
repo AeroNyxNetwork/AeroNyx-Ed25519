@@ -61,6 +61,26 @@ impl Default for NodeMode {
     }
 }
 
+/// Transport layer security mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+pub enum TransportSecurity {
+    /// [Default] Use TLS encryption (wss://), requires certificates
+    #[value(name = "tls")]
+    #[serde(rename = "tls")]
+    Tls,
+    
+    /// No TLS, direct communication (ws://), no certificates required
+    #[value(name = "raw")]
+    #[serde(rename = "raw")]
+    Raw,
+}
+
+impl Default for TransportSecurity {
+    fn default() -> Self {
+        TransportSecurity::Tls
+    }
+}
+
 /// Command enum for subcommands
 #[derive(Parser, Debug, Clone)]
 pub enum Command {
@@ -85,6 +105,10 @@ pub struct ServerArgs {
     #[clap(long, value_enum, default_value = "depin-only")]
     pub mode: NodeMode,
 
+    /// Transport layer security mode
+    #[clap(long, value_enum, default_value = "tls")]
+    pub transport_security: TransportSecurity,
+
     /// Server address to listen on (required for VPN modes)
     #[clap(long, default_value = "0.0.0.0:8443")]
     pub listen: String,
@@ -101,11 +125,11 @@ pub struct ServerArgs {
     #[clap(long, default_value = defaults::DEFAULT_LOG_LEVEL)]
     pub log_level: String,
 
-    /// TLS certificate file (required for VPN modes)
+    /// TLS certificate file (required for VPN modes with TLS)
     #[clap(long)]
     pub cert_file: Option<String>,
 
-    /// TLS key file (required for VPN modes)
+    /// TLS key file (required for VPN modes with TLS)
     #[clap(long)]
     pub key_file: Option<String>,
 
@@ -184,6 +208,10 @@ pub struct ServerConfig {
     /// Node operation mode
     #[serde(default)]
     pub mode: NodeMode,
+    
+    /// Transport layer security mode
+    #[serde(default)]
+    pub transport_security: TransportSecurity,
     
     /// Server listen address
     pub listen_addr: SocketAddr,
@@ -299,6 +327,7 @@ impl ServerConfig {
                 
                 // Override with command line arguments if explicitly provided
                 config.mode = args.mode;
+                config.transport_security = args.transport_security;
                 
                 if args.listen != "0.0.0.0:8443" {
                     config.listen_addr = args.listen.parse()?;
@@ -330,17 +359,18 @@ impl ServerConfig {
             "127.0.0.1:8443".parse().unwrap()
         };
         
-        // Determine certificate and key files based on mode
-        let (cert_file, key_file) = if matches!(args.mode, NodeMode::VPNEnabled | NodeMode::Hybrid) {
-            // For VPN modes, require cert and key files
+        // Determine certificate and key files based on mode and transport security
+        let (cert_file, key_file) = if matches!(args.mode, NodeMode::VPNEnabled | NodeMode::Hybrid) 
+            && args.transport_security == TransportSecurity::Tls {
+            // For VPN modes with TLS, require cert and key files
             match (args.cert_file, args.key_file) {
                 (Some(cert), Some(key)) => (PathBuf::from(cert), PathBuf::from(key)),
                 _ => return Err(ConfigError::Invalid(
-                    "Certificate and key files are required for VPN-enabled modes".to_string()
+                    "Certificate and key files are required for VPN-enabled modes with TLS".to_string()
                 )),
             }
         } else {
-            // For DePIN-only mode, use dummy paths
+            // For DePIN-only mode or RAW transport, use dummy paths
             (PathBuf::from("dummy.crt"), PathBuf::from("dummy.key"))
         };
         
@@ -358,6 +388,7 @@ impl ServerConfig {
         
         let config = Self {
             mode: args.mode,
+            transport_security: args.transport_security,
             listen_addr,
             tun_name: args.tun_name,
             subnet: args.subnet,
@@ -398,8 +429,9 @@ impl ServerConfig {
                 )));
             }
             
-            // Check that cert and key files exist for VPN modes
-            if !self.cert_file.to_string_lossy().contains("dummy") {
+            // Check that cert and key files exist for VPN modes with TLS
+            if self.transport_security == TransportSecurity::Tls 
+                && !self.cert_file.to_string_lossy().contains("dummy") {
                 if !self.cert_file.exists() {
                     return Err(ConfigError::Invalid(format!(
                         "Certificate file not found: {:?}", self.cert_file
@@ -456,6 +488,11 @@ impl ServerConfig {
     /// Check if DePIN functionality is enabled
     pub fn is_depin_enabled(&self) -> bool {
         matches!(self.mode, NodeMode::DePINOnly | NodeMode::Hybrid)
+    }
+    
+    /// Check if TLS is required
+    pub fn is_tls_required(&self) -> bool {
+        self.transport_security == TransportSecurity::Tls
     }
     
     /// Save configuration to a file
@@ -515,6 +552,7 @@ mod tests {
     fn test_validate_valid_config() {
         let config = ServerConfig {
             mode: NodeMode::Hybrid,
+            transport_security: TransportSecurity::Tls,
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
             tun_name: "tun0".to_string(),
             subnet: "10.7.0.0/24".to_string(),
@@ -545,6 +583,7 @@ mod tests {
     fn test_validate_invalid_subnet() {
         let mut config = ServerConfig {
             mode: NodeMode::VPNEnabled,
+            transport_security: TransportSecurity::Tls,
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
             tun_name: "tun0".to_string(),
             subnet: "10.7.0.0".to_string(), // Missing CIDR mask
@@ -579,6 +618,7 @@ mod tests {
     fn test_mode_checks() {
         let mut config = ServerConfig {
             mode: NodeMode::DePINOnly,
+            transport_security: TransportSecurity::Tls,
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
             tun_name: "tun0".to_string(),
             subnet: "10.7.0.0/24".to_string(),
@@ -618,6 +658,42 @@ mod tests {
     }
     
     #[test]
+    fn test_transport_security() {
+        let mut config = ServerConfig {
+            mode: NodeMode::VPNEnabled,
+            transport_security: TransportSecurity::Tls,
+            listen_addr: "127.0.0.1:8080".parse().unwrap(),
+            tun_name: "tun0".to_string(),
+            subnet: "10.7.0.0/24".to_string(),
+            cert_file: PathBuf::from("server.crt"),
+            key_file: PathBuf::from("server.key"),
+            acl_file: PathBuf::from("acl.json"),
+            enable_obfuscation: false,
+            obfuscation_method: "xor".to_string(),
+            enable_padding: false,
+            key_rotation_interval: Duration::from_secs(3600),
+            session_timeout: Duration::from_secs(86400),
+            max_connections_per_ip: 10,
+            data_dir: PathBuf::from("/tmp"),
+            server_key_file: PathBuf::from("/tmp/server_key.json"),
+            registration_code: None,
+            registration_reference_code: None,
+            wallet_address: None,
+            api_url: "https://api.aeronyx.network".to_string(),
+            enable_remote_management: false,
+            remote_security_mode: "restricted".to_string(),
+            key_manager: None,
+        };
+        
+        // Test TLS mode
+        assert!(config.is_tls_required());
+        
+        // Test RAW mode
+        config.transport_security = TransportSecurity::Raw;
+        assert!(!config.is_tls_required());
+    }
+    
+    #[test]
     fn test_platform_specific_data_dir() {
         let default_dir = defaults::default_data_dir();
         
@@ -632,6 +708,7 @@ mod tests {
     fn test_security_mode_validation() {
         let mut config = ServerConfig {
             mode: NodeMode::DePINOnly,
+            transport_security: TransportSecurity::Tls,
             listen_addr: "127.0.0.1:8080".parse().unwrap(),
             tun_name: "tun0".to_string(),
             subnet: "10.7.0.0/24".to_string(),
