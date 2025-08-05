@@ -381,7 +381,7 @@ where
         addr,
         ws_sender_mutex.clone(),
         ws_receiver_mutex.clone(),
-        Some(encrypted_key_packet.algorithm.as_str().to_string()),
+        encrypted_key_packet.algorithm.as_str().to_string(),
     )?;
 
     // Create IP assignment packet with encryption algorithm info
@@ -494,9 +494,9 @@ async fn process_client_session(
 
              if let Some(current_key) = session_key_manager_clone.get_key(&session_rot.client_id).await {
                  // Use the session's encryption algorithm for key rotation
-                 // Unwrap the Option<String> to get &str, then parse algorithm
+                 // Access the encryption_algorithm field directly
                  let algorithm = EncryptionAlgorithm::from_str(&session_rot.encryption_algorithm)
-                .unwrap_or_default(); // Default if None or parsing fails
+                .unwrap_or_default(); // Default if parsing fails
 
                  let encrypted_packet = match crate::crypto::flexible_encryption::encrypt_flexible(
                      &new_key,
