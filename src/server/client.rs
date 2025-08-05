@@ -56,12 +56,9 @@ pub async fn handle_client_raw(
         }
     };
 
-    // Split the WebSocket stream and process the session
-    let (ws_sender, ws_receiver) = ws_stream.split();
-    
-    process_websocket_session(
-        ws_sender,
-        ws_receiver,
+    // Process the raw WebSocket session
+    process_websocket_raw(
+        ws_stream,
         addr,
         key_manager,
         auth_manager,
@@ -75,7 +72,7 @@ pub async fn handle_client_raw(
     ).await
 }
 
-/// Handle a client connection
+/// Handle a client connection with TLS
 pub async fn handle_client(
     stream: TcpStream,
     addr: SocketAddr,
@@ -102,8 +99,6 @@ pub async fn handle_client(
             stream
         }
         Err(e) => {
-            // Record failed handshake (consider if this metric makes sense on failure)
-            // metrics.record_handshake_failure().await; // Or a dedicated failure metric
             return Err(ServerError::Tls(format!("TLS handshake failed: {}", e)));
         }
     };
@@ -115,14 +110,43 @@ pub async fn handle_client(
             stream
         }
         Err(e) => {
-            return Err(ServerError::WebSocket(e)); // Use the From trait
+            return Err(ServerError::WebSocket(e));
         }
     };
 
-    // Split the WebSocket stream and process the session
+    // Process the TLS WebSocket session
+    process_websocket_tls(
+        ws_stream,
+        addr,
+        key_manager,
+        auth_manager,
+        ip_pool,
+        session_manager,
+        session_key_manager,
+        network_monitor,
+        packet_router,
+        metrics,
+        server_state,
+    ).await
+}
+
+/// Process a WebSocket session over TLS
+async fn process_websocket_tls(
+    ws_stream: WebSocketStream<TlsStream<TcpStream>>,
+    addr: SocketAddr,
+    key_manager: Arc<KeyManager>,
+    auth_manager: Arc<AuthManager>,
+    ip_pool: Arc<IpPoolManager>,
+    session_manager: Arc<SessionManager>,
+    session_key_manager: Arc<SessionKeyManager>,
+    network_monitor: Arc<NetworkMonitor>,
+    packet_router: Arc<PacketRouter>,
+    metrics: Arc<ServerMetricsCollector>,
+    server_state: Arc<RwLock<ServerState>>,
+) -> Result<(), ServerError> {
     let (ws_sender, ws_receiver) = ws_stream.split();
     
-    process_websocket_session(
+    process_websocket_common(
         ws_sender,
         ws_receiver,
         addr,
@@ -138,8 +162,40 @@ pub async fn handle_client(
     ).await
 }
 
-/// Process a WebSocket session after the connection is established
-async fn process_websocket_session<S>(
+/// Process a WebSocket session without TLS
+async fn process_websocket_raw(
+    ws_stream: WebSocketStream<TcpStream>,
+    addr: SocketAddr,
+    key_manager: Arc<KeyManager>,
+    auth_manager: Arc<AuthManager>,
+    ip_pool: Arc<IpPoolManager>,
+    session_manager: Arc<SessionManager>,
+    session_key_manager: Arc<SessionKeyManager>,
+    network_monitor: Arc<NetworkMonitor>,
+    packet_router: Arc<PacketRouter>,
+    metrics: Arc<ServerMetricsCollector>,
+    server_state: Arc<RwLock<ServerState>>,
+) -> Result<(), ServerError> {
+    let (ws_sender, ws_receiver) = ws_stream.split();
+    
+    process_websocket_common(
+        ws_sender,
+        ws_receiver,
+        addr,
+        key_manager,
+        auth_manager,
+        ip_pool,
+        session_manager,
+        session_key_manager,
+        network_monitor,
+        packet_router,
+        metrics,
+        server_state,
+    ).await
+}
+
+/// Common WebSocket session processing logic
+async fn process_websocket_common<S>(
     mut ws_sender: SplitSink<WebSocketStream<S>, tokio_tungstenite::tungstenite::Message>,
     mut ws_receiver: SplitStream<WebSocketStream<S>>,
     addr: SocketAddr,
