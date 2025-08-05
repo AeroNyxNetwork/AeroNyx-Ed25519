@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod client;
 pub mod packet;
 pub mod globals;
+pub mod connection;
 
 // Re-export commonly used items
 pub use core::VpnServer;
