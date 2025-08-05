@@ -23,6 +23,7 @@ ipnetwork = "0.20"
 pnet = "0.34"
 portable-pty = "0.8"
 libc = "0.2"
+async-trait = "0.1"
 
 # WebSockets
 tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
