@@ -280,8 +280,8 @@ impl RegistrationManager {
                         setup_params,
                     ).await?;
                 } else {
-                    // Handle generic message
-                    self.handle_generic_message(
+                    // Handle generic message - renamed to avoid conflict
+                    self.handle_generic_message_v2(
                         &text,
                         write,
                         &mut state.authenticated,
@@ -382,7 +382,7 @@ impl RegistrationManager {
             if let Some(mut rx) = terminal_tracker.remove(&session_id) {
                 rx.close();
                 
-                if let Some(manager) = &self.terminal_manager {
+                if let Some(manager) = &*self.terminal_manager {
                     if let Err(e) = manager.close_session(&session_id).await {
                         warn!("Failed to close terminal session {}: {}", session_id, e);
                     }
@@ -406,8 +406,8 @@ impl RegistrationManager {
         }
     }
     
-    /// Handle generic message with terminal support
-    async fn handle_generic_message(
+    /// Handle generic message with terminal support (renamed to avoid conflict)
+    async fn handle_generic_message_v2(
         &self,
         text: &str,
         write: &mut WsSink,
@@ -436,7 +436,7 @@ impl RegistrationManager {
                                 terminal_tracker.insert(session_id.clone(), rx);
                                 
                                 // Start output reader
-                                if let Some(manager) = &self.terminal_manager {
+                                if let Some(manager) = &*self.terminal_manager {
                                     self.start_terminal_output_reader(
                                         manager.clone(),
                                         session_id,
