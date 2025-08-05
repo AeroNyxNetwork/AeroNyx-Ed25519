@@ -24,7 +24,7 @@ mod terminal;
 mod terminal_manager;
 
 use zkp_halo2::{initialize, SetupParams};
-use config::settings::{ServerConfig, ServerArgs, Command, NodeMode};
+use config::settings::{ServerConfig, ServerArgs, Command, NodeMode, TransportSecurity};
 use server::VpnServer;
 use registration::RegistrationManager;
 use hardware::HardwareInfo;
@@ -43,9 +43,10 @@ async fn main() -> anyhow::Result<()> {
         return handle_registration_setup(&registration_code, &args).await;
     }
     
-    info!("Starting AeroNyx Node v{} in {:?} mode", 
+    info!("Starting AeroNyx Node v{} in {:?} mode with {:?} transport", 
           env!("CARGO_PKG_VERSION"), 
-          args.mode);
+          args.mode,
+          args.transport_security);
     
     // Check root permission only for VPN mode
     #[cfg(target_family = "unix")]
@@ -56,11 +57,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     
-    // Check certificates only for VPN mode
-    if matches!(args.mode, NodeMode::VPNEnabled | NodeMode::Hybrid) {
+    // Check certificates only for VPN mode with TLS
+    if matches!(args.mode, NodeMode::VPNEnabled | NodeMode::Hybrid) 
+        && args.transport_security == TransportSecurity::Tls {
         if args.cert_file.is_none() || args.key_file.is_none() {
-            error!("VPN mode requires TLS certificate and key files");
-            error!("Use --cert-file and --key-file options");
+            error!("VPN mode with TLS requires TLS certificate and key files");
+            error!("Use --cert-file and --key-file options, or run with --transport-security raw");
             process::exit(1);
         }
         
@@ -73,12 +75,22 @@ async fn main() -> anyhow::Result<()> {
             error!("  - Key file: {}", key_file);
             error!("You can generate self-signed certificates with OpenSSL:");
             error!("  openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes");
+            error!("Or run with --transport-security raw to disable TLS");
             process::exit(1);
         }
     }
     
     // Create server configuration
     let config = ServerConfig::from_args(args.clone())?;
+    
+    // Warn about security implications of RAW mode
+    if config.transport_security == TransportSecurity::Raw {
+        warn!("⚠️  WARNING: Running in RAW mode without TLS encryption!");
+        warn!("⚠️  Control channel will be unencrypted (authentication and key exchange)");
+        warn!("⚠️  This mode is vulnerable to man-in-the-middle attacks");
+        warn!("⚠️  Only use in trusted network environments or with additional encryption layers");
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    }
     
     // Run based on mode
     match config.mode {
@@ -364,6 +376,12 @@ async fn handle_registration_setup(registration_code: &str, args: &ServerArgs) -
             info!("");
             info!("  For DePIN-only mode with full remote access (use with caution!):");
             info!("    {} --mode depin-only --enable-remote-management --remote-security-mode full-access", env!("CARGO_PKG_NAME"));
+            info!("");
+            info!("  For VPN mode with TLS (secure):");
+            info!("    {} --mode vpn-enabled --cert-file server.crt --key-file server.key", env!("CARGO_PKG_NAME"));
+            info!("");
+            info!("  For VPN mode without TLS (RAW mode - use with caution!):");
+            info!("    {} --mode vpn-enabled --transport-security raw", env!("CARGO_PKG_NAME"));
             info!("");
             info!("Your reference code: {}", response.node.reference_code);
             if reg_manager.has_zkp_enabled() {
