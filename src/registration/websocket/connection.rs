@@ -363,7 +363,7 @@ impl RegistrationManager {
     async fn send_terminal_output(
         &self,
         write: &mut WsSink,
-        session_id: &str,
+        _session_id: &str,
         msg: TerminalMessage,
     ) -> Result<(), String> {
         let json = serde_json::to_string(&msg)
@@ -382,10 +382,9 @@ impl RegistrationManager {
             if let Some(mut rx) = terminal_tracker.remove(&session_id) {
                 rx.close();
                 
-                if let Some(manager) = &*self.terminal_manager {
-                    if let Err(e) = manager.close_session(&session_id).await {
-                        warn!("Failed to close terminal session {}: {}", session_id, e);
-                    }
+                // terminal_manager is Arc<TerminalSessionManager>, not Option
+                if let Err(e) = self.terminal_manager.close_session(&session_id).await {
+                    warn!("Failed to close terminal session {}: {}", session_id, e);
                 }
             }
         }
@@ -436,13 +435,12 @@ impl RegistrationManager {
                                 terminal_tracker.insert(session_id.clone(), rx);
                                 
                                 // Start output reader
-                                if let Some(manager) = &*self.terminal_manager {
-                                    self.start_terminal_output_reader(
-                                        manager.clone(),
-                                        session_id,
-                                        tx
-                                    ).await;
-                                }
+                                // terminal_manager is Arc<TerminalSessionManager>, not Option
+                                self.start_terminal_output_reader(
+                                    self.terminal_manager.clone(),
+                                    session_id,
+                                    tx
+                                ).await;
                             }
                         }
                     }
