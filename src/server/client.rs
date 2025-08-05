@@ -29,7 +29,9 @@ use crate::server::metrics::ServerMetricsCollector;
 use crate::server::core::{ServerError, ServerState};
 use crate::utils::{current_timestamp_millis, random_string};
 use crate::utils::security::StringValidator;
+use crate::utils::security::StringValidator;
 use solana_sdk::pubkey::Pubkey;
+use crate::server::connection::DuplexWebSocketConnection;
 
 /// Handle a RAW (non-TLS) client connection
 pub async fn handle_client_raw(
@@ -45,10 +47,6 @@ pub async fn handle_client_raw(
     metrics: Arc<ServerMetricsCollector>,
     server_state: Arc<RwLock<ServerState>>,
 ) -> Result<(), ServerError> {
-    // For RAW mode, we can't use ClientSession as it's hardcoded for TLS
-    // We need to implement the session logic directly here
-    warn!("RAW mode is not fully implemented - ClientSession requires TLS stream types");
-    
     // Directly upgrade TCP connection to WebSocket
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
         Ok(stream) => {
@@ -60,12 +58,23 @@ pub async fn handle_client_raw(
         }
     };
 
-    // Split the WebSocket stream
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    // Create duplex connection wrapper
+    let duplex_conn = DuplexWebSocketConnection::new_raw(ws_stream);
     
-    // For now, return an error indicating RAW mode needs implementation
-    // TODO: Implement a generic session handler or modify ClientSession to support non-TLS streams
-    Err(ServerError::Internal("RAW mode requires ClientSession to be modified to support non-TLS streams".to_string()))
+    // Process the WebSocket session using the common logic
+    process_websocket_session_with_connection(
+        duplex_conn,
+        addr,
+        key_manager,
+        auth_manager,
+        ip_pool,
+        session_manager,
+        session_key_manager,
+        network_monitor,
+        packet_router,
+        metrics,
+        server_state,
+    ).await
 }
 
 /// Handle a client connection
@@ -95,8 +104,6 @@ pub async fn handle_client(
             stream
         }
         Err(e) => {
-            // Record failed handshake (consider if this metric makes sense on failure)
-            // metrics.record_handshake_failure().await; // Or a dedicated failure metric
             return Err(ServerError::Tls(format!("TLS handshake failed: {}", e)));
         }
     };
@@ -108,16 +115,16 @@ pub async fn handle_client(
             stream
         }
         Err(e) => {
-            return Err(ServerError::WebSocket(e)); // Use the From trait
+            return Err(ServerError::WebSocket(e));
         }
     };
 
-    // Split the WebSocket stream and process the session
-    let (ws_sender, ws_receiver) = ws_stream.split();
+    // Create duplex connection wrapper
+    let duplex_conn = DuplexWebSocketConnection::new_tls(ws_stream);
     
-    process_websocket_session(
-        ws_sender,
-        ws_receiver,
+    // Process the WebSocket session using the common logic
+    process_websocket_session_with_connection(
+        duplex_conn,
         addr,
         key_manager,
         auth_manager,
@@ -131,10 +138,9 @@ pub async fn handle_client(
     ).await
 }
 
-/// Process a WebSocket session after the connection is established
-async fn process_websocket_session(
-    mut ws_sender: SplitSink<WebSocketStream<TlsStream<TcpStream>>, tokio_tungstenite::tungstenite::Message>,
-    mut ws_receiver: SplitStream<WebSocketStream<TlsStream<TcpStream>>>,
+/// Process a WebSocket session with an abstract connection
+async fn process_websocket_session_with_connection(
+    duplex_conn: DuplexWebSocketConnection,
     addr: SocketAddr,
     key_manager: Arc<KeyManager>,
     auth_manager: Arc<AuthManager>,
@@ -147,7 +153,7 @@ async fn process_websocket_session(
     server_state: Arc<RwLock<ServerState>>,
 ) -> Result<(), ServerError> {
     // --- Authentication Phase ---
-    let (public_key_string, client_encryption_preference) = match time::timeout(Duration::from_secs(30), ws_receiver.next()).await {
+    let (public_key_string, client_encryption_preference) = match time::timeout(Duration::from_secs(30), duplex_conn.next_message()).await {
         Ok(Some(Ok(msg))) => {
              match ws_message_to_packet(&msg) {
                 Ok(PacketType::Auth { 
@@ -165,7 +171,7 @@ async fn process_websocket_session(
                     // Verify public key format
                     if !StringValidator::is_valid_solana_pubkey(&public_key) {
                         let error_packet = create_error_packet(1001, "Invalid public key format");
-                        let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
+                        let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
                         metrics.record_auth_failure().await;
                         return Err(ServerError::Authentication("Invalid public key format".to_string()));
                     }
@@ -178,7 +184,7 @@ async fn process_websocket_session(
                         Ok(challenge) => challenge,
                         Err(e) => {
                              let error_packet = create_error_packet(1001, &format!("Failed to generate challenge: {}", e));
-                            let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
+                            let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
                             metrics.record_auth_failure().await;
                             return Err(ServerError::Authentication(format!("Challenge generation failed: {}", e)));
                         }
@@ -196,18 +202,18 @@ async fn process_websocket_session(
                     };
 
                     // Send challenge
-                    if ws_sender.send(packet_to_ws_message(&challenge_packet)?).await.is_err() {
+                    if duplex_conn.send_message(packet_to_ws_message(&challenge_packet)?).await.is_err() {
                         return Err(ServerError::Network("Failed to send challenge".to_string()));
                     }
 
                     // Wait for challenge response
-                    match time::timeout(Duration::from_secs(30), ws_receiver.next()).await {
+                    match time::timeout(Duration::from_secs(30), duplex_conn.next_message()).await {
                          Ok(Some(Ok(resp_msg))) => {
                              match ws_message_to_packet(&resp_msg) {
                                 Ok(PacketType::ChallengeResponse { signature, public_key: resp_pubkey, challenge_id }) => {
                                     if resp_pubkey != public_key {
                                         let error_packet = create_error_packet(1001, "Public key mismatch");
-                                        let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
+                                        let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
                                         metrics.record_auth_failure().await;
                                         return Err(ServerError::Authentication("Public key mismatch".to_string()));
                                     }
@@ -218,7 +224,7 @@ async fn process_websocket_session(
                                             debug!("Challenge successfully verified for {}", public_key);
                                             if !auth_manager.is_client_allowed(&public_key).await {
                                                  let error_packet = create_error_packet(1005, "Access denied by ACL");
-                                                let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
+                                                let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
                                                 metrics.record_auth_failure().await;
                                                 return Err(ServerError::Authentication("Access denied by ACL".to_string()));
                                             }
@@ -243,7 +249,7 @@ async fn process_websocket_session(
                                         }
                                         Err(e) => {
                                              let error_packet = create_error_packet(1001, &format!("Challenge verification failed: {}", e));
-                                            let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
+                                            let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
                                             metrics.record_auth_failure().await;
                                             return Err(ServerError::Authentication(format!("Challenge verification failed: {}", e)));
                                         }
@@ -251,13 +257,13 @@ async fn process_websocket_session(
                                 }
                                 Ok(_) => {
                                     let error_packet = create_error_packet(1002, "Expected challenge response");
-                                    let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
+                                    let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
                                     metrics.record_auth_failure().await;
                                     return Err(ServerError::Authentication("Expected challenge response".to_string()));
                                 }
                                 Err(e) => {
                                     let error_packet = create_error_packet(1002, &format!("Invalid challenge response message: {}", e));
-                                     let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
+                                     let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
                                     metrics.record_auth_failure().await;
                                     return Err(ServerError::Protocol(e));
                                 }
@@ -279,13 +285,13 @@ async fn process_websocket_session(
                 }
                  Ok(_) => { // Wrong initial packet type
                      let error_packet = create_error_packet(1002, "Expected authentication message");
-                     let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
+                     let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
                      metrics.record_auth_failure().await;
                      return Err(ServerError::Authentication("Expected authentication message".to_string()));
                  }
                  Err(e) => { // Deserialization error
                      let error_packet = create_error_packet(1002, &format!("Invalid auth message: {}", e));
-                     let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
+                     let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
                      metrics.record_auth_failure().await;
                      return Err(ServerError::Protocol(e));
                  }
@@ -314,7 +320,7 @@ async fn process_websocket_session(
         }
         Err(e) => {
             let error_packet = create_error_packet(1007, &format!("Failed to allocate IP: {}", e));
-            let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
+            let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
             return Err(ServerError::Network(format!("IP allocation failed: {}", e)));
         }
     };
@@ -335,7 +341,7 @@ async fn process_websocket_session(
         Ok(secret) => secret,
         Err(e) => {
             let error_packet = create_error_packet(1006, &format!("Failed to derive shared secret: {}", e));
-            let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
+            let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
             if let Err(release_err) = ip_pool.release_ip(&ip_address).await {
                 warn!("Failed to release IP {}: {}", ip_address, release_err);
             }
@@ -352,7 +358,7 @@ async fn process_websocket_session(
         Ok(packet) => packet,
         Err(e) => {
             let error_packet = create_error_packet(1006, &format!("Encryption failed: {}", e));
-            let _ = ws_sender.send(packet_to_ws_message(&error_packet)?).await;
+            let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
             if let Err(release_err) = ip_pool.release_ip(&ip_address).await {
                 warn!("Failed to release IP {}: {}", ip_address, release_err);
             }
@@ -360,17 +366,14 @@ async fn process_websocket_session(
         }
     };
 
-    let ws_sender_mutex = Arc::new(Mutex::new(ws_sender));
-    let ws_receiver_mutex = Arc::new(Mutex::new(ws_receiver));
-
-    // Create the ClientSession with encryption algorithm from the encrypted packet
+    // Create the ClientSession with the abstract connection
     let session = ClientSession::new(
         session_id.clone(),
         public_key_string.clone(),
         ip_address.clone(),
         addr,
-        ws_sender_mutex.clone(),
-        ws_receiver_mutex.clone(),
+        duplex_conn.sender(),
+        duplex_conn.receiver(),
         Some(encrypted_key_packet.algorithm.as_str().to_string()),
     )?;
 
