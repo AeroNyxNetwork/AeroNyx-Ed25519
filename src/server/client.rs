@@ -271,7 +271,7 @@ async fn process_websocket_session_with_connection(
                         }
                         Ok(Some(Err(e))) => { // Handle specific websocket error
                             metrics.record_auth_failure().await;
-                            return Err(ServerError::WebSocket(e)); // Map error
+                            return Err(ServerError::WebSocket(e)); // e is already tungstenite::Error
                         }
                         Err(_) => { // Handle timeout
                             metrics.record_auth_failure().await;
@@ -299,7 +299,7 @@ async fn process_websocket_session_with_connection(
         }
         Ok(Some(Err(e))) => { // Handle specific websocket error
             metrics.record_auth_failure().await;
-            return Err(ServerError::WebSocket(e)); // Map error
+            return Err(ServerError::WebSocket(e)); // e is already tungstenite::Error
         }
         Err(_) => { // Handle timeout
             metrics.record_auth_failure().await;
