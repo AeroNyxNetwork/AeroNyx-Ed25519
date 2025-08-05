@@ -157,43 +157,21 @@ async fn process_websocket_session_raw(
     metrics: Arc<ServerMetricsCollector>,
     server_state: Arc<RwLock<ServerState>>,
 ) -> Result<(), ServerError> {
-    // Perform authentication and session setup
-    let (session, public_key_string, session_id, ip_address) = authenticate_and_setup_session(
-        &mut ws_sender,
-        &mut ws_receiver,
+    // Process WebSocket session with concrete types
+    process_websocket_session(
+        ws_sender,
+        ws_receiver,
         addr,
-        &key_manager,
-        &auth_manager,
-        &ip_pool,
-        &session_key_manager,
-        &metrics,
-        false, // is_raw = true for raw connections
-    ).await?;
-    
-    // Register the session
-    session_manager.add_session(session.clone()).await;
-
-    // Process client messages
-    let result = process_client_session(
-        session,
         key_manager,
-        session_key_manager.clone(),
-        packet_router,
+        auth_manager,
+        ip_pool,
+        session_manager,
+        session_key_manager,
         network_monitor,
-        ip_pool.clone(),
-        session_manager.clone(),
+        packet_router,
+        metrics,
         server_state,
-    ).await;
-
-    // Cleanup after process_client_session finishes or errors
-    info!("Cleaning up session for client {}", public_key_string);
-    session_manager.remove_session(&session_id).await;
-    if let Err(e) = ip_pool.release_ip(&ip_address).await {
-        warn!("Failed to release IP {} during cleanup: {}", ip_address, e);
-    }
-    session_key_manager.remove_key(&public_key_string).await;
-
-    result
+    ).await
 }
 
 /// Process a WebSocket session for TLS connections
@@ -211,60 +189,40 @@ async fn process_websocket_session_tls(
     metrics: Arc<ServerMetricsCollector>,
     server_state: Arc<RwLock<ServerState>>,
 ) -> Result<(), ServerError> {
-    // Perform authentication and session setup
-    let (session, public_key_string, session_id, ip_address) = authenticate_and_setup_session(
-        &mut ws_sender,
-        &mut ws_receiver,
+    // Process WebSocket session with concrete types
+    process_websocket_session(
+        ws_sender,
+        ws_receiver,
         addr,
-        &key_manager,
-        &auth_manager,
-        &ip_pool,
-        &session_key_manager,
-        &metrics,
-        true, // is_tls = true for TLS connections
-    ).await?;
-    
-    // Register the session
-    session_manager.add_session(session.clone()).await;
-
-    // Process client messages
-    let result = process_client_session(
-        session,
         key_manager,
-        session_key_manager.clone(),
-        packet_router,
+        auth_manager,
+        ip_pool,
+        session_manager,
+        session_key_manager,
         network_monitor,
-        ip_pool.clone(),
-        session_manager.clone(),
+        packet_router,
+        metrics,
         server_state,
-    ).await;
-
-    // Cleanup after process_client_session finishes or errors
-    info!("Cleaning up session for client {}", public_key_string);
-    session_manager.remove_session(&session_id).await;
-    if let Err(e) = ip_pool.release_ip(&ip_address).await {
-        warn!("Failed to release IP {} during cleanup: {}", ip_address, e);
-    }
-    session_key_manager.remove_key(&public_key_string).await;
-
-    result
+    ).await
 }
 
-/// Common authentication and session setup logic
-async fn authenticate_and_setup_session<S, R>(
-    ws_sender: &mut S,
-    ws_receiver: &mut R,
+/// Process a WebSocket session after the connection is established
+async fn process_websocket_session<S>(
+    mut ws_sender: SplitSink<WebSocketStream<S>, tokio_tungstenite::tungstenite::Message>,
+    mut ws_receiver: SplitStream<WebSocketStream<S>>,
     addr: SocketAddr,
-    key_manager: &Arc<KeyManager>,
-    auth_manager: &Arc<AuthManager>,
-    ip_pool: &Arc<IpPoolManager>,
-    session_key_manager: &Arc<SessionKeyManager>,
-    metrics: &Arc<ServerMetricsCollector>,
-    is_tls: bool,
-) -> Result<(ClientSession, String, String, String), ServerError>
+    key_manager: Arc<KeyManager>,
+    auth_manager: Arc<AuthManager>,
+    ip_pool: Arc<IpPoolManager>,
+    session_manager: Arc<SessionManager>,
+    session_key_manager: Arc<SessionKeyManager>,
+    network_monitor: Arc<NetworkMonitor>,
+    packet_router: Arc<PacketRouter>,
+    metrics: Arc<ServerMetricsCollector>,
+    server_state: Arc<RwLock<ServerState>>,
+) -> Result<(), ServerError> 
 where
-    S: SinkExt<tokio_tungstenite::tungstenite::Message> + Unpin,
-    R: StreamExt<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // --- Authentication Phase ---
     let (public_key_string, client_encryption_preference) = match time::timeout(Duration::from_secs(30), ws_receiver.next()).await {
@@ -480,28 +438,19 @@ where
         }
     };
 
-    // Create the ClientSession based on connection type
-    // Note: We create the session with a placeholder for now, as we need to handle the type issue
-    let session = if is_tls {
-        // For TLS connections, we need to create with TLS-specific types
-        // This is a workaround - ideally ClientSession should be generic or use trait objects
-        ClientSession::new_with_algorithm(
-            session_id.clone(),
-            public_key_string.clone(),
-            ip_address.clone(),
-            addr,
-            Some(encrypted_key_packet.algorithm.as_str().to_string()),
-        )?
-    } else {
-        // For RAW connections
-        ClientSession::new_with_algorithm(
-            session_id.clone(),
-            public_key_string.clone(),
-            ip_address.clone(),
-            addr,
-            Some(encrypted_key_packet.algorithm.as_str().to_string()),
-        )?
-    };
+    let ws_sender_mutex = Arc::new(Mutex::new(ws_sender));
+    let ws_receiver_mutex = Arc::new(Mutex::new(ws_receiver));
+
+    // Create the ClientSession with encryption algorithm from the encrypted packet
+    let session = ClientSession::new(
+        session_id.clone(),
+        public_key_string.clone(),
+        ip_address.clone(),
+        addr,
+        ws_sender_mutex.clone(),
+        ws_receiver_mutex.clone(),
+        Some(encrypted_key_packet.algorithm.as_str().to_string()),
+    )?;
 
     // Create IP assignment packet with encryption algorithm info
     let ip_assign = PacketType::IpAssign {
@@ -521,7 +470,32 @@ where
         return Err(ServerError::Network("Failed to send IP assignment".to_string()));
     }
 
-    Ok((session, public_key_string, session_id, ip_address))
+    
+    // Register the session
+    session_manager.add_session(session.clone()).await;
+
+    // Process client messages
+    let result = process_client_session(
+        session,
+        key_manager, // Keep original Arc
+        session_key_manager.clone(), // Clone Arc for the async function
+        packet_router, // Keep original Arc
+        network_monitor, // Keep original Arc
+        ip_pool.clone(), // Clone Arc for cleanup logic within or after process_client_session
+        session_manager.clone(), // Clone Arc for cleanup logic within or after process_client_session
+        server_state,
+    ).await;
+
+    // Cleanup after process_client_session finishes or errors
+    info!("Cleaning up session for client {}", public_key_string);
+    session_manager.remove_session(&session_id).await; // Use cloned session_manager
+    if let Err(e) = ip_pool.release_ip(&ip_address).await { // Use cloned ip_pool
+        warn!("Failed to release IP {} during cleanup: {}", ip_address, e);
+    }
+    // Use original session_key_manager (which still holds a valid Arc reference)
+    session_key_manager.remove_key(&public_key_string).await;
+
+    result // Return the result from process_client_session
 }
 
 /// Process messages from an authenticated client session
@@ -588,10 +562,10 @@ async fn process_client_session(
 
              if let Some(current_key) = session_key_manager_clone.get_key(&session_rot.client_id).await {
                  // Use the session's encryption algorithm for key rotation
-                 // Handle Option<String> for encryption_algorithm
+                 // The encryption_algorithm is Option<String>, use it directly
                  let algorithm = session_rot.encryption_algorithm
-                     .as_deref()
-                     .and_then(EncryptionAlgorithm::from_str)
+                     .as_ref()
+                     .and_then(|s| EncryptionAlgorithm::from_str(s))
                      .unwrap_or_default(); // Default if None or parsing fails
 
                  let encrypted_packet = match crate::crypto::flexible_encryption::encrypt_flexible(
