@@ -31,10 +31,6 @@ use crate::utils::{current_timestamp_millis, random_string};
 use crate::utils::security::StringValidator;
 use solana_sdk::pubkey::Pubkey;
 
-// Type aliases for WebSocket stream types
-type TlsWebSocketStream = WebSocketStream<TlsStream<TcpStream>>;
-type RawWebSocketStream = WebSocketStream<TcpStream>;
-
 /// Handle a RAW (non-TLS) client connection
 pub async fn handle_client_raw(
     stream: TcpStream,
@@ -49,6 +45,10 @@ pub async fn handle_client_raw(
     metrics: Arc<ServerMetricsCollector>,
     server_state: Arc<RwLock<ServerState>>,
 ) -> Result<(), ServerError> {
+    // For RAW mode, we can't use ClientSession as it's hardcoded for TLS
+    // We need to implement the session logic directly here
+    warn!("RAW mode is not fully implemented - ClientSession requires TLS stream types");
+    
     // Directly upgrade TCP connection to WebSocket
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
         Ok(stream) => {
@@ -60,23 +60,12 @@ pub async fn handle_client_raw(
         }
     };
 
-    // Split the WebSocket stream and process the session
-    let (ws_sender, ws_receiver) = ws_stream.split();
+    // Split the WebSocket stream
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     
-    process_websocket_session_raw(
-        ws_sender,
-        ws_receiver,
-        addr,
-        key_manager,
-        auth_manager,
-        ip_pool,
-        session_manager,
-        session_key_manager,
-        network_monitor,
-        packet_router,
-        metrics,
-        server_state,
-    ).await
+    // For now, return an error indicating RAW mode needs implementation
+    // TODO: Implement a generic session handler or modify ClientSession to support non-TLS streams
+    Err(ServerError::Internal("RAW mode requires ClientSession to be modified to support non-TLS streams".to_string()))
 }
 
 /// Handle a client connection
@@ -126,70 +115,6 @@ pub async fn handle_client(
     // Split the WebSocket stream and process the session
     let (ws_sender, ws_receiver) = ws_stream.split();
     
-    process_websocket_session_tls(
-        ws_sender,
-        ws_receiver,
-        addr,
-        key_manager,
-        auth_manager,
-        ip_pool,
-        session_manager,
-        session_key_manager,
-        network_monitor,
-        packet_router,
-        metrics,
-        server_state,
-    ).await
-}
-
-/// Process a WebSocket session for RAW (non-TLS) connections
-async fn process_websocket_session_raw(
-    mut ws_sender: SplitSink<RawWebSocketStream, tokio_tungstenite::tungstenite::Message>,
-    mut ws_receiver: SplitStream<RawWebSocketStream>,
-    addr: SocketAddr,
-    key_manager: Arc<KeyManager>,
-    auth_manager: Arc<AuthManager>,
-    ip_pool: Arc<IpPoolManager>,
-    session_manager: Arc<SessionManager>,
-    session_key_manager: Arc<SessionKeyManager>,
-    network_monitor: Arc<NetworkMonitor>,
-    packet_router: Arc<PacketRouter>,
-    metrics: Arc<ServerMetricsCollector>,
-    server_state: Arc<RwLock<ServerState>>,
-) -> Result<(), ServerError> {
-    // Process WebSocket session with concrete types
-    process_websocket_session(
-        ws_sender,
-        ws_receiver,
-        addr,
-        key_manager,
-        auth_manager,
-        ip_pool,
-        session_manager,
-        session_key_manager,
-        network_monitor,
-        packet_router,
-        metrics,
-        server_state,
-    ).await
-}
-
-/// Process a WebSocket session for TLS connections
-async fn process_websocket_session_tls(
-    mut ws_sender: SplitSink<TlsWebSocketStream, tokio_tungstenite::tungstenite::Message>,
-    mut ws_receiver: SplitStream<TlsWebSocketStream>,
-    addr: SocketAddr,
-    key_manager: Arc<KeyManager>,
-    auth_manager: Arc<AuthManager>,
-    ip_pool: Arc<IpPoolManager>,
-    session_manager: Arc<SessionManager>,
-    session_key_manager: Arc<SessionKeyManager>,
-    network_monitor: Arc<NetworkMonitor>,
-    packet_router: Arc<PacketRouter>,
-    metrics: Arc<ServerMetricsCollector>,
-    server_state: Arc<RwLock<ServerState>>,
-) -> Result<(), ServerError> {
-    // Process WebSocket session with concrete types
     process_websocket_session(
         ws_sender,
         ws_receiver,
@@ -207,9 +132,9 @@ async fn process_websocket_session_tls(
 }
 
 /// Process a WebSocket session after the connection is established
-async fn process_websocket_session<S>(
-    mut ws_sender: SplitSink<WebSocketStream<S>, tokio_tungstenite::tungstenite::Message>,
-    mut ws_receiver: SplitStream<WebSocketStream<S>>,
+async fn process_websocket_session(
+    mut ws_sender: SplitSink<WebSocketStream<TlsStream<TcpStream>>, tokio_tungstenite::tungstenite::Message>,
+    mut ws_receiver: SplitStream<WebSocketStream<TlsStream<TcpStream>>>,
     addr: SocketAddr,
     key_manager: Arc<KeyManager>,
     auth_manager: Arc<AuthManager>,
@@ -220,10 +145,7 @@ async fn process_websocket_session<S>(
     packet_router: Arc<PacketRouter>,
     metrics: Arc<ServerMetricsCollector>,
     server_state: Arc<RwLock<ServerState>>,
-) -> Result<(), ServerError> 
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
+) -> Result<(), ServerError> {
     // --- Authentication Phase ---
     let (public_key_string, client_encryption_preference) = match time::timeout(Duration::from_secs(30), ws_receiver.next()).await {
         Ok(Some(Ok(msg))) => {
@@ -469,7 +391,6 @@ where
         }
         return Err(ServerError::Network("Failed to send IP assignment".to_string()));
     }
-
     
     // Register the session
     session_manager.add_session(session.clone()).await;
@@ -497,6 +418,7 @@ where
 
     result // Return the result from process_client_session
 }
+
 
 /// Process messages from an authenticated client session
 async fn process_client_session(
@@ -562,11 +484,12 @@ async fn process_client_session(
 
              if let Some(current_key) = session_key_manager_clone.get_key(&session_rot.client_id).await {
                  // Use the session's encryption algorithm for key rotation
-                 // The encryption_algorithm is Option<String>, use it directly
-                 let algorithm = session_rot.encryption_algorithm
-                     .as_ref()
-                     .and_then(|s| EncryptionAlgorithm::from_str(s))
-                     .unwrap_or_default(); // Default if None or parsing fails
+                 // The encryption_algorithm is Option<String>
+                 let algorithm = if let Some(ref algo_str) = session_rot.encryption_algorithm {
+                     EncryptionAlgorithm::from_str(algo_str).unwrap_or_default()
+                 } else {
+                     EncryptionAlgorithm::default()
+                 };
 
                  let encrypted_packet = match crate::crypto::flexible_encryption::encrypt_flexible(
                      &new_key,
