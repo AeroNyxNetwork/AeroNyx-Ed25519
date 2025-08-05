@@ -3,36 +3,33 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tokio_tungstenite::WebSocketStream;
-use futures::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
 use tokio_tungstenite::tungstenite::Message;
 use std::time::{Duration, Instant};
-// Remove unused imports: debug, info
 use tracing::{warn, info};
-use tokio_rustls::server::TlsStream;
-use tokio::net::TcpStream;
 use std::sync::atomic::AtomicBool;
 
 use crate::protocol::PacketType;
 use crate::protocol::serialization::packet_to_ws_message;
 use crate::server::core::ServerError;
-use crate::crypto::flexible_encryption::EncryptionAlgorithm; // Add import for encryption enums
+use crate::crypto::flexible_encryption::EncryptionAlgorithm;
+use crate::server::connection::WebSocketConnection;
 
 /// Client session for connected users
-#[derive(Clone)] // Keep Clone, but be mindful of Arc usage
+#[derive(Clone)]
 pub struct ClientSession {
     // Existing fields
     pub id: String,
     pub client_id: String,
     pub ip_address: String,
     pub address: SocketAddr,
-    ws_sender: Arc<Mutex<SplitSink<WebSocketStream<TlsStream<TcpStream>>, Message>>>,
-    ws_receiver: Arc<Mutex<SplitStream<WebSocketStream<TlsStream<TcpStream>>>>>,
+    // Changed from concrete types to trait objects
+    ws_sender: Arc<Mutex<Box<dyn WebSocketConnection>>>,
+    ws_receiver: Arc<Mutex<Box<dyn WebSocketConnection>>>,
     pub last_activity: Arc<Mutex<Instant>>,
     stream_taken: Arc<AtomicBool>,
     
-    // New fields for encryption support
-    pub encryption_algorithm: String,     // String representation of algorithm (for logs/debugging)
+    // Existing encryption support fields
+    pub encryption_algorithm: String,
     
     /// Current room ID
     current_room: Arc<RwLock<Option<String>>>,
@@ -43,14 +40,14 @@ pub struct ClientSession {
 }
 
 impl ClientSession {
-    /// Create a new client session with split WebSocket components wrapped in Arc<Mutex<>>
+    /// Create a new client session with trait-based WebSocket connections
     pub fn new(
         id: String,
         client_id: String,
         ip_address: String,
         address: SocketAddr,
-        ws_sender: Arc<Mutex<SplitSink<WebSocketStream<TlsStream<TcpStream>>, Message>>>,
-        ws_receiver: Arc<Mutex<SplitStream<WebSocketStream<TlsStream<TcpStream>>>>>,
+        ws_sender: Arc<Mutex<Box<dyn WebSocketConnection>>>,
+        ws_receiver: Arc<Mutex<Box<dyn WebSocketConnection>>>,
         encryption_algorithm: Option<String>,
     ) -> Result<Self, ServerError> {
         // Default to ChaCha20Poly1305 if not specified
@@ -95,9 +92,8 @@ impl ClientSession {
     /// Send a packet to the client (acquires lock on sender)
     pub async fn send_packet(&self, packet: &PacketType) -> Result<(), ServerError> {
         let message = packet_to_ws_message(packet)?;
-        let mut sender_guard = self.ws_sender.lock().await; // Lock the sender
-        sender_guard.send(message).await
-            .map_err(ServerError::WebSocket) // Map error type
+        let mut sender_guard = self.ws_sender.lock().await;
+        sender_guard.send_message(message).await
     }
 
     /// Update last activity timestamp (acquires lock)
@@ -116,7 +112,7 @@ impl ClientSession {
     /// Returns Option<Result<Message, ServerError>> to handle stream end and errors.
     pub async fn next_message(&self) -> Option<Result<Message, ServerError>> {
         let mut receiver_guard = self.ws_receiver.lock().await;
-        receiver_guard.next().await.map(|res| res.map_err(ServerError::WebSocket))
+        receiver_guard.next_message().await
     }
 
     /// Attempt to logically take the stream components.
@@ -171,8 +167,6 @@ pub struct SessionManager {
     sessions: Arc<Mutex<std::collections::HashMap<String, ClientSession>>>,
     /// IP to session mapping for quicker lookups (IP String -> Session ID String)
     ip_sessions: Arc<Mutex<std::collections::HashMap<String, String>>>,
-    // Remove unused max_connections_per_ip
-    // max_connections_per_ip: usize,
     /// Session timeout
     session_timeout: Duration,
 }
@@ -186,7 +180,6 @@ impl SessionManager {
         Self {
             sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
             ip_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            // self.max_connections_per_ip = max_connections_per_ip, // Removed assignment
             session_timeout,
         }
     }
@@ -220,10 +213,10 @@ impl SessionManager {
     }
 
     /// Update session activity timestamp
-    pub async fn touch_session(&self, session_id: &str) -> Result<(), SessionError> { // Return SessionError
-        let sessions_guard = self.sessions.lock().await; // Read lock is sufficient if update_activity takes &self
+    pub async fn touch_session(&self, session_id: &str) -> Result<(), SessionError> {
+        let sessions_guard = self.sessions.lock().await;
         if let Some(session) = sessions_guard.get(session_id) {
-            session.update_activity().await; // Assuming update_activity is correctly implemented
+            session.update_activity().await;
             Ok(())
         } else {
             Err(SessionError::NotFound(session_id.to_string()))
@@ -233,7 +226,7 @@ impl SessionManager {
     /// Get a clone of a session by ID
     pub async fn get_session(&self, session_id: &str) -> Option<ClientSession> {
         let sessions_guard = self.sessions.lock().await;
-        sessions_guard.get(session_id).cloned() // Clone the session
+        sessions_guard.get(session_id).cloned()
     }
 
     /// Get a clone of a session by IP address
@@ -243,7 +236,7 @@ impl SessionManager {
         if let Some(session_id) = ip_sessions_guard.get(ip) {
             // Now get the actual session using the ID
             let sessions_guard = self.sessions.lock().await;
-            sessions_guard.get(session_id).cloned() // Clone the session
+            sessions_guard.get(session_id).cloned()
         } else {
             None
         }
@@ -277,10 +270,10 @@ impl SessionManager {
 
     /// Close all sessions gracefully (sends disconnect message)
     pub async fn close_all_sessions(&self, reason: &str) {
-        let sessions_to_close = { // Scope to release lock quickly
+        let sessions_to_close = {
             let sessions_guard = self.sessions.lock().await;
             sessions_guard.values().cloned().collect::<Vec<_>>()
-        }; // sessions_guard lock released here
+        };
 
         let disconnect_packet = crate::protocol::serialization::create_disconnect_packet(
             crate::protocol::types::disconnect_reason::SERVER_SHUTDOWN,
@@ -294,7 +287,7 @@ impl SessionManager {
                 if let Err(e) = session.send_packet(&packet).await {
                     warn!("Failed to send disconnect to {}: {}", session.client_id, e);
                 }
-                session.close().await; // Also explicitly close the connection
+                session.close().await;
             }
         });
         futures::future::join_all(close_futures).await;
@@ -316,17 +309,17 @@ impl SessionManager {
         let timeout = self.session_timeout;
         let mut expired_ids = Vec::new();
 
-        // --- Identify expired sessions ---
-        { // Scope for read lock
+        // Identify expired sessions
+        {
             let sessions_guard = self.sessions.lock().await;
             for (id, session) in sessions_guard.iter() {
                 if session.idle_time().await > timeout {
                     expired_ids.push(id.clone());
                 }
             }
-        } // sessions_guard lock released
+        }
 
-        // --- Remove expired sessions ---
+        // Remove expired sessions
         if !expired_ids.is_empty() {
             let mut sessions_guard = self.sessions.lock().await;
             let mut ip_sessions_guard = self.ip_sessions.lock().await;
@@ -340,7 +333,7 @@ impl SessionManager {
             }
         }
 
-        expired_ids.len() // Return the count of removed sessions
+        expired_ids.len()
     }
 
     /// Get all sessions using a specific encryption algorithm
@@ -376,7 +369,7 @@ impl SessionManager {
     }
 }
 
-// Session error type - Add StreamConsumed variant
+// Session error type
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("Session not found: {0}")]
