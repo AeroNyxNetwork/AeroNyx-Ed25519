@@ -32,6 +32,9 @@ use crate::server::packet::start_tun_packet_processor;
 use crate::utils::security::RateLimiter;
 use crate::registration::RegistrationManager;
 
+// Add the connection module
+pub mod connection;
+
 // --- ServerError enum remains the same ---
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
