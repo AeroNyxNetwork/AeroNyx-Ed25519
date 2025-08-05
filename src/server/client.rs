@@ -29,7 +29,6 @@ use crate::server::metrics::ServerMetricsCollector;
 use crate::server::core::{ServerError, ServerState};
 use crate::utils::{current_timestamp_millis, random_string};
 use crate::utils::security::StringValidator;
-use crate::utils::security::StringValidator;
 use solana_sdk::pubkey::Pubkey;
 use crate::server::connection::DuplexWebSocketConnection;
 
