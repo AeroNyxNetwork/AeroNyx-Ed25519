@@ -65,7 +65,7 @@ impl AccessControlList {
     /// Create a new access control list with default settings
     pub fn new() -> Self {
         Self {
-            default_policy: "deny".to_string(),
+            default_policy: "allow".to_string(),  // 改为 "allow"
             entries: Vec::new(),
             updated_at: utils::current_timestamp_millis(),
         }
