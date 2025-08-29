@@ -14,6 +14,7 @@ categories = ["networking", "cryptography"]
 # Async runtime
 tokio = { version = "1.28", features = ["full"] }
 futures = "0.3"
+bs58 = "0.5"
 futures-util = "0.3"
 mime_guess = "2.0"
 # Networking
