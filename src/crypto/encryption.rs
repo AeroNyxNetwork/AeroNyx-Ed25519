@@ -493,15 +493,43 @@ pub fn decrypt_session_key(
 /// - An `EncryptedPacket` containing the encrypted data, nonce, and algorithm used
 pub fn encrypt_session_key_flexible(
     session_key: &[u8],
-    shared_secret: &[u8], // This shared_secret acts as the 'key' for this encryption step
-    preferred_algorithm: EncryptionAlgorithm,
-) -> Result<EncryptedPacket, FlexibleEncryptionError> {
-    // We don't use AAD for session key encryption
-    let aad = None;
+    shared_secret: &[u8],
+    algorithm: EncryptionAlgorithm,
+) -> Result<EncryptedPacket, EncryptionError> {
+    // CRITICAL FIX: Derive encryption key from shared secret
+    // Don't use shared_secret directly as AES key
     
-    // Use the flexible encryption function directly
-    // Note: We use the shared_secret as the key for encrypting the session_key
-    encrypt_flexible(session_key, shared_secret, preferred_algorithm, aad)
+    // Use HKDF to derive a proper encryption key
+    let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut derived_key = [0u8; 32];
+    hkdf.expand(b"AERONYX-SESSION-KEY-ENCRYPTION", &mut derived_key)
+        .map_err(|_| EncryptionError::KeyDerivation)?;
+    
+    // Now use derived_key instead of shared_secret
+    let nonce = generate_nonce();
+    
+    match algorithm {
+        EncryptionAlgorithm::ChaCha20Poly1305 => {
+            let cipher = ChaCha20Poly1305::new_from_slice(&derived_key)?;
+            let encrypted = cipher.encrypt(&nonce.into(), session_key)?;
+            
+            Ok(EncryptedPacket {
+                algorithm,
+                data: encrypted,
+                nonce: nonce.to_vec(),
+            })
+        }
+        EncryptionAlgorithm::Aes256Gcm => {
+            let cipher = Aes256Gcm::new_from_slice(&derived_key)?;
+            let encrypted = cipher.encrypt(&nonce.into(), session_key)?;
+            
+            Ok(EncryptedPacket {
+                algorithm,
+                data: encrypted,
+                nonce: nonce.to_vec(),
+            })
+        }
+    }
 }
 
 /// Decrypt a session key received from peer using a specified algorithm.
