@@ -3,6 +3,16 @@
 //!
 //! This module handles individual client connections, including authentication,
 //! session setup, and message processing.
+//!
+//! ## Key Changes for X25519 Support
+//! - Modified challenge packet to include X25519 public key
+//! - Server now sends both Ed25519 and X25519 public keys in Challenge
+//! - Maintains backward compatibility for clients that don't support X25519
+//!
+//! ## Why These Changes
+//! - Clients need X25519 public key for ECDH key exchange
+//! - Ed25519 cannot be directly used for X25519 operations
+//! - Sending both keys allows proper ECDH while maintaining signature verification
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -189,16 +199,23 @@ async fn process_websocket_session_with_connection(
                         }
                     };
 
-                    // Get server public key
-                    let server_pubkey = key_manager.public_key().await.to_string();
+                    // Get server Ed25519 public key (for signature verification)
+                    let server_ed25519_pubkey = key_manager.public_key().await.to_string();
+                    
+                    // Get server X25519 public key (for ECDH key exchange)
+                    // This is the KEY CHANGE - we now send X25519 key separately
+                    let server_x25519_pubkey = key_manager.get_x25519_public_key_string().await;
 
-                    // Create challenge packet
+                    // Create challenge packet with both keys
                     let challenge_packet = PacketType::Challenge {
                         data: challenge.1.clone(), // Challenge data
-                        server_key: server_pubkey,
+                        server_key: server_ed25519_pubkey,
+                        x25519_key: Some(server_x25519_pubkey), // NEW: Include X25519 key
                         expires_at: current_timestamp_millis() + crate::config::constants::AUTH_CHALLENGE_TIMEOUT.as_millis() as u64,
                         id: challenge.0.clone(), // Challenge ID
                     };
+
+                    info!("Sending challenge with X25519 key support to client {}", public_key);
 
                     // Send challenge
                     if duplex_conn.send_message(packet_to_ws_message(&challenge_packet)?).await.is_err() {
@@ -232,8 +249,8 @@ async fn process_websocket_session_with_connection(
                                             
                                             // Parse client's preferred algorithm, if invalid/unsupported use default
                                             let client_preferred_algo = client_algo_pref_str
-                                                .as_deref() // Option<String> -> Option<&str>
-                                                .and_then(EncryptionAlgorithm::from_str) // Option<&str> -> Option<EncryptionAlgorithm>
+                                                .as_deref()
+                                                .and_then(EncryptionAlgorithm::from_str)
                                                 .unwrap_or_else(|| {
                                                     if client_algo_pref_str.is_some() {
                                                         warn!(
@@ -241,10 +258,10 @@ async fn process_websocket_session_with_connection(
                                                             public_key, client_algo_pref_str
                                                         );
                                                     }
-                                                    EncryptionAlgorithm::default() // Use server default algorithm
+                                                    EncryptionAlgorithm::default()
                                                 });
                                             
-                                            (public_key, client_preferred_algo) // Return the verified public key and parsed algorithm
+                                            (public_key, client_preferred_algo)
                                         }
                                         Err(e) => {
                                              let error_packet = create_error_packet(1001, &format!("Challenge verification failed: {}", e));
@@ -268,27 +285,27 @@ async fn process_websocket_session_with_connection(
                                 }
                             }
                         }
-                        Ok(Some(Err(e))) => { // Handle specific websocket error
+                        Ok(Some(Err(e))) => {
                             metrics.record_auth_failure().await;
-                            return Err(e); // e is already ServerError
+                            return Err(e);
                         }
-                        Err(_) => { // Handle timeout
+                        Err(_) => {
                             metrics.record_auth_failure().await;
                             return Err(ServerError::Authentication("Timed out waiting for challenge response".to_string()));
                         }
-                        Ok(None) => { // Handle stream closed
+                        Ok(None) => {
                              metrics.record_auth_failure().await;
                              return Err(ServerError::Authentication("WebSocket closed during challenge response".to_string()));
                         }
                     }
                 }
-                 Ok(_) => { // Wrong initial packet type
+                 Ok(_) => {
                      let error_packet = create_error_packet(1002, "Expected authentication message");
                      let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
                      metrics.record_auth_failure().await;
                      return Err(ServerError::Authentication("Expected authentication message".to_string()));
                  }
-                 Err(e) => { // Deserialization error
+                 Err(e) => {
                      let error_packet = create_error_packet(1002, &format!("Invalid auth message: {}", e));
                      let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
                      metrics.record_auth_failure().await;
@@ -296,15 +313,15 @@ async fn process_websocket_session_with_connection(
                  }
              }
         }
-        Ok(Some(Err(e))) => { // Handle specific websocket error
+        Ok(Some(Err(e))) => {
             metrics.record_auth_failure().await;
-            return Err(e); // e is already ServerError
+            return Err(e);
         }
-        Err(_) => { // Handle timeout
+        Err(_) => {
             metrics.record_auth_failure().await;
             return Err(ServerError::Authentication("Timed out waiting for auth message".to_string()));
         }
-         Ok(None) => { // Handle stream closed
+         Ok(None) => {
              metrics.record_auth_failure().await;
              return Err(ServerError::Authentication("WebSocket closed before authentication".to_string()));
          }
@@ -334,6 +351,7 @@ async fn process_websocket_session_with_connection(
     session_key_manager.store_key(&public_key_string, session_key.clone()).await;
 
     // Get shared secret for encrypting session key
+    // Note: This uses Ed25519 keys converted to X25519 internally
     let pubkey = Pubkey::from_str(&public_key_string)
         .map_err(|e| ServerError::KeyError(format!("Invalid public key: {}", e)))?;
     let shared_secret = match key_manager.get_shared_secret(&pubkey).await {
@@ -352,7 +370,7 @@ async fn process_websocket_session_with_connection(
     let encrypted_key_packet = match encrypt_session_key_flexible(
         &session_key,
         &shared_secret,
-        client_encryption_preference, // Use negotiated algorithm
+        client_encryption_preference,
     ) {
         Ok(packet) => packet,
         Err(e) => {
@@ -400,53 +418,49 @@ async fn process_websocket_session_with_connection(
     // Process client messages
     let result = process_client_session(
         session,
-        key_manager, // Keep original Arc
-        session_key_manager.clone(), // Clone Arc for the async function
-        packet_router, // Keep original Arc
-        network_monitor, // Keep original Arc
-        ip_pool.clone(), // Clone Arc for cleanup logic within or after process_client_session
-        session_manager.clone(), // Clone Arc for cleanup logic within or after process_client_session
+        key_manager,
+        session_key_manager.clone(),
+        packet_router,
+        network_monitor,
+        ip_pool.clone(),
+        session_manager.clone(),
         server_state,
     ).await;
 
     // Cleanup after process_client_session finishes or errors
     info!("Cleaning up session for client {}", public_key_string);
-    session_manager.remove_session(&session_id).await; // Use cloned session_manager
-    if let Err(e) = ip_pool.release_ip(&ip_address).await { // Use cloned ip_pool
+    session_manager.remove_session(&session_id).await;
+    if let Err(e) = ip_pool.release_ip(&ip_address).await {
         warn!("Failed to release IP {} during cleanup: {}", ip_address, e);
     }
-    // Use original session_key_manager (which still holds a valid Arc reference)
     session_key_manager.remove_key(&public_key_string).await;
 
-    result // Return the result from process_client_session
+    result
 }
-
 
 /// Process messages from an authenticated client session
 async fn process_client_session(
     session: ClientSession,
-    key_manager: Arc<KeyManager>, // Keep original Arc
-    session_key_manager: Arc<SessionKeyManager>, // Now receives a clone
-    packet_router: Arc<PacketRouter>, // Keep original Arc
-    network_monitor: Arc<NetworkMonitor>, // Keep original Arc
-    _ip_pool: Arc<IpPoolManager>, // Mark unused if cleanup is outside
-    _session_manager: Arc<SessionManager>, // Mark unused if cleanup is outside
+    key_manager: Arc<KeyManager>,
+    session_key_manager: Arc<SessionKeyManager>,
+    packet_router: Arc<PacketRouter>,
+    network_monitor: Arc<NetworkMonitor>,
+    _ip_pool: Arc<IpPoolManager>,
+    _session_manager: Arc<SessionManager>,
     server_state: Arc<RwLock<ServerState>>,
 ) -> Result<(), ServerError> {
     let client_id = session.client_id.clone();
     let session_id = session.id.clone();
     let ip_address = session.ip_address.clone();
-    // let _address = session.address; // Marked unused
 
     // --- Heartbeat Task ---
     let heartbeat_interval = Duration::from_secs(30);
-    let session_hb = session.clone(); // Clone session for heartbeat task
+    let session_hb = session.clone();
     let heartbeat_handle = tokio::spawn(async move {
         let mut interval = time::interval(heartbeat_interval);
         let mut sequence: u64 = 0;
         loop {
             interval.tick().await;
-            // Check if session is closing - Remove dereference (*)
             if session_hb.is_stream_taken().await {
                  break;
             }
@@ -464,14 +478,13 @@ async fn process_client_session(
 
     // --- Key Rotation Task ---
     let rotation_interval = Duration::from_secs(3600); // 1 hour
-    let session_rot = session.clone(); // Clone session for rotation task
+    let session_rot = session.clone();
     let session_key_manager_clone = session_key_manager.clone();
     let key_manager_clone = key_manager.clone();
     let key_rotation_handle = tokio::spawn(async move {
         let mut interval = time::interval(rotation_interval);
         loop {
             interval.tick().await;
-            // Check if session is closing - Remove dereference (*)
             if session_rot.is_stream_taken().await {
                 break;
             }
@@ -485,8 +498,6 @@ async fn process_client_session(
             let new_key = SessionKeyManager::generate_key();
 
              if let Some(current_key) = session_key_manager_clone.get_key(&session_rot.client_id).await {
-                 // Use the session's encryption algorithm for key rotation
-                 // encryption_algorithm is String, not Option<String>
                  let algorithm = EncryptionAlgorithm::from_str(&session_rot.encryption_algorithm)
                      .unwrap_or_default();
 
@@ -528,7 +539,6 @@ async fn process_client_session(
         }
     });
 
-
     let mut last_counter: Option<u64> = None;
 
     // Main message processing loop
@@ -537,7 +547,7 @@ async fn process_client_session(
          let current_state = *server_state.read().await;
          if current_state != ServerState::Running {
              let disconnect = create_disconnect_packet(2, "Server shutting down");
-             let _ = session.send_packet(&disconnect).await; // Attempt to notify client
+             let _ = session.send_packet(&disconnect).await;
              return Err(ServerError::Internal("Server shutting down".to_string()));
          }
 
@@ -560,7 +570,6 @@ async fn process_client_session(
                                  last_counter = Some(counter);
 
                                  if let Some(key) = session_key_manager.get_key(&client_id).await {
-                                     // session对象直接传递给handle_inbound_packet，由函数内部正确处理
                                      match packet_router.handle_inbound_packet(
                                          &encrypted, 
                                          &nonce, 
@@ -609,27 +618,21 @@ async fn process_client_session(
                                      warn!("IP renewal with mismatched IP from {}", client_id);
                                      continue;
                                  }
-                                 // Get the IP pool from the session_manager or pass it in
-                                 // Assuming IP Pool is accessible (e.g., passed into process_client_session)
-                                 // let ip_pool = ...; // Get access to IP Pool
-                                 // match ip_pool.renew_ip(&ip_address).await { ... }
-
-                                 // Placeholder: Need access to ip_pool here
+                                 // IP renewal logic would go here
                                  warn!("IP Renewal requested but IP pool access not implemented here");
                                  let response = PacketType::IpRenewalResponse {
                                       session_id: session_id.clone(),
-                                      expires_at: 0, // Indicate failure
+                                      expires_at: 0,
                                       success: false,
                                   };
                                   if session.send_packet(&response).await.is_err() {
                                       warn!("Failed to send failed IP renewal response to {}: channel closed", client_id);
                                       return Err(ServerError::Network("Failed IP renewal response send failed".to_string()));
                                   }
-
                              }
                              PacketType::Disconnect { reason, message } => {
                                  info!("Client {} disconnecting: {} (reason {})", client_id, message, reason);
-                                 break; // Break loop for graceful disconnect
+                                 break;
                              }
                              _ => {
                                  warn!("Received unexpected packet type from {} during session", client_id);
@@ -638,19 +641,16 @@ async fn process_client_session(
                      }
                      Err(e) => {
                          warn!("Failed to parse message from {}: {}", client_id, e);
-                         // Maybe disconnect on parse error?
-                         // return Err(ServerError::Protocol(e));
                      }
                  }
              }
-             Some(Err(e)) => { // WebSocket error
+             Some(Err(e)) => {
                  debug!("WebSocket error for client {}: {}", client_id, e);
-                 // Use explicit From conversion
                  return Err(ServerError::from(e));
              }
-             None => { // WebSocket stream closed
+             None => {
                  debug!("WebSocket connection closed for client {}", client_id);
-                 break; // Break loop for normal closure
+                 break;
              }
          }
      }
@@ -658,7 +658,7 @@ async fn process_client_session(
     // Abort background tasks associated with this session
     heartbeat_handle.abort();
     key_rotation_handle.abort();
-    session.mark_stream_taken().await; // Mark session as closing
+    session.mark_stream_taken().await;
 
-    Ok(()) // Return Ok(()) if loop finishes normally
+    Ok(())
 }
