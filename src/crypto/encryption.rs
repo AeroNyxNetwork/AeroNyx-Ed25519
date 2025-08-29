@@ -14,7 +14,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce as AesNonce,
 };
 use chacha20poly1305::{
-    aead::NewAead,
+    aead::{Aead as ChaChaAead, NewAead},
     ChaCha20Poly1305, Nonce as ChaNonce,
 };
 use generic_array::{GenericArray, typenum::U12};
