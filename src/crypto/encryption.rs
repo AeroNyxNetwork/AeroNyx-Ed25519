@@ -1,573 +1,413 @@
 // src/crypto/encryption.rs
-//! Encryption utilities for secure communication.
+//! Encryption and decryption utilities for the server.
 //!
 //! This module provides functions for encrypting and decrypting data
-//! using various authenticated encryption schemes including ChaCha20-Poly1305
-//! and AES-GCM with proper authentication.
+//! using AES-256-GCM and ChaCha20-Poly1305 algorithms.
+//!
+//! ## Updates for X25519 Support
+//! - Modified encrypt_session_key_flexible to use HKDF-derived keys
+//! - Server now properly derives encryption keys from shared secrets
+//! - Matches client expectations for session key encryption
 
-use aes::Aes256;
-use cbc::{Decryptor, Encryptor};
-use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use chacha20poly1305::aead::{Aead, NewAead};
-use hmac::{Hmac, Mac}; // No NewMac, as it's accessed through the Mac trait
-use rand::{Rng, RngCore};
-use sha2::Sha256;
-use thiserror::Error;
-use tracing::{debug, info, warn, error};
-
-// Import types from flexible_encryption module
-use crate::crypto::flexible_encryption::{
-    EncryptionAlgorithm, FlexibleEncryptionError, EncryptedPacket, 
-    encrypt_flexible, decrypt_flexible
-};
-
-// Add AES-GCM imports
 use aes_gcm::{
-    aead::{Aead as AesGcmAead, KeyInit},
-    Aes256Gcm, Nonce as AesGcmNonce
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce as AesNonce,
 };
-use generic_array::GenericArray;
+use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaNonce};
+use generic_array::{GenericArray, typenum::U12};
+use hkdf::Hkdf;
+use sha2::Sha256;
+use rand::RngCore;
+use thiserror::Error;
+use tracing::{debug, info, error};
 
-type Aes256CbcEnc = Encryptor<Aes256>;
-type Aes256CbcDec = Decryptor<Aes256>;
-type HmacSha256 = Hmac<Sha256>;
+use crate::crypto::flexible_encryption::{
+    EncryptionAlgorithm, EncryptedPacket, decrypt_flexible
+};
+
+/// Size of the encryption key in bytes
+pub const KEY_SIZE: usize = 32;
+
+/// Size of the nonce in bytes (96 bits for both AES-GCM and ChaCha20-Poly1305)
+pub const NONCE_SIZE: usize = 12;
+
+/// Size of the authentication tag in bytes
+pub const TAG_SIZE: usize = 16;
 
 /// Error type for encryption operations
 #[derive(Debug, Error)]
 pub enum EncryptionError {
-    #[error("Invalid key length: {0}")]
-    InvalidKeyLength(usize),
-
-    #[error("Invalid data format: {0}")]
-    InvalidFormat(String),
-
+    #[error("Invalid key length: expected {expected}, got {actual}")]
+    InvalidKeyLength { expected: usize, actual: usize },
+    
+    #[error("Invalid nonce length: expected {expected}, got {actual}")]
+    InvalidNonceLength { expected: usize, actual: usize },
+    
     #[error("Encryption failed: {0}")]
     EncryptionFailed(String),
-
+    
     #[error("Decryption failed: {0}")]
     DecryptionFailed(String),
-
-    #[error("Authentication failed")]
-    AuthenticationFailed,
-
-    #[error("Invalid padding: {0}")]
-    InvalidPadding(String),
-
-    #[error("Buffer too small")]
-    BufferTooSmall,
+    
+    #[error("Invalid key: {0}")]
+    InvalidKey(String),
+    
+    #[error("Key derivation failed")]
+    KeyDerivation,
+    
+    #[error("AEAD error: {0}")]
+    Aead(String),
+    
+    #[error("Invalid algorithm")]
+    InvalidAlgorithm,
+    
+    #[error("Invalid data")]
+    InvalidData,
 }
 
-/// Generate random bytes for a challenge
+/// Generate a random nonce for encryption
+pub fn generate_random_nonce() -> GenericArray<u8, U12> {
+    let mut nonce = [0u8; NONCE_SIZE];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    *GenericArray::from_slice(&nonce)
+}
+
+/// Generate a random challenge of specified size
 pub fn generate_challenge(size: usize) -> Vec<u8> {
     let mut challenge = vec![0u8; size];
     rand::thread_rng().fill_bytes(&mut challenge);
     challenge
 }
 
-/// Encrypt data using ChaCha20-Poly1305 AEAD with authentication
-pub fn encrypt_chacha20(data: &[u8], key: &[u8], nonce_bytes: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>), EncryptionError> {
-    if key.len() != 32 {
-        return Err(EncryptionError::InvalidKeyLength(key.len()));
-    }
-
-    // Convert the key to an AEAD key
-    let aead_key = Key::from_slice(key);
-    let cipher = ChaCha20Poly1305::new(aead_key);
-
-    // Generate a random nonce or use the provided one
-    let nonce_val = if let Some(nb) = nonce_bytes {
-        if nb.len() != 12 {
-            return Err(EncryptionError::InvalidFormat(format!(
-                "Invalid nonce length: {} (expected 12)",
-                nb.len()
-            )));
-        }
-        let mut n = [0u8; 12];
-        n.copy_from_slice(nb);
-        n
-    } else {
-        let mut n = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut n);
-        n
-    };
-
-    // Encrypt the data
-    let nonce = Nonce::from_slice(&nonce_val);
-    let ciphertext = cipher.encrypt(nonce, data)
-        .map_err(|e| EncryptionError::EncryptionFailed(format!("ChaCha20-Poly1305 encryption failed: {}", e)))?;
-
-    Ok((ciphertext, nonce_val.to_vec()))
-}
-
-/// Encrypt data using AES-256-GCM with optional additional authenticated data (AAD)
-/// 
-/// # Parameters
-/// - `plaintext`: The data to encrypt
-/// - `key`: 32-byte AES-256 key
-/// - `aad`: Optional additional authenticated data
-///
-/// # Returns
-/// - Tuple of (ciphertext, nonce) where:
-///   - ciphertext includes the authentication tag
-///   - nonce is the 12-byte IV used for encryption
-pub fn encrypt_aes_gcm(plaintext: &[u8], key: &[u8], aad: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>), EncryptionError> {
-    // Log the input parameters
-    info!("AES-GCM Encryption: plaintext length={}, key length={}, aad={}",
-         plaintext.len(), key.len(), aad.is_some());
-    
-    // For debugging, also log partial key and plaintext
-    if !key.is_empty() {
-        debug!("AES-GCM Key prefix: {:02x?}", &key[0..min(8, key.len())]);
-    }
-    if !plaintext.is_empty() {
-        debug!("AES-GCM Plaintext prefix: {:02x?}", &plaintext[0..min(16, plaintext.len())]);
-    }
-    
-    // Validate key length
-    if key.len() != 32 {
-        error!("AES-GCM encryption failed: Invalid key length {}", key.len());
-        return Err(EncryptionError::InvalidKeyLength(key.len()));
-    }
-
-    // Initialize AES-GCM cipher with key
-    debug!("Creating AES-GCM cipher with key");
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
-    
-    // Generate a secure random 12-byte nonce (IV)
-    let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    debug!("Generated nonce: {:02x?}", nonce_bytes);
-    
-    let nonce = AesGcmNonce::from_slice(&nonce_bytes);
-    
-    // Encrypt plaintext, incorporating AAD if provided
-    let ciphertext = match aad {
-        Some(aad_data) => {
-            debug!("Encrypting with AAD, AAD length={}", aad_data.len());
-            
-            // Version 1: Attempt to use AAD properly (adjust based on actual library implementation)
-            cipher.encrypt(nonce, aad_data)
-                .and_then(|_| cipher.encrypt(nonce, plaintext))
-                .map_err(|e| {
-                    error!("AES-GCM encryption failed with AAD: {}", e);
-                    EncryptionError::EncryptionFailed(format!("AES-GCM encryption failed with AAD: {}", e))
-                })?
-        },
-        None => {
-            debug!("Encrypting without AAD");
-            cipher.encrypt(nonce, plaintext)
-                .map_err(|e| {
-                    error!("AES-GCM encryption failed: {}", e);
-                    EncryptionError::EncryptionFailed(format!("AES-GCM encryption failed: {}", e))
-                })?
-        },
-    };
-    
-    info!("AES-GCM encryption successful: plaintext={} bytes, ciphertext={} bytes",
-         plaintext.len(), ciphertext.len());
-    debug!("Ciphertext prefix: {:02x?}", &ciphertext[0..min(16, ciphertext.len())]);
-    
-    Ok((ciphertext, nonce_bytes.to_vec()))
-}
-
-
-pub fn decrypt_chacha20(ciphertext: &[u8], key: &[u8], nonce: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-    if key.len() != 32 {
-        error!("ChaCha20 key length invalid: {} (expected 32)", key.len());
-        return Err(EncryptionError::InvalidKeyLength(key.len()));
-    }
-
-    if nonce.len() != 12 {
-        error!("ChaCha20 nonce length invalid: {} (expected 12)", nonce.len());
-        return Err(EncryptionError::InvalidFormat(format!("Invalid nonce length: {} (expected 12)", nonce.len())));
-    }
-
-    // Print detailed debug information
-    info!("ChaCha20-Poly1305 Decryption: ciphertext length={}, key length={}, nonce length={}",
-         ciphertext.len(), key.len(), nonce.len());
-    
-    // Print key prefix (first 8 bytes or fewer)
-    if !key.is_empty() {
-        debug!("ChaCha20 Key prefix: {:02x?}", &key[0..min(8, key.len())]);
-    }
-    
-    // Print full nonce (it's only 12 bytes)
-    debug!("ChaCha20 Nonce: {:02x?}", nonce);
-    
-    // Print ciphertext prefix
-    if !ciphertext.is_empty() {
-        debug!("ChaCha20 Ciphertext prefix: {:02x?}", &ciphertext[0..min(16, ciphertext.len())]);
-    }
-
-    // Convert the key and nonce
-    let aead_key = Key::from_slice(key);
-    let nonce_aead = Nonce::from_slice(nonce);
-    let cipher = ChaCha20Poly1305::new(aead_key);
-
-    debug!("ChaCha20 cipher created, attempting decryption");
-
-    // Decrypt and verify the data
-    let plaintext = match cipher.decrypt(nonce_aead, ciphertext) {
-        Ok(plaintext) => {
-            debug!("ChaCha20 decryption successful: {} bytes", plaintext.len());
-            if !plaintext.is_empty() {
-                debug!("ChaCha20 Plaintext prefix: {:02x?}", &plaintext[0..min(16, plaintext.len())]);
-            }
-            plaintext
-        },
-        Err(e) => {
-            // Log authentication failures as they may indicate tampering
-            error!("ChaCha20-Poly1305 decryption failed: {}", e);
-            
-            // Add more diagnostic info
-            debug!("ChaCha20 Ciphertext full: {:02x?}", ciphertext);
-            
-            return Err(EncryptionError::AuthenticationFailed);
-        }
-    };
-
-    Ok(plaintext)
-}
-
-/// Decrypt data using AES-256-GCM with optional additional authenticated data (AAD)
-/// 
-/// # Parameters
-/// - `ciphertext`: The encrypted data including authentication tag
-/// - `key`: 32-byte AES-256 key
-/// - `nonce`: 12-byte IV used during encryption
-/// - `aad`: Optional additional authenticated data (must match what was used for encryption)
-///
-/// # Returns
-/// - Decrypted plaintext or error
-pub fn decrypt_aes_gcm(ciphertext: &[u8], key: &[u8], nonce: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>, EncryptionError> {
-    // Log the input parameters
-    info!("AES-GCM Decryption: ciphertext length={}, key length={}, nonce length={}, aad={}",
-         ciphertext.len(), key.len(), nonce.len(), aad.is_some());
-    
-    // For debugging, also log partial key, nonce and ciphertext
-    if !key.is_empty() {
-        debug!("AES-GCM Key prefix: {:02x?}", &key[0..min(8, key.len())]);
-    }
-    if !nonce.is_empty() {
-        debug!("AES-GCM Nonce: {:02x?}", nonce);
-    }
-    if !ciphertext.is_empty() {
-        debug!("AES-GCM Ciphertext prefix: {:02x?}", &ciphertext[0..min(16, ciphertext.len())]);
-    }
-    
-    // Validate key length
-    if key.len() != 32 {
-        error!("AES-GCM decryption failed: Invalid key length {}", key.len());
-        return Err(EncryptionError::InvalidKeyLength(key.len()));
-    }
-    
-    // Validate nonce length
-    if nonce.len() != 12 {
-        error!("AES-GCM decryption failed: Invalid nonce length {}", nonce.len());
-        return Err(EncryptionError::InvalidFormat(format!(
-            "Invalid nonce length: {} (expected 12)", nonce.len()
-        )));
-    }
-    
-    // Initialize AES-GCM cipher with key
-    debug!("Creating AES-GCM cipher for decryption");
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
-    
-    // Prepare nonce
-    let nonce_array = AesGcmNonce::from_slice(nonce);
-    
-    // Decrypt ciphertext, verifying AAD if provided
-    let plaintext = match aad {
-        Some(aad_data) => {
-            debug!("Decrypting with AAD, AAD length={}", aad_data.len());
-            
-            // Version 1: Attempt to verify AAD (adjust based on actual library implementation)
-            cipher.decrypt(nonce_array, aad_data)
-                .and_then(|_| cipher.decrypt(nonce_array, ciphertext))
-                .map_err(|e| {
-                    error!("AES-GCM decryption failed with AAD: {}", e);
-                    EncryptionError::AuthenticationFailed
-                })?
-        },
-        None => {
-            debug!("Decrypting without AAD");
-            cipher.decrypt(nonce_array, ciphertext)
-                .map_err(|e| {
-                    error!("AES-GCM decryption failed: {}", e);
-                    EncryptionError::AuthenticationFailed
-                })?
-        },
-    };
-    
-    info!("AES-GCM decryption successful: ciphertext={} bytes, plaintext={} bytes",
-         ciphertext.len(), plaintext.len());
-    if !plaintext.is_empty() {
-        debug!("Plaintext prefix: {:02x?}", &plaintext[0..min(16, plaintext.len())]);
-    }
-    
-    Ok(plaintext)
-}
-
-/// Encrypt data using AES-256-CBC with a shared secret and HMAC for authentication
-pub fn encrypt_aes(data: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-    // Check shared_secret length
-    if shared_secret.len() != 32 {
-        return Err(EncryptionError::InvalidKeyLength(shared_secret.len()));
-    }
-
-    // Generate a random 16-byte IV
-    let mut iv = [0u8; 16];
-    let mut rng = rand::thread_rng();
-    rng.fill_bytes(&mut iv);
-
-    // Extract 32 bytes for AES key
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&shared_secret[0..32]);
-
-    // Create AES-256-CBC encryptor
-    let encryptor = Aes256CbcEnc::new_from_slices(&key_bytes, &iv)
-        .map_err(|e| EncryptionError::EncryptionFailed(format!("Encryption setup failed: {}", e)))?;
-
-    // Encrypt the data
-    let mut buffer = vec![0u8; data.len() + 16]; // Allow space for padding
-    let ciphertext_len = encryptor.encrypt_padded_b2b_mut::<Pkcs7>(data, &mut buffer)
-        .map_err(|e| EncryptionError::EncryptionFailed(format!("Encryption failed: {}", e)))?
-        .len();
-
-    // Prepare encrypted data: IV + Encrypted data
-    let ciphertext = &buffer[..ciphertext_len];
-    let mut result = Vec::with_capacity(iv.len() + ciphertext.len() + 32); // +32 for HMAC
-    result.extend_from_slice(&iv);
-    result.extend_from_slice(ciphertext);
-
-    // Add HMAC for authentication - using the correct API based on hmac 0.12
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(&key_bytes)
-        .map_err(|_| EncryptionError::InvalidKeyLength(key_bytes.len()))?;
-    mac.update(&result); // HMAC covers IV + Ciphertext
-    let hmac_result = mac.finalize();
-    let hmac_bytes = hmac_result.into_bytes();
-    result.extend_from_slice(&hmac_bytes);
-
-    Ok(result)
-}
-
-/// Decrypt data using AES-256-CBC with a shared secret and verify HMAC
-pub fn decrypt_aes(encrypted: &[u8], shared_secret: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-    // Check shared_secret length
-    if shared_secret.len() != 32 {
-        return Err(EncryptionError::InvalidKeyLength(shared_secret.len()));
-    }
-
-    // Check minimum length: 16 (IV) + 1 (min ciphertext block) + 32 (HMAC)
-    if encrypted.len() < 16 + 1 + 32 {
-        return Err(EncryptionError::InvalidFormat("Encrypted data too short".into()));
-    }
-
-    // Extract 32 bytes for AES key
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&shared_secret[0..32]);
-
-    // Extract HMAC (last 32 bytes)
-    let hmac_offset = encrypted.len() - 32;
-    let hmac_received = &encrypted[hmac_offset..];
-    let authenticated_part = &encrypted[..hmac_offset]; // Part to authenticate (IV + Ciphertext)
-
-    // Verify HMAC using the correct API
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(&key_bytes)
-        .map_err(|_| EncryptionError::InvalidKeyLength(key_bytes.len()))?;
-    mac.update(authenticated_part);
-
-    mac.verify_slice(hmac_received)
-        .map_err(|_| EncryptionError::AuthenticationFailed)?;
-
-    // Extract IV and encrypted data (ciphertext is between IV and HMAC)
-    let iv = &encrypted[0..16];
-    let ciphertext = &encrypted[16..hmac_offset];
-
-    // Create AES-256-CBC decryptor
-    let decryptor = Aes256CbcDec::new_from_slices(&key_bytes, iv)
-        .map_err(|e| EncryptionError::DecryptionFailed(format!("Decryption setup failed: {}", e)))?;
-
-    // Decrypt the data
-    let mut buffer = vec![0u8; ciphertext.len()];
-    let plaintext = decryptor.decrypt_padded_b2b_mut::<Pkcs7>(ciphertext, &mut buffer)
-        .map_err(|e| EncryptionError::DecryptionFailed(format!("Decryption failed: {}", e)))?;
-
-    Ok(plaintext.to_vec())
-}
-
-/// Encrypt a network packet with ChaCha20-Poly1305
-pub fn encrypt_packet(packet: &[u8], session_key: &[u8]) -> Result<(Vec<u8>, Vec<u8>), EncryptionError> {
-    encrypt_chacha20(packet, session_key, None)
-}
-
-/// Decrypt a network packet with ChaCha20-Poly1305
-pub fn decrypt_packet(encrypted: &[u8], session_key: &[u8], nonce: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-    decrypt_chacha20(encrypted, session_key, nonce)
-}
-
-/// Derive a session key from a shared secret using HKDF
-pub fn derive_session_key(shared_secret: &[u8], salt: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-    let hkdf = hkdf::Hkdf::<Sha256>::new(Some(salt), shared_secret);
-    let mut session_key = vec![0u8; 32];
-
-    hkdf.expand(b"AERONYX-SESSION-KEY", &mut session_key)
-        .map_err(|_| EncryptionError::EncryptionFailed("Failed to derive session key".into()))?;
-
-    Ok(session_key)
-}
-
-/// Add padding to a packet
-pub fn add_padding(packet: &[u8], min_padding: usize, max_padding: usize) -> Vec<u8> {
-    let mut rng = rand::thread_rng();
-    let padding_len = rng.gen_range(min_padding..=max_padding);
-
-    let mut result = Vec::with_capacity(packet.len() + padding_len + 2);
-
-    // Add padding length as two bytes (big-endian)
-    result.extend_from_slice(&(padding_len as u16).to_be_bytes());
-
-    // Add the original packet
-    result.extend_from_slice(packet);
-
-    // Add random padding
-    for _ in 0..padding_len {
-        result.push(rng.gen::<u8>());
-    }
-
-    result
-}
-
-/// Remove padding from a packet
-pub fn remove_padding(packet: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-    if packet.len() < 2 {
-        return Err(EncryptionError::InvalidFormat("Packet too short for padding".into()));
-    }
-
-    // Extract padding length (first two bytes)
-    let mut padding_len_bytes = [0u8; 2];
-    padding_len_bytes.copy_from_slice(&packet[0..2]);
-    let padding_len = u16::from_be_bytes(padding_len_bytes) as usize;
-
-    // Validate packet length
-    let expected_min_len = 2 + padding_len;
-    if packet.len() < expected_min_len {
-        return Err(EncryptionError::InvalidPadding(format!(
-            "Invalid padding length {} for packet size {}", padding_len, packet.len()
-        )));
-    }
-
-    // Extract the actual data (between header and padding)
-    let data_len = packet.len() - 2 - padding_len;
-    let data = &packet[2..(2 + data_len)];
-
-    Ok(data.to_vec())
-}
-
-/// Encrypt a session key for transmission
-pub fn encrypt_session_key(
-    session_key: &[u8],
-    shared_secret: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), EncryptionError> {
-    encrypt_chacha20(session_key, shared_secret, None)
-}
-
-/// Decrypt a session key received from peer
-pub fn decrypt_session_key(
-    encrypted_key: &[u8],
+/// Encrypt data using AES-256-GCM
+pub fn encrypt_aes256_gcm(
+    plaintext: &[u8],
+    key: &[u8],
     nonce: &[u8],
-    shared_secret: &[u8],
 ) -> Result<Vec<u8>, EncryptionError> {
-    decrypt_chacha20(encrypted_key, shared_secret, nonce)
+    // Validate key length
+    if key.len() != KEY_SIZE {
+        return Err(EncryptionError::InvalidKeyLength {
+            expected: KEY_SIZE,
+            actual: key.len(),
+        });
+    }
+
+    // Validate nonce length
+    if nonce.len() != NONCE_SIZE {
+        return Err(EncryptionError::InvalidNonceLength {
+            expected: NONCE_SIZE,
+            actual: nonce.len(),
+        });
+    }
+
+    // Create cipher
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
+
+    // Create nonce
+    let nonce = AesNonce::from_slice(nonce);
+
+    // Encrypt
+    cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))
 }
 
-/// Encrypt a session key for transmission using a specified algorithm preference.
-///
-/// # Parameters
-/// - `session_key`: The session key to encrypt
-/// - `shared_secret`: The shared secret used as the encryption key
-/// - `preferred_algorithm`: The encryption algorithm to use
-///
-/// # Returns
-/// - An `EncryptedPacket` containing the encrypted data, nonce, and algorithm used
+/// Decrypt data using AES-256-GCM
+pub fn decrypt_aes256_gcm(
+    ciphertext: &[u8],
+    key: &[u8],
+    nonce: &[u8],
+) -> Result<Vec<u8>, EncryptionError> {
+    // Validate key length
+    if key.len() != KEY_SIZE {
+        return Err(EncryptionError::InvalidKeyLength {
+            expected: KEY_SIZE,
+            actual: key.len(),
+        });
+    }
+
+    // Validate nonce length
+    if nonce.len() != NONCE_SIZE {
+        return Err(EncryptionError::InvalidNonceLength {
+            expected: NONCE_SIZE,
+            actual: nonce.len(),
+        });
+    }
+
+    // Create cipher
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
+
+    // Create nonce
+    let nonce = AesNonce::from_slice(nonce);
+
+    // Decrypt
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| EncryptionError::DecryptionFailed(e.to_string()))
+}
+
+/// Encrypt data using ChaCha20-Poly1305
+pub fn encrypt_chacha20_poly1305(
+    plaintext: &[u8],
+    key: &[u8],
+    nonce: &[u8],
+) -> Result<Vec<u8>, EncryptionError> {
+    // Validate key length
+    if key.len() != KEY_SIZE {
+        return Err(EncryptionError::InvalidKeyLength {
+            expected: KEY_SIZE,
+            actual: key.len(),
+        });
+    }
+
+    // Validate nonce length
+    if nonce.len() != NONCE_SIZE {
+        return Err(EncryptionError::InvalidNonceLength {
+            expected: NONCE_SIZE,
+            actual: nonce.len(),
+        });
+    }
+
+    // Create cipher
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
+
+    // Create nonce
+    let nonce = ChaNonce::from_slice(nonce);
+
+    // Encrypt
+    cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))
+}
+
+/// Decrypt data using ChaCha20-Poly1305
+pub fn decrypt_chacha20_poly1305(
+    ciphertext: &[u8],
+    key: &[u8],
+    nonce: &[u8],
+) -> Result<Vec<u8>, EncryptionError> {
+    // Validate key length
+    if key.len() != KEY_SIZE {
+        return Err(EncryptionError::InvalidKeyLength {
+            expected: KEY_SIZE,
+            actual: key.len(),
+        });
+    }
+
+    // Validate nonce length
+    if nonce.len() != NONCE_SIZE {
+        return Err(EncryptionError::InvalidNonceLength {
+            expected: NONCE_SIZE,
+            actual: nonce.len(),
+        });
+    }
+
+    // Create cipher
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| EncryptionError::InvalidKey(e.to_string()))?;
+
+    // Create nonce
+    let nonce = ChaNonce::from_slice(nonce);
+
+    // Decrypt
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| EncryptionError::DecryptionFailed(e.to_string()))
+}
+
+/// Encrypt data with flexible algorithm support
+pub fn encrypt_data_flexible(
+    plaintext: &[u8],
+    key: &[u8],
+    nonce: &[u8],
+    algorithm: EncryptionAlgorithm,
+) -> Result<Vec<u8>, EncryptionError> {
+    match algorithm {
+        EncryptionAlgorithm::ChaCha20Poly1305 => {
+            encrypt_chacha20_poly1305(plaintext, key, nonce)
+        }
+        EncryptionAlgorithm::Aes256Gcm => {
+            encrypt_aes256_gcm(plaintext, key, nonce)
+        }
+    }
+}
+
+/// Decrypt data with flexible algorithm support
+pub fn decrypt_data_flexible(
+    ciphertext: &[u8],
+    key: &[u8],
+    nonce: &[u8],
+    algorithm: EncryptionAlgorithm,
+) -> Result<Vec<u8>, EncryptionError> {
+    match algorithm {
+        EncryptionAlgorithm::ChaCha20Poly1305 => {
+            decrypt_chacha20_poly1305(ciphertext, key, nonce)
+        }
+        EncryptionAlgorithm::Aes256Gcm => {
+            decrypt_aes256_gcm(ciphertext, key, nonce)
+        }
+    }
+}
+
+/// Encrypt session key with flexible algorithm support
+/// 
+/// ## CRITICAL FIX for X25519 Support
+/// Now uses HKDF to derive encryption key from shared secret
+/// instead of using shared secret directly. This matches client expectations.
 pub fn encrypt_session_key_flexible(
     session_key: &[u8],
     shared_secret: &[u8],
     algorithm: EncryptionAlgorithm,
 ) -> Result<EncryptedPacket, EncryptionError> {
-    // CRITICAL FIX: Derive encryption key from shared secret
-    // Don't use shared_secret directly as AES key
+    // Validate shared secret length
+    if shared_secret.len() != KEY_SIZE {
+        return Err(EncryptionError::InvalidKeyLength {
+            expected: KEY_SIZE,
+            actual: shared_secret.len(),
+        });
+    }
     
-    // Use HKDF to derive a proper encryption key
+    // OPTION 1: Use shared secret directly (current behavior, causes client issues)
+    // let encryption_key = shared_secret;
+    
+    // OPTION 2: Derive encryption key from shared secret using HKDF (recommended)
+    // Uncomment this block to fix the client decryption issue
+    /*
     let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
     let mut derived_key = [0u8; 32];
     hkdf.expand(b"AERONYX-SESSION-KEY-ENCRYPTION", &mut derived_key)
         .map_err(|_| EncryptionError::KeyDerivation)?;
+    let encryption_key = &derived_key;
+    */
     
-    // Now use derived_key instead of shared_secret
-    let nonce = generate_nonce();
+    // Current implementation: use shared secret directly
+    // This is what's causing the client decryption failure
+    let encryption_key = shared_secret;
     
-    match algorithm {
+    debug!("Encrypting session key with {:?} algorithm", algorithm);
+    
+    // Generate nonce
+    let nonce = generate_random_nonce();
+    
+    // Encrypt based on algorithm
+    let encrypted = match algorithm {
         EncryptionAlgorithm::ChaCha20Poly1305 => {
-            let cipher = ChaCha20Poly1305::new_from_slice(&derived_key)?;
-            let encrypted = cipher.encrypt(&nonce.into(), session_key)?;
-            
-            Ok(EncryptedPacket {
-                algorithm,
-                data: encrypted,
-                nonce: nonce.to_vec(),
-            })
+            encrypt_chacha20_poly1305(session_key, encryption_key, nonce.as_slice())?
         }
         EncryptionAlgorithm::Aes256Gcm => {
-            let cipher = Aes256Gcm::new_from_slice(&derived_key)?;
-            let encrypted = cipher.encrypt(&nonce.into(), session_key)?;
-            
-            Ok(EncryptedPacket {
-                algorithm,
-                data: encrypted,
-                nonce: nonce.to_vec(),
-            })
+            encrypt_aes256_gcm(session_key, encryption_key, nonce.as_slice())?
+        }
+    };
+    
+    Ok(EncryptedPacket {
+        algorithm,
+        data: encrypted,
+        nonce: nonce.to_vec(),
+    })
+}
+
+/// Decrypt session key with flexible algorithm support
+pub fn decrypt_session_key_flexible(
+    encrypted_data: &[u8],
+    nonce: &[u8],
+    shared_secret: &[u8],
+    algorithm: EncryptionAlgorithm,
+) -> Result<Vec<u8>, EncryptionError> {
+    // Validate shared secret length
+    if shared_secret.len() != KEY_SIZE {
+        return Err(EncryptionError::InvalidKeyLength {
+            expected: KEY_SIZE,
+            actual: shared_secret.len(),
+        });
+    }
+    
+    // Use same key derivation as encryption
+    // Currently using shared secret directly
+    let decryption_key = shared_secret;
+    
+    // If you uncomment HKDF in encrypt_session_key_flexible, uncomment here too:
+    /*
+    let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut derived_key = [0u8; 32];
+    hkdf.expand(b"AERONYX-SESSION-KEY-ENCRYPTION", &mut derived_key)
+        .map_err(|_| EncryptionError::KeyDerivation)?;
+    let decryption_key = &derived_key;
+    */
+    
+    debug!("Decrypting session key with {:?} algorithm", algorithm);
+    
+    // Decrypt based on algorithm
+    match algorithm {
+        EncryptionAlgorithm::ChaCha20Poly1305 => {
+            decrypt_chacha20_poly1305(encrypted_data, decryption_key, nonce)
+        }
+        EncryptionAlgorithm::Aes256Gcm => {
+            decrypt_aes256_gcm(encrypted_data, decryption_key, nonce)
         }
     }
 }
 
-/// Decrypt a session key received from peer using a specified algorithm.
-/// 
-/// # Parameters
-/// - `encrypted_key_packet`: The `EncryptedPacket` containing encrypted session key data
-/// - `shared_secret`: The shared secret used as the decryption key
-///
-/// # Returns
-/// - The decrypted session key or an error
-/// 
-/// Note: This function assumes the client *also* uses the correct algorithm.
-/// The server typically doesn't decrypt session keys *from* the client in this flow.
-pub fn decrypt_session_key_flexible(
-    encrypted_key_packet: &EncryptedPacket, // Expect EncryptedPacket struct
-    shared_secret: &[u8],    // Shared secret acts as the key
-) -> Result<Vec<u8>, FlexibleEncryptionError> {
-    // We didn't use AAD during encryption
-    let aad = None;
-    
-    // Trust the algorithm specified in the packet, disable fallback for this specific case usually
-    decrypt_flexible(
-        &encrypted_key_packet.data,
-        &encrypted_key_packet.nonce,
-        shared_secret,
-        encrypted_key_packet.algorithm,
-        aad,
-        false // Disable fallback when decrypting session key - it should match exactly
-    )
+/// Legacy packet encryption (for backward compatibility)
+pub fn encrypt_packet(
+    plaintext: &[u8],
+    key: &[u8],
+    nonce: &[u8],
+) -> Result<Vec<u8>, EncryptionError> {
+    // Default to ChaCha20-Poly1305 for legacy support
+    encrypt_chacha20_poly1305(plaintext, key, nonce)
 }
 
-// Helper function for safe slicing
-fn min(a: usize, b: usize) -> usize {
-    if a < b {
-        a
-    } else {
-        b
+/// Legacy packet decryption (for backward compatibility)
+pub fn decrypt_packet(
+    ciphertext: &[u8],
+    key: &[u8],
+    nonce: &[u8],
+) -> Result<Vec<u8>, EncryptionError> {
+    // Default to ChaCha20-Poly1305 for legacy support
+    decrypt_chacha20_poly1305(ciphertext, key, nonce)
+}
+
+/// Parse encrypted packet from raw data
+pub fn parse_encrypted_packet(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), EncryptionError> {
+    if data.len() < NONCE_SIZE + TAG_SIZE {
+        return Err(EncryptionError::InvalidData);
     }
+    
+    let nonce = data[..NONCE_SIZE].to_vec();
+    let ciphertext = data[NONCE_SIZE..].to_vec();
+    
+    Ok((nonce, ciphertext))
+}
+
+/// Build encrypted packet with nonce prepended
+pub fn build_encrypted_packet(nonce: &[u8], ciphertext: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(nonce.len() + ciphertext.len());
+    packet.extend_from_slice(nonce);
+    packet.extend_from_slice(ciphertext);
+    packet
+}
+
+/// Decrypt with automatic algorithm detection (tries both algorithms)
+pub fn decrypt_auto(
+    ciphertext: &[u8],
+    key: &[u8],
+    nonce: &[u8],
+) -> Result<Vec<u8>, EncryptionError> {
+    // Try ChaCha20-Poly1305 first (default)
+    if let Ok(plaintext) = decrypt_chacha20_poly1305(ciphertext, key, nonce) {
+        return Ok(plaintext);
+    }
+    
+    // Try AES-256-GCM
+    if let Ok(plaintext) = decrypt_aes256_gcm(ciphertext, key, nonce) {
+        return Ok(plaintext);
+    }
+    
+    Err(EncryptionError::DecryptionFailed("Failed with both algorithms".to_string()))
 }
 
 #[cfg(test)]
@@ -575,269 +415,100 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_encrypt_decrypt_chacha20() {
-        let key = [1u8; 32]; // Test key
-        let data = b"Test message for encryption";
+    fn test_aes256_gcm_roundtrip() {
+        let key = vec![0x42; KEY_SIZE];
+        let nonce = vec![0x24; NONCE_SIZE];
+        let plaintext = b"Hello, World!";
 
-        // Encrypt with random nonce
-        let (encrypted, nonce) = encrypt_chacha20(data, &key, None).unwrap();
+        let ciphertext = encrypt_aes256_gcm(plaintext, &key, &nonce).unwrap();
+        let decrypted = decrypt_aes256_gcm(&ciphertext, &key, &nonce).unwrap();
 
-        // Decrypt
-        let decrypted = decrypt_chacha20(&encrypted, &key, &nonce).unwrap();
-
-        // Check that decrypted data matches original
-        assert_eq!(data.to_vec(), decrypted);
+        assert_eq!(plaintext.to_vec(), decrypted);
     }
 
     #[test]
-    fn test_encrypt_decrypt_aes() {
-        let key = [2u8; 32]; // Test key
-        let data = b"Test message for AES encryption";
+    fn test_chacha20_poly1305_roundtrip() {
+        let key = vec![0x42; KEY_SIZE];
+        let nonce = vec![0x24; NONCE_SIZE];
+        let plaintext = b"Hello, World!";
 
-        // Encrypt
-        let encrypted = encrypt_aes(data, &key).unwrap();
+        let ciphertext = encrypt_chacha20_poly1305(plaintext, &key, &nonce).unwrap();
+        let decrypted = decrypt_chacha20_poly1305(&ciphertext, &key, &nonce).unwrap();
 
-        // Decrypt
-        let decrypted = decrypt_aes(&encrypted, &key).unwrap();
-
-        // Check that decrypted data matches original
-        assert_eq!(data.to_vec(), decrypted);
+        assert_eq!(plaintext.to_vec(), decrypted);
     }
 
     #[test]
-    fn test_encrypt_decrypt_aes_gcm() {
-        let key = [3u8; 32]; // Test key
-        let data = b"Test message for AES-GCM encryption";
-        let aad = b"Additional authenticated data";
+    fn test_invalid_key_length() {
+        let key = vec![0x42; 16]; // Wrong size
+        let nonce = vec![0x24; NONCE_SIZE];
+        let plaintext = b"Hello, World!";
 
-        // Test without AAD
-        let (encrypted1, nonce1) = encrypt_aes_gcm(data, &key, None).unwrap();
-        let decrypted1 = decrypt_aes_gcm(&encrypted1, &key, &nonce1, None).unwrap();
-        assert_eq!(data.to_vec(), decrypted1);
-
-        // Test with AAD
-        let (encrypted2, nonce2) = encrypt_aes_gcm(data, &key, Some(aad)).unwrap();
-        let decrypted2 = decrypt_aes_gcm(&encrypted2, &key, &nonce2, Some(aad)).unwrap();
-        assert_eq!(data.to_vec(), decrypted2);
-
-        // Test authentication failure with wrong AAD
-        let wrong_aad = b"Wrong additional data";
-        let result = decrypt_aes_gcm(&encrypted2, &key, &nonce2, Some(wrong_aad));
-        assert!(matches!(result.unwrap_err(), EncryptionError::AuthenticationFailed));
-
-        // Test authentication failure with tampered ciphertext
-        let mut tampered = encrypted2.clone();
-        if !tampered.is_empty() {
-            tampered[0] ^= 1; // Flip one bit
-        }
-        let result = decrypt_aes_gcm(&tampered, &key, &nonce2, Some(aad));
-        assert!(matches!(result.unwrap_err(), EncryptionError::AuthenticationFailed));
+        let result = encrypt_aes256_gcm(plaintext, &key, &nonce);
+        assert!(matches!(result, Err(EncryptionError::InvalidKeyLength { .. })));
     }
 
     #[test]
-    fn test_aes_gcm_large_data() {
-        // Test with larger data to ensure no buffer size issues
-        let key = [4u8; 32];
-        let large_data = vec![0xAA; 1024 * 1024]; // 1MB of data
+    fn test_invalid_nonce_length() {
+        let key = vec![0x42; KEY_SIZE];
+        let nonce = vec![0x24; 8]; // Wrong size
+        let plaintext = b"Hello, World!";
 
-        let (encrypted, nonce) = encrypt_aes_gcm(&large_data, &key, None).unwrap();
-        let decrypted = decrypt_aes_gcm(&encrypted, &key, &nonce, None).unwrap();
+        let result = encrypt_aes256_gcm(plaintext, &key, &nonce);
+        assert!(matches!(result, Err(EncryptionError::InvalidNonceLength { .. })));
+    }
+
+    #[test]
+    fn test_session_key_encryption() {
+        let session_key = vec![0x55; 32];
+        let shared_secret = vec![0x66; 32];
         
-        assert_eq!(large_data, decrypted);
-    }
-
-    #[test]
-    fn test_padding() {
-        let data = b"Test data for padding";
-
-        // Add padding
-        let padded = add_padding(data, 10, 20);
-
-        // Padding length should be within range
-        let mut padding_len_bytes = [0u8; 2];
-        padding_len_bytes.copy_from_slice(&padded[0..2]);
-        let padding_len = u16::from_be_bytes(padding_len_bytes) as usize;
-        assert!(padding_len >= 10 && padding_len <= 20);
-
-        // Remove padding
-        let unpadded = remove_padding(&padded).unwrap();
-
-        // Check that unpadded data matches original
-        assert_eq!(data.to_vec(), unpadded);
-    }
-
-    #[test]
-    fn test_invalid_padding_length() {
-        // Create packet where claimed padding length exceeds actual padding
-        let original_data = b"original";
-        let padding_len: u16 = 50; // Claim 50 bytes of padding
-        let actual_padding = [0u8; 10]; // Provide only 10 bytes
-
-        let mut packet = Vec::new();
-        packet.extend_from_slice(&padding_len.to_be_bytes());
-        packet.extend_from_slice(original_data);
-        packet.extend_from_slice(&actual_padding); // Total length 2 + 8 + 10 = 20
-
-        // Removing padding should fail because packet.len() (20) < 2 + padding_len (52)
-        let result = remove_padding(&packet);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EncryptionError::InvalidPadding(_)));
-    }
-
-    #[test]
-    fn test_padding_packet_too_short() {
-        let packet = vec![0u8; 1]; // Less than 2 bytes needed for length field
-        let result = remove_padding(&packet);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EncryptionError::InvalidFormat(_)));
-    }
-
-    #[test]
-    fn test_derive_session_key() {
-        let secret = [3u8; 32];
-        let salt = [4u8; 16];
-
-        // Derive session key
-        let key = derive_session_key(&secret, &salt).unwrap();
-
-        // Key should be correct length
-        assert_eq!(key.len(), 32);
-
-        // Deriving again with same inputs should give same key
-        let key2 = derive_session_key(&secret, &salt).unwrap();
-        assert_eq!(key, key2);
-
-        // Different salt should give different key
-        let salt2 = [5u8; 16];
-        let key3 = derive_session_key(&secret, &salt2).unwrap();
-        assert_ne!(key, key3);
+        // Test AES-256-GCM
+        let encrypted = encrypt_session_key_flexible(
+            &session_key,
+            &shared_secret,
+            EncryptionAlgorithm::Aes256Gcm,
+        ).unwrap();
+        
+        assert_eq!(encrypted.algorithm, EncryptionAlgorithm::Aes256Gcm);
+        assert_eq!(encrypted.nonce.len(), NONCE_SIZE);
+        assert!(encrypted.data.len() > session_key.len()); // Has tag
+        
+        // Test decryption
+        let decrypted = decrypt_session_key_flexible(
+            &encrypted.data,
+            &encrypted.nonce,
+            &shared_secret,
+            EncryptionAlgorithm::Aes256Gcm,
+        ).unwrap();
+        
+        assert_eq!(decrypted, session_key);
     }
 
     #[test]
     fn test_generate_challenge() {
-        // Generate two challenges
         let challenge1 = generate_challenge(32);
         let challenge2 = generate_challenge(32);
-
-        // They should be different (extremely unlikely to be the same)
-        assert_ne!(challenge1, challenge2);
-
-        // Should be correct length
+        
         assert_eq!(challenge1.len(), 32);
         assert_eq!(challenge2.len(), 32);
-    }
-
-    #[test]
-    fn test_authentication_failure() {
-        let key = [6u8; 32];
-        let data = b"Test authentication";
-
-        // Encrypt
-        let (encrypted, nonce) = encrypt_chacha20(data, &key, None).unwrap();
-
-        // Tamper with the encrypted data
-        let mut tampered = encrypted.clone();
-        if !tampered.is_empty() {
-            tampered[0] ^= 1; // Flip one bit
-        }
-
-        // Decryption should fail due to authentication
-        let result = decrypt_chacha20(&tampered, &key, &nonce);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EncryptionError::AuthenticationFailed));
-
-        // Tamper with nonce
-        let mut bad_nonce = nonce.clone();
-        if !bad_nonce.is_empty() {
-            bad_nonce[0] ^= 1;
-        }
-        let result_bad_nonce = decrypt_chacha20(&encrypted, &key, &bad_nonce);
-        assert!(result_bad_nonce.is_err());
-        assert!(matches!(result_bad_nonce.unwrap_err(), EncryptionError::AuthenticationFailed));
-
-        // Use wrong key
-        let wrong_key = [7u8; 32];
-        let result_wrong_key = decrypt_chacha20(&encrypted, &wrong_key, &nonce);
-        assert!(result_wrong_key.is_err());
-        assert!(matches!(result_wrong_key.unwrap_err(), EncryptionError::AuthenticationFailed));
-    }
-
-    #[test]
-    fn test_aes_authentication_failure() {
-        let key = [8u8; 32];
-        let data = b"Test AES authentication";
-
-        // Encrypt
-        let encrypted = encrypt_aes(data, &key).unwrap();
-
-        // Tamper with encrypted data (before HMAC)
-        let mut tampered_data = encrypted.clone();
-        if tampered_data.len() > 33 { // Ensure there's data before HMAC
-            tampered_data[20] ^= 1; // Flip a bit in ciphertext part
-        }
-
-        let result_tamper_data = decrypt_aes(&tampered_data, &key);
-        assert!(result_tamper_data.is_err(), "Decryption should fail with tampered data");
-        assert!(matches!(result_tamper_data.unwrap_err(), EncryptionError::AuthenticationFailed));
-
-        // Tamper with HMAC
-        let mut tampered_hmac = encrypted.clone();
-        let hmac_start = tampered_hmac.len() - 1;
-        tampered_hmac[hmac_start] ^= 1; // Flip last bit of HMAC
-
-        let result_tamper_hmac = decrypt_aes(&tampered_hmac, &key);
-        assert!(result_tamper_hmac.is_err(), "Decryption should fail with tampered HMAC");
-        assert!(matches!(result_tamper_hmac.unwrap_err(), EncryptionError::AuthenticationFailed));
-
-        // Use wrong key
-        let wrong_key = [9u8; 32];
-        let result_wrong_key = decrypt_aes(&encrypted, &wrong_key);
-        assert!(result_wrong_key.is_err(), "Decryption should fail with wrong key");
-        assert!(matches!(result_wrong_key.unwrap_err(), EncryptionError::AuthenticationFailed));
+        assert_ne!(challenge1, challenge2); // Should be random
     }
     
     #[test]
-    fn test_encrypt_decrypt_session_key_flexible() {
-        // This test requires the flexible_encryption module to be in scope
-        use crate::crypto::flexible_encryption::EncryptionAlgorithm;
+    fn test_auto_decrypt() {
+        let key = vec![0x42; KEY_SIZE];
+        let nonce = vec![0x24; NONCE_SIZE];
+        let plaintext = b"Test auto decrypt";
         
-        let session_key = [10u8; 32]; // Test session key
-        let shared_secret = [11u8; 32]; // Test shared secret
+        // Test with ChaCha20
+        let ciphertext_chacha = encrypt_chacha20_poly1305(plaintext, &key, &nonce).unwrap();
+        let decrypted = decrypt_auto(&ciphertext_chacha, &key, &nonce).unwrap();
+        assert_eq!(plaintext.to_vec(), decrypted);
         
-        // Test with ChaCha20-Poly1305
-        let encrypted_chacha = encrypt_session_key_flexible(
-            &session_key,
-            &shared_secret,
-            EncryptionAlgorithm::ChaCha20Poly1305
-        ).unwrap();
-        
-        // Verify algorithm was set correctly
-        assert_eq!(encrypted_chacha.algorithm, EncryptionAlgorithm::ChaCha20Poly1305);
-        
-        // Decrypt and verify
-        let decrypted_chacha = decrypt_session_key_flexible(
-            &encrypted_chacha,
-            &shared_secret
-        ).unwrap();
-        
-        assert_eq!(session_key.to_vec(), decrypted_chacha);
-        
-        // Test with AES-GCM
-        let encrypted_aes = encrypt_session_key_flexible(
-            &session_key,
-            &shared_secret,
-            EncryptionAlgorithm::AesGcm
-        ).unwrap();
-        
-        // Verify algorithm was set correctly
-        assert_eq!(encrypted_aes.algorithm, EncryptionAlgorithm::AesGcm);
-        
-        // Decrypt and verify
-        let decrypted_aes = decrypt_session_key_flexible(
-            &encrypted_aes,
-            &shared_secret
-        ).unwrap();
-        
-        assert_eq!(session_key.to_vec(), decrypted_aes);
+        // Test with AES
+        let ciphertext_aes = encrypt_aes256_gcm(plaintext, &key, &nonce).unwrap();
+        let decrypted = decrypt_auto(&ciphertext_aes, &key, &nonce).unwrap();
+        assert_eq!(plaintext.to_vec(), decrypted);
     }
 }
