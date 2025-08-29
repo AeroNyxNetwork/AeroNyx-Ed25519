@@ -19,6 +19,7 @@
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
+use rand_core::RngCore;
 use sha2::{Digest, Sha256, Sha512};
 use solana_sdk::pubkey::Pubkey;
 use ed25519_dalek::{SecretKey, PublicKey, Keypair as DalekKeypair};
@@ -168,11 +169,21 @@ impl SecretKeyCache {
 }
 
 /// Combined keypair storage structure
-#[derive(Debug)]
+/// Note: X25519SecretKey (StaticSecret) does not implement Debug,
+/// so we implement Debug manually for this struct
 struct CombinedKeypairs {
     ed25519: Keypair,
     x25519_private: X25519SecretKey,
     x25519_public: X25519PublicKey,
+}
+
+impl std::fmt::Debug for CombinedKeypairs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CombinedKeypairs")
+            .field("ed25519", &self.ed25519.pubkey())
+            .field("x25519_public", &bs58::encode(self.x25519_public.as_bytes()).into_string())
+            .finish()
+    }
 }
 
 /// Key manager for the server
@@ -220,7 +231,7 @@ impl KeyManager {
         } else {
             // Generate new keypairs
             let ed25519 = Keypair::new();
-            let x25519_private = X25519SecretKey::random_from_rng(OsRng);
+            let x25519_private = X25519SecretKey::new(OsRng);
             let x25519_public = X25519PublicKey::from(&x25519_private);
             
             let keypairs = CombinedKeypairs {
@@ -266,7 +277,7 @@ impl KeyManager {
                 .map_err(|e| KeyError::Format(format!("Invalid Ed25519 keypair: {}", e)))?;
             
             // Generate new X25519 keypair
-            let x25519_private = X25519SecretKey::random_from_rng(OsRng);
+            let x25519_private = X25519SecretKey::new(OsRng);
             let x25519_public = X25519PublicKey::from(&x25519_private);
             
             let keypairs = CombinedKeypairs {
@@ -298,7 +309,7 @@ impl KeyManager {
         // Combine both keypairs: Ed25519 (64 bytes) + X25519 private (32 bytes)
         let mut combined = Vec::with_capacity(96);
         combined.extend_from_slice(&keypairs.ed25519.to_bytes());
-        combined.extend_from_slice(keypairs.x25519_private.to_bytes());
+        combined.extend_from_slice(&keypairs.x25519_private.to_bytes());
 
         let mut file = fs::File::create(path)?;
         file.write_all(&combined)?;
@@ -363,7 +374,7 @@ impl KeyManager {
     pub async fn rotate_keypair(&self) -> Result<(), KeyError> {
         // Generate new keypairs
         let new_ed25519 = Keypair::new();
-        let new_x25519_private = X25519SecretKey::random_from_rng(OsRng);
+        let new_x25519_private = X25519SecretKey::new(OsRng);
         let new_x25519_public = X25519PublicKey::from(&new_x25519_private);
         
         let new_keypairs = CombinedKeypairs {
@@ -476,7 +487,7 @@ mod tests {
 
         // Generate and save keypairs
         let original_ed25519 = Keypair::new();
-        let original_x25519_private = X25519SecretKey::random_from_rng(OsRng);
+        let original_x25519_private = X25519SecretKey::new(OsRng);
         let original_x25519_public = X25519PublicKey::from(&original_x25519_private);
         
         let original = CombinedKeypairs {
