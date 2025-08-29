@@ -3,6 +3,16 @@
 //!
 //! This module defines the message types used in the AeroNyx Privacy Network
 //! protocol for authentication, key exchange, and data transfer.
+//!
+//! ## Key Changes for X25519 Support
+//! - Added optional `x25519_key` field to Challenge packet
+//! - Server now sends both Ed25519 (for signatures) and X25519 (for ECDH) public keys
+//! - Maintains backward compatibility with clients that don't support X25519
+//!
+//! ## Why These Changes
+//! - Clients need X25519 public key for ECDH key exchange
+//! - Ed25519 keys cannot be directly used for X25519 operations
+//! - Optional field ensures backward compatibility
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -49,7 +59,6 @@ pub enum PayloadDataType {
 #[serde(rename_all = "camelCase")]
 pub struct DataEnvelope {
     pub payload_type: PayloadDataType,
-    // Use Value for flexibility, or define a specific enum for payload types
     pub payload: Value,
 }
 
@@ -59,7 +68,7 @@ pub struct DataEnvelope {
 pub enum PacketType {
     /// Authentication request
     Auth {
-    /// Client public key
+        /// Client public key (Ed25519)
         public_key: String,
         /// Client version
         version: String,
@@ -72,11 +81,20 @@ pub enum PacketType {
     },
     
     /// Challenge for authentication
+    /// 
+    /// ## X25519 Support
+    /// Now includes optional `x25519_key` field for ECDH key exchange.
+    /// - `server_key`: Ed25519 public key for signature verification
+    /// - `x25519_key`: X25519 public key for ECDH (optional for backward compatibility)
     Challenge {
         /// Challenge data to sign
         data: Vec<u8>,
-        /// Server public key
+        /// Server's Ed25519 public key (for signature verification)
         server_key: String,
+        /// Server's X25519 public key (for ECDH key exchange)
+        /// This is optional to maintain backward compatibility
+        #[serde(skip_serializing_if = "Option::is_none")]
+        x25519_key: Option<String>,
         /// Challenge expiration timestamp
         expires_at: u64,
         /// Challenge ID
@@ -108,11 +126,10 @@ pub enum PacketType {
         /// Selected encryption algorithm
         encryption_algorithm: String,
     },
-
     
     /// Encrypted data packet
     Data {
-    /// Encrypted packet data
+        /// Encrypted packet data
         encrypted: Vec<u8>,
         /// Encryption nonce
         nonce: Vec<u8>,
@@ -298,24 +315,69 @@ mod tests {
     use serde_json;
     
     #[test]
+    fn test_challenge_with_x25519_key() {
+        // Test with X25519 key
+        let challenge = PacketType::Challenge {
+            data: vec![1, 2, 3],
+            server_key: "Ed25519PublicKey".to_string(),
+            x25519_key: Some("X25519PublicKey".to_string()),
+            expires_at: 1234567890,
+            id: "challenge123".to_string(),
+        };
+        
+        let serialized = serde_json::to_string(&challenge).unwrap();
+        assert!(serialized.contains("x25519_key"));
+        assert!(serialized.contains("X25519PublicKey"));
+        
+        let deserialized: PacketType = serde_json::from_str(&serialized).unwrap();
+        match deserialized {
+            PacketType::Challenge { x25519_key, .. } => {
+                assert_eq!(x25519_key, Some("X25519PublicKey".to_string()));
+            }
+            _ => panic!("Wrong packet type"),
+        }
+    }
+    
+    #[test]
+    fn test_challenge_without_x25519_key() {
+        // Test backward compatibility (no X25519 key)
+        let json = r#"{
+            "type": "Challenge",
+            "data": [1, 2, 3],
+            "server_key": "Ed25519PublicKey",
+            "expires_at": 1234567890,
+            "id": "challenge123"
+        }"#;
+        
+        let deserialized: PacketType = serde_json::from_str(json).unwrap();
+        match deserialized {
+            PacketType::Challenge { x25519_key, .. } => {
+                assert_eq!(x25519_key, None);
+            }
+            _ => panic!("Wrong packet type"),
+        }
+    }
+    
+    #[test]
     fn test_packet_serialization() {
         // Auth packet
         let auth = PacketType::Auth {
             public_key: "ABC123".to_string(),
             version: "1.0.0".to_string(),
             features: vec!["chacha20poly1305".to_string()],
+            encryption_algorithm: Some("chacha20poly1305".to_string()),
             nonce: "123456".to_string(),
         };
         
         let serialized = serde_json::to_string(&auth).unwrap();
         let deserialized: PacketType = serde_json::from_str(&serialized).unwrap();
         
-        // Match on the deserialized value to verify the type and fields
         match deserialized {
-            PacketType::Auth { public_key, version, features, nonce } => {
+            PacketType::Auth { public_key, version, features, encryption_algorithm, nonce } => {
                 assert_eq!(public_key, "ABC123");
                 assert_eq!(version, "1.0.0");
                 assert_eq!(features, vec!["chacha20poly1305"]);
+                assert_eq!(encryption_algorithm, Some("chacha20poly1305".to_string()));
                 assert_eq!(nonce, "123456");
             }
             _ => panic!("Deserialized to wrong type"),
@@ -338,8 +400,8 @@ mod tests {
         assert!(!session.is_expired(1999));
         
         // Test inactivity
-        assert!(session.is_inactive(2000, 300)); // 1500 + 300 < 2000
-        assert!(!session.is_inactive(1700, 300)); // 1500 + 300 > 1700
+        assert!(session.is_inactive(2000, 300));
+        assert!(!session.is_inactive(1700, 300));
         
         // Test touch
         session.touch(2500);
