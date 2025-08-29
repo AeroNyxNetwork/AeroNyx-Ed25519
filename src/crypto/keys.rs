@@ -19,7 +19,6 @@
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
-use rand_core::RngCore;
 use sha2::{Digest, Sha256, Sha512};
 use solana_sdk::pubkey::Pubkey;
 use ed25519_dalek::{SecretKey, PublicKey, Keypair as DalekKeypair};
@@ -231,7 +230,11 @@ impl KeyManager {
         } else {
             // Generate new keypairs
             let ed25519 = Keypair::new();
-            let x25519_private = X25519SecretKey::new(OsRng);
+            // Generate X25519 keypair using raw bytes
+            let mut x25519_bytes = [0u8; 32];
+            use rand::RngCore;
+            OsRng.fill_bytes(&mut x25519_bytes);
+            let x25519_private = X25519SecretKey::from(x25519_bytes);
             let x25519_public = X25519PublicKey::from(&x25519_private);
             
             let keypairs = CombinedKeypairs {
@@ -276,8 +279,11 @@ impl KeyManager {
             let ed25519 = Keypair::from_bytes(&bytes)
                 .map_err(|e| KeyError::Format(format!("Invalid Ed25519 keypair: {}", e)))?;
             
-            // Generate new X25519 keypair
-            let x25519_private = X25519SecretKey::new(OsRng);
+            // Generate new X25519 keypair using raw bytes
+            let mut x25519_bytes = [0u8; 32];
+            use rand::RngCore;
+            OsRng.fill_bytes(&mut x25519_bytes);
+            let x25519_private = X25519SecretKey::from(x25519_bytes);
             let x25519_public = X25519PublicKey::from(&x25519_private);
             
             let keypairs = CombinedKeypairs {
@@ -374,7 +380,11 @@ impl KeyManager {
     pub async fn rotate_keypair(&self) -> Result<(), KeyError> {
         // Generate new keypairs
         let new_ed25519 = Keypair::new();
-        let new_x25519_private = X25519SecretKey::new(OsRng);
+        // Generate X25519 keypair using raw bytes
+        let mut x25519_bytes = [0u8; 32];
+        use rand::RngCore;
+        OsRng.fill_bytes(&mut x25519_bytes);
+        let new_x25519_private = X25519SecretKey::from(x25519_bytes);
         let new_x25519_public = X25519PublicKey::from(&new_x25519_private);
         
         let new_keypairs = CombinedKeypairs {
@@ -487,7 +497,11 @@ mod tests {
 
         // Generate and save keypairs
         let original_ed25519 = Keypair::new();
-        let original_x25519_private = X25519SecretKey::new(OsRng);
+        // Generate X25519 keypair using raw bytes
+        let mut x25519_bytes = [0u8; 32];
+        use rand::RngCore;
+        OsRng.fill_bytes(&mut x25519_bytes);
+        let original_x25519_private = X25519SecretKey::from(x25519_bytes);
         let original_x25519_public = X25519PublicKey::from(&original_x25519_private);
         
         let original = CombinedKeypairs {
