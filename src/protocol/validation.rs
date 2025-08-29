@@ -3,6 +3,10 @@
 //!
 //! This module provides functions for validating protocol messages
 //! to ensure they conform to the expected format and constraints.
+//!
+//! ## Updates for X25519 Support
+//! - Added x25519_key field handling in Challenge validation
+//! - Field is optional so we ignore it with underscore pattern
 
 use std::str::FromStr;
 use solana_sdk::pubkey::Pubkey;
@@ -139,6 +143,7 @@ pub fn validate_message(packet: &PacketType) -> Result<(), MessageError> {
             server_key,
             expires_at,
             id,
+            x25519_key: _, // FIXED: Added x25519_key field (ignored)
         } => {
             if data.is_empty() {
                 return Err(MessageError::MissingField("challenge data".to_string()));
@@ -309,8 +314,7 @@ mod tests {
         // This ensures the tests can run without relying on the actual Solana crate behavior
 
         // We'll temporarily override the is_valid_solana_pubkey function for testing
-        // Prefix unused variable // Corrected unused variable
-        let _orig_validate = StringValidator::is_valid_solana_pubkey; // Corrected line 310
+        let _orig_validate = StringValidator::is_valid_solana_pubkey;
         let test_key = "AiUYgGCmQxtYbboLnNer8nY3Lnkarn3awthiCgqMkwkp";
 
         // Valid auth message
@@ -383,6 +387,7 @@ mod tests {
             nonce: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             counter: 1,
             padding: None,
+            encryption_algorithm: None,
         };
 
         let result = validate_message(&data);
@@ -394,6 +399,7 @@ mod tests {
             nonce: vec![1, 2, 3], // Too short
             counter: 1,
             padding: None,
+            encryption_algorithm: None,
         };
 
         let result = validate_message(&data);
