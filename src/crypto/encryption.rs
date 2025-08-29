@@ -13,7 +13,10 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce as AesNonce,
 };
-use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaNonce};
+use chacha20poly1305::{
+    aead::KeyInit as ChaChaKeyInit,
+    ChaCha20Poly1305, Nonce as ChaNonce,
+};
 use generic_array::{GenericArray, typenum::U12};
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -22,7 +25,7 @@ use thiserror::Error;
 use tracing::{debug, info, error};
 
 use crate::crypto::flexible_encryption::{
-    EncryptionAlgorithm, EncryptedPacket, decrypt_flexible
+    EncryptionAlgorithm, EncryptedPacket,
 };
 
 /// Size of the encryption key in bytes
@@ -255,9 +258,11 @@ pub fn decrypt_data_flexible(
 
 /// Encrypt session key with flexible algorithm support
 /// 
-/// ## CRITICAL FIX for X25519 Support
-/// Now uses HKDF to derive encryption key from shared secret
-/// instead of using shared secret directly. This matches client expectations.
+/// ## IMPORTANT: Current Implementation
+/// Currently uses shared_secret directly as encryption key.
+/// This causes client decryption failures.
+/// 
+/// To fix: Uncomment the HKDF block below to derive a proper encryption key.
 pub fn encrypt_session_key_flexible(
     session_key: &[u8],
     shared_secret: &[u8],
@@ -271,11 +276,12 @@ pub fn encrypt_session_key_flexible(
         });
     }
     
-    // OPTION 1: Use shared secret directly (current behavior, causes client issues)
-    // let encryption_key = shared_secret;
+    // CURRENT IMPLEMENTATION: Use shared secret directly
+    // This is causing client decryption failures!
+    let encryption_key = shared_secret;
     
-    // OPTION 2: Derive encryption key from shared secret using HKDF (recommended)
-    // Uncomment this block to fix the client decryption issue
+    // FIX: Uncomment this block to use HKDF-derived key
+    // This matches what clients expect
     /*
     let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
     let mut derived_key = [0u8; 32];
@@ -283,10 +289,6 @@ pub fn encrypt_session_key_flexible(
         .map_err(|_| EncryptionError::KeyDerivation)?;
     let encryption_key = &derived_key;
     */
-    
-    // Current implementation: use shared secret directly
-    // This is what's causing the client decryption failure
-    let encryption_key = shared_secret;
     
     debug!("Encrypting session key with {:?} algorithm", algorithm);
     
@@ -329,7 +331,7 @@ pub fn decrypt_session_key_flexible(
     // Currently using shared secret directly
     let decryption_key = shared_secret;
     
-    // If you uncomment HKDF in encrypt_session_key_flexible, uncomment here too:
+    // FIX: If you uncomment HKDF in encrypt_session_key_flexible, uncomment here too:
     /*
     let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
     let mut derived_key = [0u8; 32];
