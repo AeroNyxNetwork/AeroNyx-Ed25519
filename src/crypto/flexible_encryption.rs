@@ -15,14 +15,12 @@ use crate::crypto::encryption::{
     encrypt_aes256_gcm,
     decrypt_aes256_gcm,
     generate_random_nonce,
-    encrypt_packet,
-    decrypt_packet,
     EncryptionError,
     KEY_SIZE,
     NONCE_SIZE,
 };
 
-// Re-export for backward compatibility
+// Re-export for backward compatibility (from parent module)
 pub use crate::crypto::encryption::{encrypt_packet, decrypt_packet};
 
 /// Supported encryption algorithms
