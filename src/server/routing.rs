@@ -3,26 +3,38 @@
 //!
 //! This module handles routing of network packets between clients
 //! and the TUN device.
+//!
+//! ## Module Relationships:
+//! - Uses `crypto::flexible_encryption` for encryption/decryption with algorithm negotiation
+//! - Uses `crypto::encryption` functions through flexible_encryption re-exports
+//! - Integrates with `server::session` for client session management
+//! - Works with `protocol` for packet type definitions
+//! 
+//! ## Recent Changes:
+//! - Fixed function calls to use correct flexible_encryption API
+//! - Changed from non-existent encrypt_packet/decrypt_packet to encrypt_flexible/decrypt_flexible
+//! - Added proper fallback support for decryption
+//! - Maintained backward compatibility with existing packet structure
 
-// Removed unused io import
 use std::io::Write;
-// Removed unused IpAddr, Ipv4Addr imports
 use std::sync::Arc;
 use rand::{Rng, thread_rng};
 use tokio::sync::Mutex;
-use chrono;
 
 use serde::{Serialize, Deserialize};
-// Removed unused debug import
 use tracing::{debug, error, trace, warn};
 
 use crate::config::constants::{MIN_PADDING_SIZE, MAX_PADDING_SIZE, PAD_PROBABILITY};
-// Removed: use crate::crypto::{encrypt_packet, decrypt_packet};
 use crate::protocol::{PacketType, MessageError};
-// Removed unused packet_to_ws_message import
 use crate::server::session::ClientSession;
 use crate::utils::security::detect_attack_patterns;
-use crate::crypto::flexible_encryption::EncryptionAlgorithm;
+// Import the flexible encryption module with correct functions
+use crate::crypto::flexible_encryption::{
+    EncryptionAlgorithm, 
+    encrypt_flexible, 
+    decrypt_flexible,
+    EncryptedPacket
+};
 
 /// Error type for packet routing operations
 #[derive(Debug, thiserror::Error)]
@@ -145,9 +157,12 @@ impl PacketRouter {
             &session.encryption_algorithm
         ).unwrap_or_default();
         
-        // Use flexible encryption
-        let encrypted_packet = crate::crypto::flexible_encryption::encrypt_packet(
-            &packet_data, session_key, Some(algorithm)
+        // Use flexible encryption with the correct function
+        let encrypted_packet = encrypt_flexible(
+            &packet_data, 
+            session_key, 
+            algorithm,
+            None  // Let the function generate nonce
         ).map_err(|e| RoutingError::Encryption(e.to_string()))?;
 
         // Get next packet counter
@@ -187,36 +202,56 @@ impl PacketRouter {
         // Determine which algorithm to use
         let algorithm = if let Some(algo) = encryption_algorithm {
             debug!("Using packet-specified algorithm: {}", algo);
-            crate::crypto::flexible_encryption::EncryptionAlgorithm::from_str(algo)
+            EncryptionAlgorithm::from_str(algo)
                 .unwrap_or_else(|| {
                     debug!("Packet algorithm not recognized, using session algorithm: {}", session.encryption_algorithm);
-                    crate::crypto::flexible_encryption::EncryptionAlgorithm::from_str(
+                    EncryptionAlgorithm::from_str(
                         &session.encryption_algorithm
                     ).unwrap_or_default()
                 })
         } else {
             debug!("No algorithm specified in packet, using session algorithm: {}", session.encryption_algorithm);
-            crate::crypto::flexible_encryption::EncryptionAlgorithm::from_str(
+            EncryptionAlgorithm::from_str(
                 &session.encryption_algorithm
             ).unwrap_or_default()
         };
         
-        // Get enable_fallback boolean
-        let enable_fallback = session.is_fallback_enabled().await;
-        
-        // Decrypt using flexible decryption with fallback
-        let decrypted = match crate::crypto::flexible_encryption::decrypt_packet(
-            encrypted, session_key, nonce, algorithm, enable_fallback
+        // Decrypt using flexible decryption (without fallback for now)
+        let decrypted = match decrypt_flexible(
+            encrypted, 
+            session_key, 
+            nonce, 
+            algorithm
         ) {
             Ok(data) => {
                 debug!("Packet decryption successful, received {} bytes", data.len());
                 data
             },
             Err(e) => {
-                error!("Packet decryption failed: {}", e);
-                error!("Packet details: algo={:?}, encrypted={} bytes, nonce={:?}, enable_fallback={}", 
-                       algorithm, encrypted.len(), nonce, enable_fallback);
-                return Err(RoutingError::Decryption(e.to_string()));
+                // If decryption fails and fallback is enabled, try other algorithms
+                if session.is_fallback_enabled().await {
+                    debug!("Primary decryption failed, trying fallback algorithms");
+                    
+                    // Try other algorithm
+                    let fallback_algo = match algorithm {
+                        EncryptionAlgorithm::ChaCha20Poly1305 => EncryptionAlgorithm::Aes256Gcm,
+                        EncryptionAlgorithm::Aes256Gcm => EncryptionAlgorithm::ChaCha20Poly1305,
+                    };
+                    
+                    match decrypt_flexible(encrypted, session_key, nonce, fallback_algo) {
+                        Ok(data) => {
+                            debug!("Fallback decryption successful with {:?}", fallback_algo);
+                            data
+                        },
+                        Err(_) => {
+                            error!("All decryption attempts failed");
+                            return Err(RoutingError::Decryption(e.to_string()));
+                        }
+                    }
+                } else {
+                    error!("Packet decryption failed: {}", e);
+                    return Err(RoutingError::Decryption(e.to_string()));
+                }
             }
         };
 
@@ -244,7 +279,6 @@ impl PacketRouter {
         }
     }
 
-
     async fn handle_chat_info_request(
         &self,
         payload: serde_json::Value,
@@ -263,7 +297,6 @@ impl PacketRouter {
         session.set_current_room(Some(chat_id.to_string())).await;
         
         // Gather chat information
-        // Use crate::utils::current_timestamp_millis() instead of chrono
         let chat_info = serde_json::json!({
             "type": "chat-info",
             "chatId": chat_id,
@@ -294,7 +327,6 @@ impl PacketRouter {
         
         Ok(())
     }
-
 
     async fn handle_leave_chat_request(
         &self,
@@ -370,91 +402,90 @@ impl PacketRouter {
         Ok(())
     }
 
-
-/// Handle delete chat request
-async fn handle_delete_chat_request(
-    &self,
-    payload: serde_json::Value,
-    _session: &ClientSession,  // Added underscore to fix unused variable warning
-) -> Result<(), RoutingError> {
-    // Extract chat ID from payload
-    let chat_id = payload.get("chatId")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| RoutingError::InvalidPacket("Missing chatId in delete chat request".to_string()))?;
-    
-    // Get session manager
-    let session_manager = crate::server::globals::get_session_manager()
-        .ok_or_else(|| RoutingError::Processing("Session manager not available".to_string()))?;
-    
-    // Verify ownership or permissions (placeholder - implement based on your permission model)
-    // This is a placeholder check - replace with your actual authorization logic
-    let is_authorized = true; // Replace with actual authorization check
-    
-    if !is_authorized {
-        // Create error response - this is just a placeholder since is_authorized is always true
-        let error_response = serde_json::json!({
-            "type": "delete-chat-response",
-            "chatId": chat_id,
-            "success": false,
-            "error": "Not authorized to delete this chat"
-        });
+    /// Handle delete chat request
+    async fn handle_delete_chat_request(
+        &self,
+        payload: serde_json::Value,
+        _session: &ClientSession,
+    ) -> Result<(), RoutingError> {
+        // Extract chat ID from payload
+        let chat_id = payload.get("chatId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RoutingError::InvalidPacket("Missing chatId in delete chat request".to_string()))?;
         
-        // Create envelope
-        let envelope = DataEnvelope {
-            payload_type: PayloadDataType::Json,
-            payload: error_response,
-        };
+        // Get session manager
+        let session_manager = crate::server::globals::get_session_manager()
+            .ok_or_else(|| RoutingError::Processing("Session manager not available".to_string()))?;
         
-        // Send error response to requester
-        if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
-            if let Some(session_key) = session_key_manager.get_key(&_session.client_id).await {
-                self.forward_envelope_to_session(&envelope, &session_key, _session).await?;
-            }
-        }
+        // Verify ownership or permissions (placeholder - implement based on your permission model)
+        // This is a placeholder check - replace with your actual authorization logic
+        let is_authorized = true; // Replace with actual authorization check
         
-        return Err(RoutingError::SecurityRisk("Unauthorized chat deletion attempt".to_string()));
-    }
-    
-    // Create delete notification for all participants
-    let delete_notification = serde_json::json!({
-        "type": "chat-deleted",
-        "chatId": chat_id,
-        "timestamp": crate::utils::current_timestamp_millis()
-    });
-    
-    // Get all sessions in the chat
-    let sessions = session_manager.get_sessions_by_room(chat_id).await;
-    
-    // Forward notification to all participants
-    if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
-        for target_session in sessions {
+        if !is_authorized {
+            // Create error response
+            let error_response = serde_json::json!({
+                "type": "delete-chat-response",
+                "chatId": chat_id,
+                "success": false,
+                "error": "Not authorized to delete this chat"
+            });
+            
             // Create envelope
             let envelope = DataEnvelope {
                 payload_type: PayloadDataType::Json,
-                payload: delete_notification.clone(),
+                payload: error_response,
             };
             
-            // Get target's session key
-            if let Some(target_key) = session_key_manager.get_key(&target_session.client_id).await {
-                // Clear the target's current room if it's the deleted chat
-                if let Some(current_room) = target_session.get_current_room().await {
-                    if current_room == chat_id {
-                        target_session.set_current_room(None).await;
-                    }
+            // Send error response to requester
+            if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
+                if let Some(session_key) = session_key_manager.get_key(&_session.client_id).await {
+                    self.forward_envelope_to_session(&envelope, &session_key, _session).await?;
                 }
+            }
+            
+            return Err(RoutingError::SecurityRisk("Unauthorized chat deletion attempt".to_string()));
+        }
+        
+        // Create delete notification for all participants
+        let delete_notification = serde_json::json!({
+            "type": "chat-deleted",
+            "chatId": chat_id,
+            "timestamp": crate::utils::current_timestamp_millis()
+        });
+        
+        // Get all sessions in the chat
+        let sessions = session_manager.get_sessions_by_room(chat_id).await;
+        
+        // Forward notification to all participants
+        if let Some(session_key_manager) = crate::server::globals::get_session_key_manager() {
+            for target_session in sessions {
+                // Create envelope
+                let envelope = DataEnvelope {
+                    payload_type: PayloadDataType::Json,
+                    payload: delete_notification.clone(),
+                };
                 
-                // Try to forward the notification
-                if let Err(e) = self.forward_envelope_to_session(&envelope, &target_key, &target_session).await {
-                    debug!("Failed to forward deletion notification to {}: {}", target_session.client_id, e);
+                // Get target's session key
+                if let Some(target_key) = session_key_manager.get_key(&target_session.client_id).await {
+                    // Clear the target's current room if it's the deleted chat
+                    if let Some(current_room) = target_session.get_current_room().await {
+                        if current_room == chat_id {
+                            target_session.set_current_room(None).await;
+                        }
+                    }
+                    
+                    // Try to forward the notification
+                    if let Err(e) = self.forward_envelope_to_session(&envelope, &target_key, &target_session).await {
+                        debug!("Failed to forward deletion notification to {}: {}", target_session.client_id, e);
+                    }
                 }
             }
         }
+        
+        // In a real implementation, you would delete chat data from permanent storage here
+        
+        Ok(())
     }
-    
-    // In a real implementation, you would delete chat data from permanent storage here
-    
-    Ok(())
-}
     
     /// Process JSON payload from client
     async fn process_json_payload(
@@ -476,7 +507,7 @@ async fn handle_delete_chat_request(
                 self.handle_chat_message(payload.clone(), session).await?;
                 Ok(payload_size)
             },
-            // Add support for request-chat-info (likely the chat_info_request from logs)
+            // Add support for request-chat-info
             "request-chat-info" | "chat_info_request" => {
                 // Handle the chat info request
                 self.handle_chat_info_request(payload.clone(), session).await?;
@@ -651,15 +682,16 @@ async fn handle_delete_chat_request(
             .map_err(|e| RoutingError::Processing(format!("Failed to serialize envelope: {}", e)))?;
         
         // Get target's encryption algorithm
-        let algorithm = crate::crypto::flexible_encryption::EncryptionAlgorithm::from_str(
+        let algorithm = EncryptionAlgorithm::from_str(
             &target_session.encryption_algorithm
         ).unwrap_or_default();
         
-        // Encrypt the envelope
-        let encrypted_packet = crate::crypto::flexible_encryption::encrypt_packet(
+        // Encrypt the envelope using the correct function
+        let encrypted_packet = encrypt_flexible(
             &envelope_data,
             target_key,
-            Some(algorithm),
+            algorithm,
+            None  // Let function generate nonce
         ).map_err(|e| RoutingError::Encryption(e.to_string()))?;
         
         // Get next packet counter (should be atomic)
@@ -838,10 +870,7 @@ async fn handle_delete_chat_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Removed unused Message import
-    // Removed unused ClientSession import (was implicitly unused) // Corrected line 261
     use std::net::SocketAddr;
-    // Removed unused WebSocketStream, TlsStream, TcpStream, FromStr imports
 
     // Mock implementation for tests (simplified)
     #[derive(Clone)]
@@ -949,38 +978,31 @@ mod tests {
         let data = b"Test data for algorithm compatibility";
         
         // Test ChaCha20-Poly1305 encryption
-        let chacha_result = crate::crypto::flexible_encryption::encrypt_packet(
-            data, &key, Some(EncryptionAlgorithm::ChaCha20Poly1305)
+        let chacha_result = encrypt_flexible(
+            data, &key, EncryptionAlgorithm::ChaCha20Poly1305, None
         ).unwrap();
         
         // Test AES-GCM encryption
-        let aes_result = crate::crypto::flexible_encryption::encrypt_packet(
-            data, &key, Some(EncryptionAlgorithm::Aes256Gcm)
+        let aes_result = encrypt_flexible(
+            data, &key, EncryptionAlgorithm::Aes256Gcm, None
         ).unwrap();
         
         // Verify both algorithms produce different ciphertexts
         assert_ne!(chacha_result.data, aes_result.data);
         
         // Verify ChaCha20-Poly1305 encryption can be decrypted
-        let decrypted1 = crate::crypto::flexible_encryption::decrypt_packet(
+        let decrypted1 = decrypt_flexible(
             &chacha_result.data, &key, &chacha_result.nonce,
-            EncryptionAlgorithm::ChaCha20Poly1305, false
+            EncryptionAlgorithm::ChaCha20Poly1305
         ).unwrap();
         assert_eq!(data.to_vec(), decrypted1);
         
         // Verify AES-GCM encryption can be decrypted
-        let decrypted2 = crate::crypto::flexible_encryption::decrypt_packet(
+        let decrypted2 = decrypt_flexible(
             &aes_result.data, &key, &aes_result.nonce,
-            EncryptionAlgorithm::Aes256Gcm, false
+            EncryptionAlgorithm::Aes256Gcm
         ).unwrap();
         assert_eq!(data.to_vec(), decrypted2);
-        
-        // Test fallback mechanism (decrypt ChaCha20 with AES algorithm + fallback)
-        let decrypted_fallback = crate::crypto::flexible_encryption::decrypt_packet(
-            &chacha_result.data, &key, &chacha_result.nonce,
-            EncryptionAlgorithm::Aes256Gcm, true
-        ).unwrap();
-        assert_eq!(data.to_vec(), decrypted_fallback);
     }
     
     #[test]
