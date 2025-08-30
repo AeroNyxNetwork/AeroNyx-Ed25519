@@ -271,7 +271,6 @@ pub fn encrypt_session_key_flexible(
     shared_secret: &[u8],
     algorithm: EncryptionAlgorithm,
 ) -> Result<EncryptedPacket, EncryptionError> {
-    // Validate shared secret length
     if shared_secret.len() != KEY_SIZE {
         return Err(EncryptionError::InvalidKeyLength {
             expected: KEY_SIZE,
@@ -279,25 +278,15 @@ pub fn encrypt_session_key_flexible(
         });
     }
     
-    // HKDF key derivation
-    let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
-    let mut derived_key = [0u8; 32];
-    hkdf.expand(b"AERONYX-SESSION-KEY-ENCRYPTION", &mut derived_key)
-        .map_err(|_| EncryptionError::KeyDerivation)?;
+    // 临时方案：直接使用 shared_secret，不使用 HKDF
+    let encryption_key = shared_secret;
     
-    // 添加调试日志
-    debug!("Shared secret (first 8 bytes): {:02x?}", &shared_secret[..8]);
-    debug!("Derived key (first 8 bytes): {:02x?}", &derived_key[..8]);
-    
-    let encryption_key = &derived_key;
-    
-    debug!("Encrypting session key with {:?} algorithm using HKDF-derived key", algorithm);
+    debug!("Using shared secret directly for encryption (HKDF disabled temporarily)");
     
     // Generate nonce
     let nonce = generate_random_nonce();
-    debug!("Generated nonce (first 8 bytes): {:02x?}", &nonce.as_slice()[..8]);
     
-    // Encrypt based on algorithm
+    // Encrypt
     let encrypted = match algorithm {
         EncryptionAlgorithm::ChaCha20Poly1305 => {
             encrypt_chacha20_poly1305(session_key, encryption_key, nonce.as_slice())?
@@ -316,14 +305,12 @@ pub fn encrypt_session_key_flexible(
     })
 }
 
-/// Decrypt session key with flexible algorithm support
 pub fn decrypt_session_key_flexible(
     encrypted_data: &[u8],
     nonce: &[u8],
     shared_secret: &[u8],
     algorithm: EncryptionAlgorithm,
 ) -> Result<Vec<u8>, EncryptionError> {
-    // Validate shared secret length
     if shared_secret.len() != KEY_SIZE {
         return Err(EncryptionError::InvalidKeyLength {
             expected: KEY_SIZE,
@@ -331,16 +318,12 @@ pub fn decrypt_session_key_flexible(
         });
     }
     
-    // Use HKDF to derive decryption key (same as encryption)
-    let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
-    let mut derived_key = [0u8; 32];
-    hkdf.expand(b"AERONYX-SESSION-KEY-ENCRYPTION", &mut derived_key)
-        .map_err(|_| EncryptionError::KeyDerivation)?;
-    let decryption_key = &derived_key;
+    // 临时方案：直接使用 shared_secret
+    let decryption_key = shared_secret;
     
-    debug!("Decrypting session key with {:?} algorithm using HKDF-derived key", algorithm);
+    debug!("Using shared secret directly for decryption (HKDF disabled temporarily)");
     
-    // Decrypt based on algorithm
+    // Decrypt
     match algorithm {
         EncryptionAlgorithm::ChaCha20Poly1305 => {
             decrypt_chacha20_poly1305(encrypted_data, decryption_key, nonce)
@@ -350,6 +333,7 @@ pub fn decrypt_session_key_flexible(
         }
     }
 }
+
 
 /// Legacy packet encryption (for backward compatibility)
 pub fn encrypt_packet(
