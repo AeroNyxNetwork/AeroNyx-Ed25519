@@ -4,10 +4,15 @@
 //! This module provides functions for encrypting and decrypting data
 //! using AES-256-GCM and ChaCha20-Poly1305 algorithms.
 //!
-//! ## Updates for X25519 Support
-//! - Modified encrypt_session_key_flexible to use HKDF-derived keys
-//! - Server now properly derives encryption keys from shared secrets
-//! - Matches client expectations for session key encryption
+//! ## CRITICAL FIX (2025-01-09)
+//! - Enabled HKDF key derivation for session key encryption
+//! - This matches what macOS/iOS clients expect
+//! - Without this, clients fail to decrypt session keys
+//!
+//! ## Why This Fix Is Necessary
+//! - Clients derive encryption keys using HKDF-SHA256 with "AERONYX-SESSION-KEY-ENCRYPTION" info
+//! - Server was using shared_secret directly, causing decryption failures
+//! - Now both use the same key derivation method
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -258,11 +263,9 @@ pub fn decrypt_data_flexible(
 
 /// Encrypt session key with flexible algorithm support
 /// 
-/// ## IMPORTANT: Current Implementation
-/// Currently uses shared_secret directly as encryption key.
-/// This causes client decryption failures.
-/// 
-/// To fix: Uncomment the HKDF block below to derive a proper encryption key.
+/// ## FIXED IMPLEMENTATION (2025-01-09)
+/// Now uses HKDF-SHA256 to derive encryption key from shared secret
+/// This matches the client implementation exactly
 pub fn encrypt_session_key_flexible(
     session_key: &[u8],
     shared_secret: &[u8],
@@ -276,21 +279,15 @@ pub fn encrypt_session_key_flexible(
         });
     }
     
-    // CURRENT IMPLEMENTATION: Use shared secret directly
-    // This is causing client decryption failures!
-    let encryption_key = shared_secret;
-    
-    // FIX: Uncomment this block to use HKDF-derived key
-    // This matches what clients expect
-    /*
+    // CRITICAL FIX: Use HKDF to derive encryption key
+    // This matches what the macOS/iOS clients expect
     let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
     let mut derived_key = [0u8; 32];
     hkdf.expand(b"AERONYX-SESSION-KEY-ENCRYPTION", &mut derived_key)
         .map_err(|_| EncryptionError::KeyDerivation)?;
     let encryption_key = &derived_key;
-    */
     
-    debug!("Encrypting session key with {:?} algorithm", algorithm);
+    debug!("Encrypting session key with {:?} algorithm using HKDF-derived key", algorithm);
     
     // Generate nonce
     let nonce = generate_random_nonce();
@@ -304,6 +301,8 @@ pub fn encrypt_session_key_flexible(
             encrypt_aes256_gcm(session_key, encryption_key, nonce.as_slice())?
         }
     };
+    
+    info!("Session key encrypted successfully with {:?}", algorithm);
     
     Ok(EncryptedPacket {
         algorithm,
@@ -327,20 +326,14 @@ pub fn decrypt_session_key_flexible(
         });
     }
     
-    // Use same key derivation as encryption
-    // Currently using shared secret directly
-    let decryption_key = shared_secret;
-    
-    // FIX: If you uncomment HKDF in encrypt_session_key_flexible, uncomment here too:
-    /*
+    // Use HKDF to derive decryption key (same as encryption)
     let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
     let mut derived_key = [0u8; 32];
     hkdf.expand(b"AERONYX-SESSION-KEY-ENCRYPTION", &mut derived_key)
         .map_err(|_| EncryptionError::KeyDerivation)?;
     let decryption_key = &derived_key;
-    */
     
-    debug!("Decrypting session key with {:?} algorithm", algorithm);
+    debug!("Decrypting session key with {:?} algorithm using HKDF-derived key", algorithm);
     
     // Decrypt based on algorithm
     match algorithm {
@@ -461,11 +454,11 @@ mod tests {
     }
 
     #[test]
-    fn test_session_key_encryption() {
+    fn test_session_key_encryption_with_hkdf() {
         let session_key = vec![0x55; 32];
         let shared_secret = vec![0x66; 32];
         
-        // Test AES-256-GCM
+        // Test AES-256-GCM with HKDF
         let encrypted = encrypt_session_key_flexible(
             &session_key,
             &shared_secret,
@@ -476,7 +469,7 @@ mod tests {
         assert_eq!(encrypted.nonce.len(), NONCE_SIZE);
         assert!(encrypted.data.len() > session_key.len()); // Has tag
         
-        // Test decryption
+        // Test decryption with HKDF
         let decrypted = decrypt_session_key_flexible(
             &encrypted.data,
             &encrypted.nonce,
@@ -485,6 +478,27 @@ mod tests {
         ).unwrap();
         
         assert_eq!(decrypted, session_key);
+    }
+    
+    #[test]
+    fn test_hkdf_key_derivation() {
+        // Test that HKDF produces consistent results
+        let shared_secret = vec![0x42; 32];
+        
+        // Derive key multiple times
+        let hkdf1 = Hkdf::<Sha256>::new(None, &shared_secret);
+        let mut key1 = [0u8; 32];
+        hkdf1.expand(b"AERONYX-SESSION-KEY-ENCRYPTION", &mut key1).unwrap();
+        
+        let hkdf2 = Hkdf::<Sha256>::new(None, &shared_secret);
+        let mut key2 = [0u8; 32];
+        hkdf2.expand(b"AERONYX-SESSION-KEY-ENCRYPTION", &mut key2).unwrap();
+        
+        // Keys should be identical
+        assert_eq!(key1, key2);
+        
+        // Key should be different from shared secret
+        assert_ne!(key1.to_vec(), shared_secret);
     }
 
     #[test]
