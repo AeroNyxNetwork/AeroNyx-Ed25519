@@ -279,18 +279,23 @@ pub fn encrypt_session_key_flexible(
         });
     }
     
-    // CRITICAL FIX: Use HKDF to derive encryption key
-    // This matches what the macOS/iOS clients expect
+    // HKDF key derivation
     let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
     let mut derived_key = [0u8; 32];
     hkdf.expand(b"AERONYX-SESSION-KEY-ENCRYPTION", &mut derived_key)
         .map_err(|_| EncryptionError::KeyDerivation)?;
+    
+    // 添加调试日志
+    debug!("Shared secret (first 8 bytes): {:02x?}", &shared_secret[..8]);
+    debug!("Derived key (first 8 bytes): {:02x?}", &derived_key[..8]);
+    
     let encryption_key = &derived_key;
     
     debug!("Encrypting session key with {:?} algorithm using HKDF-derived key", algorithm);
     
     // Generate nonce
     let nonce = generate_random_nonce();
+    debug!("Generated nonce (first 8 bytes): {:02x?}", &nonce.as_slice()[..8]);
     
     // Encrypt based on algorithm
     let encrypted = match algorithm {
