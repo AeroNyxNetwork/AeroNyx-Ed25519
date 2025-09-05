@@ -56,7 +56,6 @@ pub const TUN_MTU: u16 = 1500; // Default MTU size
 pub const PACKET_READ_BUFFER_SIZE: usize = 2048; // Buffer size for packet reads
 
 /// Security settings
-pub const AUTH_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_AUTH_ATTEMPTS: usize = 3;
 pub const SERVER_SIGNATURE_VERIFY_ENABLED: bool = true;
 pub const HMAC_VERIFY_ENABLED: bool = true;
