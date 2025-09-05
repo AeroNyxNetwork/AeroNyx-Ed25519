@@ -280,10 +280,13 @@ pub fn encrypt_session_key_flexible(
         });
     }
     
-    // 临时方案：直接使用 shared_secret 作为加密密钥
-    let encryption_key = shared_secret;
+    // 使用 HKDF 派生加密密钥
+    let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut encryption_key = [0u8; 32];
+    hkdf.expand(b"AERONYX-SESSION-KEY-ENCRYPTION", &mut encryption_key)
+        .map_err(|_| EncryptionError::KeyDerivation)?;
     
-    debug!("Using shared secret directly for encryption (HKDF disabled temporarily)");
+    info!("Using HKDF-derived key for session key encryption");
     
     // Generate nonce
     let nonce = generate_random_nonce();
@@ -291,10 +294,10 @@ pub fn encrypt_session_key_flexible(
     // Encrypt
     let encrypted = match algorithm {
         EncryptionAlgorithm::ChaCha20Poly1305 => {
-            encrypt_chacha20_poly1305(session_key, encryption_key, nonce.as_slice())?
+            encrypt_chacha20_poly1305(session_key, &encryption_key, nonce.as_slice())?
         }
         EncryptionAlgorithm::Aes256Gcm => {
-            encrypt_aes256_gcm(session_key, encryption_key, nonce.as_slice())?
+            encrypt_aes256_gcm(session_key, &encryption_key, nonce.as_slice())?
         }
     };
     
@@ -320,18 +323,21 @@ pub fn decrypt_session_key_flexible(
         });
     }
     
-    // 临时方案：直接使用 shared_secret
-    let decryption_key = shared_secret;
+    // 使用 HKDF 派生解密密钥
+    let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut decryption_key = [0u8; 32];
+    hkdf.expand(b"AERONYX-SESSION-KEY-ENCRYPTION", &mut decryption_key)
+        .map_err(|_| EncryptionError::KeyDerivation)?;
     
-    debug!("Using shared secret directly for decryption (HKDF disabled temporarily)");
+    debug!("Using HKDF-derived key for session key decryption");
     
     // Decrypt
     match algorithm {
         EncryptionAlgorithm::ChaCha20Poly1305 => {
-            decrypt_chacha20_poly1305(encrypted_data, decryption_key, nonce)
+            decrypt_chacha20_poly1305(encrypted_data, &decryption_key, nonce)
         }
         EncryptionAlgorithm::Aes256Gcm => {
-            decrypt_aes256_gcm(encrypted_data, decryption_key, nonce)
+            decrypt_aes256_gcm(encrypted_data, &decryption_key, nonce)
         }
     }
 }
