@@ -228,6 +228,14 @@ impl PacketRouter {
                 data
             },
             Err(e) => {
+
+
+                error!("Decryption failed for packet from {}", session.client_id);
+                error!("  Algorithm used: {:?}", algorithm);
+                error!("  Session key (first 8 bytes): {:02x?}", &session_key[..8.min(session_key.len())]);
+                error!("  Nonce (first 8 bytes): {:02x?}", &nonce[..8.min(nonce.len())]);
+                error!("  Encrypted data size: {} bytes", encrypted.len());
+                error!("  Error: {}", e);
                 // If decryption fails and fallback is enabled, try other algorithms
                 if session.is_fallback_enabled().await {
                     debug!("Primary decryption failed, trying fallback algorithms");
