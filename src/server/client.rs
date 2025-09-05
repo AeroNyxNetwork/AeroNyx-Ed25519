@@ -26,6 +26,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, trace, warn};
 
+use crate::config::constants::AUTH_CHALLENGE_TIMEOUT;
 use crate::auth::AuthManager;
 use crate::crypto::{KeyManager, SessionKeyManager};
 use crate::crypto::flexible_encryption::EncryptionAlgorithm;
