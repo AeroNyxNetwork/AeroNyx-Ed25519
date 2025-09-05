@@ -208,11 +208,11 @@ async fn process_websocket_session_with_connection(
 
                     // Create challenge packet with both keys
                     let challenge_packet = PacketType::Challenge {
-                        data: challenge.1.clone(), // Challenge data
+                        data: challenge.1.clone(),
                         server_key: server_ed25519_pubkey,
-                        x25519_key: Some(server_x25519_pubkey), // NEW: Include X25519 key
-                        expires_at: current_timestamp_millis() + crate::config::constants::AUTH_CHALLENGE_TIMEOUT.as_millis() as u64,
-                        id: challenge.0.clone(), // Challenge ID
+                        x25519_key: Some(server_x25519_pubkey), // 这行关键！服务器必须提供
+                        expires_at: current_timestamp_millis() + AUTH_CHALLENGE_TIMEOUT.as_millis() as u64,
+                        id: challenge.0.clone(),
                     };
 
                     info!("Sending challenge with X25519 key support to client {}", public_key);
