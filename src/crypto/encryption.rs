@@ -277,12 +277,7 @@ pub fn encrypt_session_key_flexible(
             actual: shared_secret.len(),
         });
     }
-    
-    // 临时方案：直接使用 shared_secret，不使用 HKDF
-    let encryption_key = shared_secret;
-    
-    debug!("Using shared secret directly for encryption (HKDF disabled temporarily)");
-    
+
     // Generate nonce
     let nonce = generate_random_nonce();
     
