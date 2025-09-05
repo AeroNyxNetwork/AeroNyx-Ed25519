@@ -17,6 +17,9 @@ pub const TAG_SIZE: usize = 16; // For ChaCha20-Poly1305
 pub const PACKET_SIZE_LIMIT: usize = 16384; // 16KB
 pub const MIN_PACKET_SIZE: usize = 64; // Minimum size for padding
 
+/// Authentication challenge timeout (30 seconds)
+pub const AUTH_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Network constants
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
