@@ -373,7 +373,15 @@ async fn process_websocket_session_with_connection(
         &shared_secret,
         client_encryption_preference,
     ) {
-        Ok(packet) => packet,
+        Ok(packet) => {
+            // 添加调试日志
+            info!("Session key encryption details:");
+            info!("  Raw session key (first 8 bytes): {:02x?}", &session_key[..8]);
+            info!("  Shared secret (first 8 bytes): {:02x?}", &shared_secret[..8]);
+            info!("  Encrypted size: {} bytes", packet.data.len());
+            info!("  Nonce: {:02x?}", &packet.nonce[..8]);
+            packet
+        }
         Err(e) => {
             let error_packet = create_error_packet(1006, &format!("Encryption failed: {}", e));
             let _ = duplex_conn.send_message(packet_to_ws_message(&error_packet)?).await;
