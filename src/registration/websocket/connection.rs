@@ -1,5 +1,5 @@
 // src/registration/websocket/connection.rs
-// WebSocket connection management and lifecycle - Fixed version with terminal output support
+// WebSocket connection management and lifecycle - Fixed version preserving ALL functionality
 
 use crate::registration::{RegistrationManager, WebSocketMessage};
 use crate::hardware::HardwareInfo;
@@ -296,17 +296,17 @@ impl RegistrationManager {
                         state.missed_heartbeats = 0;
                     }
                     
-                    // ✅ FIX: Pass terminal_tracker as mutable HashMap
+                    // Pass terminal_output_channels (the HashMap) to handle_server_message
                     self.handle_server_message(
                         server_msg,
                         write,
                         &mut state.authenticated,
                         hardware_info,
                         setup_params,
-                        &mut terminal_tracker.channels,  // Pass the HashMap directly
+                        &mut terminal_tracker.channels,  // Pass the HashMap
                     ).await?;
                 } else {
-                    // Handle generic message - use local version
+                    // Handle generic message - renamed to avoid conflict
                     self.handle_generic_message_v2(
                         &text,
                         write,
@@ -431,7 +431,7 @@ impl RegistrationManager {
         }
     }
     
-    /// Handle generic message with terminal support (local version)
+    /// Handle generic message with terminal support (renamed to avoid conflict)
     async fn handle_generic_message_v2(
         &self,
         text: &str,
@@ -470,8 +470,9 @@ impl RegistrationManager {
                         }
                     }
                     
-                    // Other messages - delegate to handlers.rs version with terminal_output_channels
+                    // Other messages - delegate to original handler in handlers.rs
                     _ => {
+                        // Call handle_generic_message from handlers.rs
                         return self.handle_generic_message(
                             text,
                             write,
@@ -479,7 +480,7 @@ impl RegistrationManager {
                             auth_sent,
                             heartbeat_interval,
                             last_heartbeat_ack,
-                            &mut terminal_tracker.channels,  // Pass the HashMap for legacy handler
+                            &mut terminal_tracker.channels,  // Pass the HashMap for handlers.rs
                             hardware_info,
                             setup_params,
                         ).await;
