@@ -1,5 +1,5 @@
 // src/registration/websocket/connection.rs
-// WebSocket connection management and lifecycle - Optimized version
+// WebSocket connection management and lifecycle - Fixed version with terminal output support
 
 use crate::registration::{RegistrationManager, WebSocketMessage};
 use crate::hardware::HardwareInfo;
@@ -89,6 +89,30 @@ impl TerminalSessionTracker {
     
     fn mark_cleanup(&mut self) {
         self.last_cleanup = std::time::Instant::now();
+    }
+}
+
+// Connection state management
+struct ConnectionState {
+    authenticated: bool,
+    auth_sent: bool,
+    last_heartbeat_ack: std::time::Instant,
+    missed_heartbeats: u32,
+    heartbeat_interval: time::Interval,
+}
+
+impl ConnectionState {
+    fn new() -> Self {
+        let mut heartbeat_interval = time::interval(Duration::from_secs(30));
+        heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        
+        Self {
+            authenticated: false,
+            auth_sent: false,
+            last_heartbeat_ack: std::time::Instant::now(),
+            missed_heartbeats: 0,
+            heartbeat_interval,
+        }
     }
 }
 
@@ -272,23 +296,25 @@ impl RegistrationManager {
                         state.missed_heartbeats = 0;
                     }
                     
+                    // ✅ FIX: Pass terminal_tracker as mutable HashMap
                     self.handle_server_message(
                         server_msg,
                         write,
                         &mut state.authenticated,
                         hardware_info,
                         setup_params,
+                        &mut terminal_tracker.channels,  // Pass the HashMap directly
                     ).await?;
                 } else {
-                    // Handle generic message - renamed to avoid conflict
-                    self.handle_generic_message_v2(
+                    // Handle generic message
+                    self.handle_generic_message(
                         &text,
                         write,
                         &mut state.authenticated,
                         &mut state.auth_sent,
                         &mut state.heartbeat_interval,
                         &mut state.last_heartbeat_ack,
-                        terminal_tracker,
+                        &mut terminal_tracker.channels,  // Pass the HashMap directly
                         hardware_info,
                         setup_params,
                     ).await?;
@@ -402,162 +428,6 @@ impl RegistrationManager {
             Err("Server did not send initial connection message".to_string())
         } else {
             Ok(())
-        }
-    }
-    
-    /// Handle generic message with terminal support (renamed to avoid conflict)
-    async fn handle_generic_message_v2(
-        &self,
-        text: &str,
-        write: &mut WsSink,
-        authenticated: &mut bool,
-        auth_sent: &mut bool,
-        heartbeat_interval: &mut time::Interval,
-        last_heartbeat_ack: &mut std::time::Instant,
-        terminal_tracker: &mut TerminalSessionTracker,
-        hardware_info: &HardwareInfo,
-        setup_params: &SetupParams,
-    ) -> Result<(), String> {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-            if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
-                match msg_type {
-                    // Terminal messages
-                    "term_init" | "term_input" | "term_resize" | "term_close" => {
-                        self.handle_terminal_message_json(&json, write, terminal_tracker).await?;
-                    }
-                    
-                    // Terminal response messages
-                    "term_ready" => {
-                        if let Ok(msg) = serde_json::from_value::<TerminalMessage>(json) {
-                            if let TerminalMessage::Ready { session_id } = msg {
-                                // Create channel for terminal output
-                                let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
-                                terminal_tracker.insert(session_id.clone(), rx);
-                                
-                                // Start output reader
-                                // terminal_manager is Arc<TerminalSessionManager>, not Option
-                                self.start_terminal_output_reader(
-                                    self.terminal_manager.clone(),
-                                    session_id,
-                                    tx
-                                ).await;
-                            }
-                        }
-                    }
-                    
-                    // Other messages - delegate to original handler
-                    _ => {
-                        return self.handle_websocket_message(
-                            text,
-                            write,
-                            authenticated,
-                            heartbeat_interval,
-                            last_heartbeat_ack
-                        ).await;
-                    }
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Handle terminal message from JSON
-    async fn handle_terminal_message_json(
-        &self,
-        json: &serde_json::Value,
-        write: &mut WsSink,
-        terminal_tracker: &mut TerminalSessionTracker,
-    ) -> Result<(), String> {
-        // Check if remote management is enabled
-        if !*self.remote_management_enabled.read().await {
-            let session_id = json.get("session_id")
-                .and_then(|s| s.as_str())
-                .unwrap_or("unknown");
-            
-            let error_response = serde_json::json!({
-                "type": "term_error",
-                "session_id": session_id,
-                "error": "Remote management is disabled"
-            });
-            
-            write.send(Message::Text(error_response.to_string())).await
-                .map_err(|e| format!("Failed to send error response: {}", e))?;
-            return Ok(());
-        }
-        
-        // Parse and handle terminal message
-        if let Ok(term_msg) = serde_json::from_value::<TerminalMessage>(json.clone()) {
-            let terminal_manager = self.get_terminal_manager();
-            
-            match super::terminal::handle_terminal_message(&terminal_manager, term_msg).await {
-                Ok(Some(response)) => {
-                    let response_json = serde_json::to_string(&response)
-                        .unwrap_or_else(|_| "{}".to_string());
-                    
-                    write.send(Message::Text(response_json)).await
-                        .map_err(|e| format!("Failed to send terminal response: {}", e))?;
-                    
-                    // Handle special responses
-                    if let TerminalMessage::Ready { session_id } = response {
-                        // Create channel for output
-                        let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
-                        terminal_tracker.insert(session_id.clone(), rx);
-                        
-                        // Start output reader
-                        self.start_terminal_output_reader(
-                            terminal_manager.clone(),
-                            session_id,
-                            tx
-                        ).await;
-                    }
-                }
-                Ok(None) => {
-                    // No response needed
-                }
-                Err(e) => {
-                    error!("Terminal message handling error: {}", e);
-                    
-                    let session_id = json.get("session_id")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("unknown");
-                    
-                    let error_response = serde_json::json!({
-                        "type": "term_error",
-                        "session_id": session_id,
-                        "error": e.to_string()
-                    });
-                    
-                    write.send(Message::Text(error_response.to_string())).await
-                        .map_err(|e| format!("Failed to send error response: {}", e))?;
-                }
-            }
-        }
-        
-        Ok(())
-    }
-}
-
-// Connection state management
-struct ConnectionState {
-    authenticated: bool,
-    auth_sent: bool,
-    last_heartbeat_ack: std::time::Instant,
-    missed_heartbeats: u32,
-    heartbeat_interval: time::Interval,
-}
-
-impl ConnectionState {
-    fn new() -> Self {
-        let mut heartbeat_interval = time::interval(Duration::from_secs(30));
-        heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-        
-        Self {
-            authenticated: false,
-            auth_sent: false,
-            last_heartbeat_ack: std::time::Instant::now(),
-            missed_heartbeats: 0,
-            heartbeat_interval,
         }
     }
 }
