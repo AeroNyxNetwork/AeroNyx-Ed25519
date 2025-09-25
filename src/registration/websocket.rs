@@ -1,12 +1,38 @@
 // src/registration/websocket.rs
+// ============================================
 // AeroNyx Privacy Network - WebSocket Communication Module
-// Version: 1.0.0
-//
+// Version: 1.0.1 - Added terminal output reader support
+// ============================================
 // Copyright (c) 2024 AeroNyx Team
 // SPDX-License-Identifier: MIT
 //
-// This module handles WebSocket connections for real-time communication
-// with the AeroNyx control plane.
+// Creation Reason: WebSocket connection management for node communication
+// Modification Reason: Added terminal output reader and terminal manager methods
+// Main Functionality:
+// - WebSocket connection establishment and maintenance
+// - Message handling and routing
+// - Terminal session output streaming
+// - Heartbeat and metrics reporting
+// Dependencies:
+// - connection.rs: Connection lifecycle management
+// - handlers.rs: Message processing
+// - terminal.rs: Terminal-specific handlers
+// - terminal/mod.rs: Terminal emulation
+//
+// Main Logical Flow:
+// 1. Establish WebSocket connection with retry logic
+// 2. Handle authentication and heartbeat
+// 3. Process incoming messages (commands, terminal, etc.)
+// 4. Spawn output readers for terminal sessions
+//
+// ⚠️ Important Note for Next Developer:
+// - The terminal output reader MUST be spawned after session creation
+// - WebSocket reconnection logic is critical for reliability
+// - Heartbeat messages maintain connection alive status
+// - Terminal manager is shared across all handlers
+//
+// Last Modified: v1.0.1 - Added start_terminal_output_reader and get_terminal_manager
+// ============================================
 
 use super::{RegistrationManager, WebSocketMessage, LegacyHeartbeatMetrics};
 use crate::hardware::HardwareInfo;
@@ -15,8 +41,10 @@ use crate::websocket_protocol::{
     HeartbeatMetrics as WsHeartbeatMetrics, ClientMessage,
 };
 use crate::server::metrics::ServerMetricsCollector;
+use crate::terminal::{TerminalMessage, TerminalSessionManager, terminal_output_reader};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 
 // Sub-modules
@@ -187,5 +215,30 @@ impl RegistrationManager {
                 .unwrap()
                 .as_secs()),
         }
+    }
+
+    /// Start terminal output reader task
+    /// This spawns an async task that continuously reads from the PTY
+    /// and sends output through the provided channel
+    pub(crate) async fn start_terminal_output_reader(
+        &self,
+        terminal_manager: Arc<TerminalSessionManager>,
+        session_id: String,
+        tx: mpsc::Sender<TerminalMessage>,
+    ) {
+        info!("Starting terminal output reader for session: {}", session_id);
+        
+        // Spawn the terminal output reader task from terminal/mod.rs
+        tokio::spawn(terminal_output_reader(
+            terminal_manager,
+            session_id,
+            tx,
+        ));
+    }
+    
+    /// Get terminal manager instance
+    /// Returns the Arc reference to the shared terminal session manager
+    pub(crate) fn get_terminal_manager(&self) -> Arc<TerminalSessionManager> {
+        self.terminal_manager.clone()
     }
 }
