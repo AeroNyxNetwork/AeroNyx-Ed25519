@@ -1,37 +1,38 @@
 // src/registration/websocket.rs
 // ============================================
 // AeroNyx Privacy Network - WebSocket Communication Module
-// Version: 1.0.1 - Added terminal output reader support
+// Version: 1.0.2 - Fixed duplicate definitions
 // ============================================
 // Copyright (c) 2024 AeroNyx Team
 // SPDX-License-Identifier: MIT
 //
 // Creation Reason: WebSocket connection management for node communication
-// Modification Reason: Added terminal output reader and terminal manager methods
+// Modification Reason: Removed duplicate method definitions
 // Main Functionality:
 // - WebSocket connection establishment and maintenance
 // - Message handling and routing
-// - Terminal session output streaming
 // - Heartbeat and metrics reporting
 // Dependencies:
 // - connection.rs: Connection lifecycle management
 // - handlers.rs: Message processing
 // - terminal.rs: Terminal-specific handlers
-// - terminal/mod.rs: Terminal emulation
+// - ../registration.rs: Provides get_terminal_manager
+// - terminal.rs (local): Provides start_terminal_output_reader
 //
 // Main Logical Flow:
 // 1. Establish WebSocket connection with retry logic
 // 2. Handle authentication and heartbeat
 // 3. Process incoming messages (commands, terminal, etc.)
-// 4. Spawn output readers for terminal sessions
+// 4. Terminal output reader spawning handled by terminal.rs
 //
 // ⚠️ Important Note for Next Developer:
-// - The terminal output reader MUST be spawned after session creation
+// - DO NOT add duplicate definitions of get_terminal_manager or start_terminal_output_reader
+// - get_terminal_manager is defined in src/registration.rs
+// - start_terminal_output_reader is defined in src/registration/websocket/terminal.rs
 // - WebSocket reconnection logic is critical for reliability
 // - Heartbeat messages maintain connection alive status
-// - Terminal manager is shared across all handlers
 //
-// Last Modified: v1.0.1 - Added start_terminal_output_reader and get_terminal_manager
+// Last Modified: v1.0.2 - Removed duplicate method definitions
 // ============================================
 
 use super::{RegistrationManager, WebSocketMessage, LegacyHeartbeatMetrics};
@@ -41,10 +42,8 @@ use crate::websocket_protocol::{
     HeartbeatMetrics as WsHeartbeatMetrics, ClientMessage,
 };
 use crate::server::metrics::ServerMetricsCollector;
-use crate::terminal::{TerminalMessage, TerminalSessionManager, terminal_output_reader};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 
 // Sub-modules
@@ -216,29 +215,15 @@ impl RegistrationManager {
                 .as_secs()),
         }
     }
-
-    /// Start terminal output reader task
-    /// This spawns an async task that continuously reads from the PTY
-    /// and sends output through the provided channel
-    pub(crate) async fn start_terminal_output_reader(
-        &self,
-        terminal_manager: Arc<TerminalSessionManager>,
-        session_id: String,
-        tx: mpsc::Sender<TerminalMessage>,
-    ) {
-        info!("Starting terminal output reader for session: {}", session_id);
-        
-        // Spawn the terminal output reader task from terminal/mod.rs
-        tokio::spawn(terminal_output_reader(
-            terminal_manager,
-            session_id,
-            tx,
-        ));
-    }
     
-    /// Get terminal manager instance
-    /// Returns the Arc reference to the shared terminal session manager
-    pub(crate) fn get_terminal_manager(&self) -> Arc<TerminalSessionManager> {
-        self.terminal_manager.clone()
-    }
+    // ============================================
+    // IMPORTANT: DO NOT ADD THESE METHODS HERE
+    // ============================================
+    // get_terminal_manager() is defined in src/registration.rs
+    // start_terminal_output_reader() is defined in src/registration/websocket/terminal.rs
+    //
+    // Adding duplicate definitions will cause compilation errors.
+    // If you need to use these methods, they are already available
+    // through the RegistrationManager impl in their respective files.
+    // ============================================
 }
