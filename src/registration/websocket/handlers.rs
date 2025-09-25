@@ -1,5 +1,5 @@
 // src/registration/websocket/handlers.rs
-// WebSocket message handling logic - Optimized version with all features preserved
+// WebSocket message handling logic - Fixed version with terminal output support
 
 use crate::registration::{RegistrationManager, WebSocketMessage};
 use crate::hardware::HardwareInfo;
@@ -314,9 +314,6 @@ impl RegistrationManager {
                             
                             info!("Request ID: {}", request_id);
                             info!("From session: {:?}", from_session);
-                            
-                            // NOTE: Backend doesn't send node_reference, so we don't check it
-                            // The node is already authenticated, so we trust the command
                             
                             if let Some(command_json) = json_value.get("command") {
                                 info!("Command JSON: {:?}", command_json);
@@ -637,7 +634,7 @@ impl RegistrationManager {
         Ok(())
     }
 
-    /// Handle server messages with ZKP support
+    /// Handle server messages with ZKP support (FIXED VERSION WITH TERMINAL CHANNELS)
     pub(super) async fn handle_server_message(
         &self,
         message: ServerMessage,
@@ -645,6 +642,7 @@ impl RegistrationManager {
         authenticated: &mut bool,
         hardware_info: &HardwareInfo,
         setup_params: &SetupParams,
+        terminal_output_channels: &mut HashMap<String, mpsc::Receiver<TerminalMessage>>,
     ) -> Result<(), String> {
         use crate::zkp_halo2;
         
@@ -837,7 +835,7 @@ impl RegistrationManager {
                 debug!("Received unknown message type");
             }
             
-            // Handle terminal-related messages
+            // Handle terminal-related messages with FIXED output reader
             ServerMessage::TermInit { session_id, rows, cols, cwd, env, from_user } => {
                 info!("Received TermInit request: session_id={}, user={}, size={}x{}", 
                     session_id, from_user, cols, rows);
@@ -859,7 +857,6 @@ impl RegistrationManager {
                 let terminal_manager = self.get_terminal_manager();
                 
                 // Create terminal message for initialization
-                // Note: The from_user field is stored in the websocket protocol but not used by terminal manager
                 let init_msg = TerminalMessage::Init {
                     session_id: session_id.clone(),
                     rows,
@@ -871,16 +868,43 @@ impl RegistrationManager {
                 // Handle terminal initialization
                 match handle_terminal_message(&terminal_manager, init_msg).await {
                     Ok(Some(response)) => {
+                        // Check if we got a Ready response and extract session_id
+                        let ready_session_id = if let TerminalMessage::Ready { ref session_id } = response {
+                            Some(session_id.clone())
+                        } else {
+                            None
+                        };
+                        
+                        // Send the ready response
                         let response_json = serde_json::to_string(&response)
                             .unwrap_or_else(|_| "{}".to_string());
                         
                         write.send(Message::Text(response_json)).await
                             .map_err(|e| format!("Failed to send ready message: {}", e))?;
                         
-                        info!("Terminal session {} created and ready for user {}", session_id, from_user);
+                        // ✅ FIX: Start the output reader task for this terminal session
+                        if let Some(ready_id) = ready_session_id {
+                            // Create channel for terminal output
+                            let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
+                            
+                            // Store the receiver in the terminal output channels
+                            terminal_output_channels.insert(ready_id.clone(), rx);
+                            
+                            // Start the output reader task
+                            info!("Starting output reader for terminal session: {}", ready_id);
+                            self.start_terminal_output_reader(
+                                terminal_manager.clone(),
+                                ready_id.clone(),
+                                tx
+                            ).await;
+                            
+                            info!("Terminal session {} created and output reader started for user {}", 
+                                ready_id, from_user);
+                        }
                     }
                     Ok(None) => {
                         // No response expected
+                        info!("Terminal init handled but no response expected");
                     }
                     Err(e) => {
                         error!("Failed to create terminal session: {}", e);
@@ -963,6 +987,9 @@ impl RegistrationManager {
                 if let Err(e) = handle_terminal_message(&terminal_manager, close_msg).await {
                     error!("Failed to close terminal {}: {}", session_id, e);
                 }
+                
+                // Remove from terminal output channels
+                terminal_output_channels.remove(&session_id);
                 
                 // Send closed confirmation
                 let closed_msg = serde_json::json!({
