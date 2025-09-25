@@ -306,15 +306,15 @@ impl RegistrationManager {
                         &mut terminal_tracker.channels,  // Pass the HashMap directly
                     ).await?;
                 } else {
-                    // Handle generic message
-                    self.handle_generic_message(
+                    // Handle generic message - use local version
+                    self.handle_generic_message_v2(
                         &text,
                         write,
                         &mut state.authenticated,
                         &mut state.auth_sent,
                         &mut state.heartbeat_interval,
                         &mut state.last_heartbeat_ack,
-                        &mut terminal_tracker.channels,  // Pass the HashMap directly
+                        terminal_tracker,  // Pass the whole tracker
                         hardware_info,
                         setup_params,
                     ).await?;
@@ -429,5 +429,140 @@ impl RegistrationManager {
         } else {
             Ok(())
         }
+    }
+    
+    /// Handle generic message with terminal support (local version)
+    async fn handle_generic_message_v2(
+        &self,
+        text: &str,
+        write: &mut WsSink,
+        authenticated: &mut bool,
+        auth_sent: &mut bool,
+        heartbeat_interval: &mut time::Interval,
+        last_heartbeat_ack: &mut std::time::Instant,
+        terminal_tracker: &mut TerminalSessionTracker,
+        hardware_info: &HardwareInfo,
+        setup_params: &SetupParams,
+    ) -> Result<(), String> {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+            if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
+                match msg_type {
+                    // Terminal messages
+                    "term_init" | "term_input" | "term_resize" | "term_close" => {
+                        self.handle_terminal_message_json(&json, write, terminal_tracker).await?;
+                    }
+                    
+                    // Terminal response messages
+                    "term_ready" => {
+                        if let Ok(msg) = serde_json::from_value::<TerminalMessage>(json) {
+                            if let TerminalMessage::Ready { session_id } = msg {
+                                // Create channel for terminal output
+                                let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
+                                terminal_tracker.insert(session_id.clone(), rx);
+                                
+                                // Start output reader
+                                self.start_terminal_output_reader(
+                                    self.terminal_manager.clone(),
+                                    session_id,
+                                    tx
+                                ).await;
+                            }
+                        }
+                    }
+                    
+                    // Other messages - delegate to handlers.rs version with terminal_output_channels
+                    _ => {
+                        return self.handle_generic_message(
+                            text,
+                            write,
+                            authenticated,
+                            auth_sent,
+                            heartbeat_interval,
+                            last_heartbeat_ack,
+                            &mut terminal_tracker.channels,  // Pass the HashMap for legacy handler
+                            hardware_info,
+                            setup_params,
+                        ).await;
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Handle terminal message from JSON
+    async fn handle_terminal_message_json(
+        &self,
+        json: &serde_json::Value,
+        write: &mut WsSink,
+        terminal_tracker: &mut TerminalSessionTracker,
+    ) -> Result<(), String> {
+        // Check if remote management is enabled
+        if !*self.remote_management_enabled.read().await {
+            let session_id = json.get("session_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown");
+            
+            let error_response = serde_json::json!({
+                "type": "term_error",
+                "session_id": session_id,
+                "error": "Remote management is disabled"
+            });
+            
+            write.send(Message::Text(error_response.to_string())).await
+                .map_err(|e| format!("Failed to send error response: {}", e))?;
+            return Ok(());
+        }
+        
+        // Parse and handle terminal message
+        if let Ok(term_msg) = serde_json::from_value::<TerminalMessage>(json.clone()) {
+            let terminal_manager = self.get_terminal_manager();
+            
+            match super::terminal::handle_terminal_message(&terminal_manager, term_msg).await {
+                Ok(Some(response)) => {
+                    let response_json = serde_json::to_string(&response)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    
+                    write.send(Message::Text(response_json)).await
+                        .map_err(|e| format!("Failed to send terminal response: {}", e))?;
+                    
+                    // Handle special responses
+                    if let TerminalMessage::Ready { session_id } = response {
+                        // Create channel for output
+                        let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
+                        terminal_tracker.insert(session_id.clone(), rx);
+                        
+                        // Start output reader
+                        self.start_terminal_output_reader(
+                            terminal_manager.clone(),
+                            session_id,
+                            tx
+                        ).await;
+                    }
+                }
+                Ok(None) => {
+                    // No response needed
+                }
+                Err(e) => {
+                    error!("Terminal message handling error: {}", e);
+                    
+                    let session_id = json.get("session_id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    
+                    let error_response = serde_json::json!({
+                        "type": "term_error",
+                        "session_id": session_id,
+                        "error": e.to_string()
+                    });
+                    
+                    write.send(Message::Text(error_response.to_string())).await
+                        .map_err(|e| format!("Failed to send error response: {}", e))?;
+                }
+            }
+        }
+        
+        Ok(())
     }
 }
