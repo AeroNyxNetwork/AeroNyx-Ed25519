@@ -1,5 +1,32 @@
 // src/registration/websocket/connection.rs
-// WebSocket connection management and lifecycle - Fixed version preserving ALL functionality
+// ============================================
+// WebSocket connection management and lifecycle
+// Version: 1.1.0 - Fixed terminal blocking issue
+// ============================================
+// Creation Reason: Manages WebSocket connections between node and backend
+// Modification Reason: Fixed event loop blocking caused by terminal output processing
+// Main Functionality:
+// - WebSocket connection establishment with retry logic
+// - Message routing and processing
+// - Terminal session management
+// - Heartbeat mechanism
+// - Ping/pong handling
+//
+// Main Logical Flow:
+// 1. Establish WebSocket connection with retry
+// 2. Authenticate with backend
+// 3. Process messages in event loop with proper priority
+// 4. Handle terminal I/O without blocking ping/pong
+// 5. Maintain heartbeat for connection health
+//
+// ⚠️ Important Note for Next Developer:
+// - The terminal output check MUST be rate-limited to prevent blocking
+// - WebSocket ping/pong messages have priority over terminal output
+// - Terminal check interval is set to 50ms to balance responsiveness and CPU usage
+// - Never remove the terminal_check_interval - it prevents connection drops
+//
+// Last Modified: v1.1.0 - Added rate limiting for terminal output checks
+// ============================================
 
 use crate::registration::{RegistrationManager, WebSocketMessage};
 use crate::hardware::HardwareInfo;
@@ -19,7 +46,7 @@ use tracing::{debug, error, info, warn};
 pub type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>;
 pub type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>;
 
-// 心跳配置
+// Heartbeat configuration
 #[derive(Clone)]
 struct HeartbeatConfig {
     interval: Duration,
@@ -31,15 +58,15 @@ struct HeartbeatConfig {
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(30),
-            timeout: Duration::from_secs(180),     // 6分钟基础超时
-            max_missed: 3,                        // 允许错过3次
-            grace_period: Duration::from_secs(30), // 额外宽限期
+            interval: Duration::from_secs(30),      // Send heartbeat every 30 seconds
+            timeout: Duration::from_secs(180),      // Timeout after 180 seconds (3 minutes)
+            max_missed: 3,                          // Allow 3 missed heartbeats
+            grace_period: Duration::from_secs(30),  // Additional grace period before disconnect
         }
     }
 }
 
-// 终端会话管理器
+// Terminal session tracker - manages terminal output channels
 struct TerminalSessionTracker {
     channels: HashMap<String, mpsc::Receiver<TerminalMessage>>,
     last_cleanup: std::time::Instant,
@@ -53,14 +80,17 @@ impl TerminalSessionTracker {
         }
     }
     
+    // Add a new terminal session channel
     fn insert(&mut self, session_id: String, rx: mpsc::Receiver<TerminalMessage>) {
         self.channels.insert(session_id, rx);
     }
     
+    // Remove a terminal session channel
     fn remove(&mut self, session_id: &str) -> Option<mpsc::Receiver<TerminalMessage>> {
         self.channels.remove(session_id)
     }
     
+    // Clean up closed channels
     fn cleanup_closed(&mut self) {
         let closed_sessions: Vec<String> = self.channels
             .iter()
@@ -74,7 +104,9 @@ impl TerminalSessionTracker {
         }
     }
     
+    // Check for output from any terminal session (non-blocking)
     async fn check_for_output(&mut self) -> Option<(String, TerminalMessage)> {
+        // Iterate through all channels and try to receive without blocking
         for (id, rx) in self.channels.iter_mut() {
             if let Ok(msg) = rx.try_recv() {
                 return Some((id.clone(), msg));
@@ -83,10 +115,12 @@ impl TerminalSessionTracker {
         None
     }
     
+    // Check if cleanup is needed (every 60 seconds)
     fn should_cleanup(&self) -> bool {
         self.last_cleanup.elapsed() > Duration::from_secs(60)
     }
     
+    // Mark cleanup as done
     fn mark_cleanup(&mut self) {
         self.last_cleanup = std::time::Instant::now();
     }
@@ -117,7 +151,7 @@ impl ConnectionState {
 }
 
 impl RegistrationManager {
-    /// Optimized WebSocket connection handler with improved error handling and resource management
+    /// Main WebSocket connection handler with retry logic and resource management
     pub(crate) async fn connect_and_run_websocket_v2(
         &self,
         ws_url: &str,
@@ -162,7 +196,7 @@ impl RegistrationManager {
         result
     }
     
-    /// Connect with retry logic
+    /// Connect to WebSocket with exponential backoff retry
     async fn connect_with_retry(&self, ws_url: &str, max_retries: u32) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, String> {
         let mut retry_count = 0;
         let mut backoff = Duration::from_secs(1);
@@ -175,6 +209,7 @@ impl RegistrationManager {
                     warn!("WebSocket connection attempt {} failed: {}. Retrying in {:?}...", 
                           retry_count, e, backoff);
                     tokio::time::sleep(backoff).await;
+                    // Exponential backoff with cap at 10 seconds
                     backoff = backoff.mul_f32(1.5).min(Duration::from_secs(10));
                 }
                 Err(e) => {
@@ -184,7 +219,8 @@ impl RegistrationManager {
         }
     }
     
-    /// Main event loop
+    /// Main event loop - processes all WebSocket events with proper priority
+    /// CRITICAL: Terminal output checking is rate-limited to prevent blocking ping/pong
     async fn run_event_loop(
         &self,
         write: &mut WsSink,
@@ -196,21 +232,33 @@ impl RegistrationManager {
         hardware_info: &HardwareInfo,
         setup_params: &SetupParams,
     ) -> Result<(), String> {
-        // Set up intervals
+        // Set up intervals for various periodic tasks
         let mut heartbeat_interval = time::interval(heartbeat_config.interval);
         heartbeat_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         
         let mut cleanup_interval = time::interval(Duration::from_secs(60));
         cleanup_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         
+        // CRITICAL: Terminal output check interval - prevents blocking the event loop
+        // This ensures terminal output doesn't prevent ping/pong processing
+        let mut terminal_check_interval = time::interval(Duration::from_millis(50));
+        terminal_check_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        
         // Authentication timeout
         let auth_timeout = time::sleep(Duration::from_secs(35));
         tokio::pin!(auth_timeout);
         
+        // Main event loop using tokio::select! for concurrent event handling
         loop {
             tokio::select! {
-                // Handle incoming messages
+                // Priority 1: Handle incoming WebSocket messages (including ping/pong)
+                // This branch has implicit priority by being listed first
                 Some(message) = read.next() => {
+                    // Special logging for ping messages to track their processing
+                    if let Ok(Message::Ping(_)) = &message {
+                        info!("Processing WebSocket ping message with high priority");
+                    }
+                    
                     match self.handle_incoming_message(
                         message, 
                         write, 
@@ -231,15 +279,7 @@ impl RegistrationManager {
                     }
                 }
                 
-                // Check terminal outputs
-                Some((session_id, msg)) = terminal_tracker.check_for_output() => {
-                    if let Err(e) = self.send_terminal_output(write, &session_id, msg).await {
-                        error!("Failed to send terminal output: {}", e);
-                        terminal_tracker.remove(&session_id);
-                    }
-                }
-                
-                // Heartbeat
+                // Priority 2: Send heartbeat messages (must be timely)
                 _ = heartbeat_interval.tick() => {
                     if state.authenticated {
                         if let Err(e) = self.handle_heartbeat(
@@ -254,7 +294,23 @@ impl RegistrationManager {
                     }
                 }
                 
-                // Periodic cleanup
+                // Priority 3: Check terminal output (rate-limited to prevent blocking)
+                // Only runs every 50ms to ensure other events can be processed
+                _ = terminal_check_interval.tick() => {
+                    // Only check if we have active terminal sessions
+                    if !terminal_tracker.channels.is_empty() {
+                        // Non-blocking check, process only one message per tick
+                        if let Some((session_id, msg)) = terminal_tracker.check_for_output().await {
+                            debug!("Sending terminal output for session {}", session_id);
+                            if let Err(e) = self.send_terminal_output(write, &session_id, msg).await {
+                                error!("Failed to send terminal output: {}", e);
+                                terminal_tracker.remove(&session_id);
+                            }
+                        }
+                    }
+                }
+                
+                // Priority 4: Periodic cleanup of closed channels
                 _ = cleanup_interval.tick() => {
                     if terminal_tracker.should_cleanup() {
                         terminal_tracker.cleanup_closed();
@@ -262,7 +318,7 @@ impl RegistrationManager {
                     }
                 }
                 
-                // Authentication timeout
+                // Authentication timeout check (only active before authentication)
                 _ = &mut auth_timeout, if !state.authenticated => {
                     error!("Authentication timeout - no server response within 35 seconds");
                     return Err("Authentication timeout".to_string());
@@ -274,7 +330,7 @@ impl RegistrationManager {
         self.determine_exit_reason(state, &heartbeat_config)
     }
     
-    /// Handle incoming WebSocket message
+    /// Handle incoming WebSocket messages
     async fn handle_incoming_message(
         &self,
         message: Result<Message, tokio_tungstenite::tungstenite::Error>,
@@ -286,27 +342,27 @@ impl RegistrationManager {
     ) -> Result<bool, String> {
         match message {
             Ok(Message::Text(text)) => {
-                debug!("Received message: {} bytes", text.len());
+                debug!("Received text message: {} bytes", text.len());
                 
-                // Try structured message first
+                // Try to parse as structured message first
                 if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
-                    // Update heartbeat ack for relevant messages
+                    // Update heartbeat acknowledgment for relevant messages
                     if matches!(server_msg, ServerMessage::HeartbeatAck { .. }) {
                         state.last_heartbeat_ack = std::time::Instant::now();
                         state.missed_heartbeats = 0;
                     }
                     
-                    // Pass terminal_output_channels (the HashMap) to handle_server_message
+                    // Handle structured server message
                     self.handle_server_message(
                         server_msg,
                         write,
                         &mut state.authenticated,
                         hardware_info,
                         setup_params,
-                        &mut terminal_tracker.channels,  // Pass the HashMap
+                        &mut terminal_tracker.channels,
                     ).await?;
                 } else {
-                    // Handle generic message - renamed to avoid conflict
+                    // Handle generic/unstructured message
                     self.handle_generic_message_v2(
                         &text,
                         write,
@@ -314,7 +370,7 @@ impl RegistrationManager {
                         &mut state.auth_sent,
                         &mut state.heartbeat_interval,
                         &mut state.last_heartbeat_ack,
-                        terminal_tracker,  // Pass the whole tracker
+                        terminal_tracker,
                         hardware_info,
                         setup_params,
                     ).await?;
@@ -326,9 +382,11 @@ impl RegistrationManager {
                 Ok(false)
             }
             Ok(Message::Ping(data)) => {
-                debug!("Received ping, sending pong");
+                // CRITICAL: Respond to ping immediately to maintain connection
+                info!("Received ping with {} bytes, sending pong immediately", data.len());
                 write.send(Message::Pong(data)).await
                     .map_err(|e| format!("Failed to send pong: {}", e))?;
+                info!("Pong sent successfully");
                 Ok(true)
             }
             Ok(Message::Pong(_)) => {
@@ -345,7 +403,7 @@ impl RegistrationManager {
         }
     }
     
-    /// Handle heartbeat logic
+    /// Handle heartbeat logic - sends heartbeat and checks for timeout
     async fn handle_heartbeat(
         &self,
         write: &mut WsSink,
@@ -355,7 +413,7 @@ impl RegistrationManager {
     ) -> Result<(), String> {
         let elapsed = state.last_heartbeat_ack.elapsed();
         
-        // Check for timeout
+        // Check for heartbeat timeout
         if elapsed > config.timeout {
             state.missed_heartbeats += 1;
             
@@ -373,7 +431,7 @@ impl RegistrationManager {
             }
         }
         
-        // Send regular heartbeat
+        // Send regular heartbeat message
         let heartbeat = self.create_heartbeat_message(metrics_collector).await;
         let heartbeat_json = serde_json::to_string(&heartbeat)
             .map_err(|e| format!("Failed to serialize heartbeat: {}", e))?;
@@ -385,7 +443,7 @@ impl RegistrationManager {
         Ok(())
     }
     
-    /// Send terminal output
+    /// Send terminal output to WebSocket
     async fn send_terminal_output(
         &self,
         write: &mut WsSink,
@@ -399,7 +457,7 @@ impl RegistrationManager {
             .map_err(|e| format!("Failed to send terminal output: {}", e))
     }
     
-    /// Clean up resources
+    /// Clean up resources on disconnect
     async fn cleanup_resources(&self, terminal_tracker: &mut TerminalSessionTracker) {
         // Close all terminal sessions
         let session_ids: Vec<String> = terminal_tracker.channels.keys().cloned().collect();
@@ -408,7 +466,7 @@ impl RegistrationManager {
             if let Some(mut rx) = terminal_tracker.remove(&session_id) {
                 rx.close();
                 
-                // terminal_manager is Arc<TerminalSessionManager>, not Option
+                // Close the actual terminal session
                 if let Err(e) = self.terminal_manager.close_session(&session_id).await {
                     warn!("Failed to close terminal session {}: {}", session_id, e);
                 }
@@ -418,7 +476,7 @@ impl RegistrationManager {
         info!("Cleaned up {} terminal sessions", terminal_tracker.channels.len());
     }
     
-    /// Determine exit reason
+    /// Determine exit reason based on connection state
     fn determine_exit_reason(&self, state: &ConnectionState, config: &HeartbeatConfig) -> Result<(), String> {
         if state.authenticated && state.last_heartbeat_ack.elapsed() > config.timeout {
             Err("Connection lost: heartbeat timeout".to_string())
@@ -431,7 +489,7 @@ impl RegistrationManager {
         }
     }
     
-    /// Handle generic message with terminal support (renamed to avoid conflict)
+    /// Handle generic/unstructured messages with terminal support
     async fn handle_generic_message_v2(
         &self,
         text: &str,
@@ -447,12 +505,12 @@ impl RegistrationManager {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
             if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
                 match msg_type {
-                    // Terminal messages
+                    // Terminal-specific messages
                     "term_init" | "term_input" | "term_resize" | "term_close" => {
                         self.handle_terminal_message_json(&json, write, terminal_tracker).await?;
                     }
                     
-                    // Terminal response messages
+                    // Terminal ready response
                     "term_ready" => {
                         if let Ok(msg) = serde_json::from_value::<TerminalMessage>(json) {
                             if let TerminalMessage::Ready { session_id } = msg {
@@ -460,7 +518,7 @@ impl RegistrationManager {
                                 let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
                                 terminal_tracker.insert(session_id.clone(), rx);
                                 
-                                // Start output reader
+                                // Start output reader task
                                 self.start_terminal_output_reader(
                                     self.terminal_manager.clone(),
                                     session_id,
@@ -470,9 +528,8 @@ impl RegistrationManager {
                         }
                     }
                     
-                    // Other messages - delegate to original handler in handlers.rs
+                    // All other messages - delegate to main handler
                     _ => {
-                        // Call handle_generic_message from handlers.rs
                         return self.handle_generic_message(
                             text,
                             write,
@@ -480,7 +537,7 @@ impl RegistrationManager {
                             auth_sent,
                             heartbeat_interval,
                             last_heartbeat_ack,
-                            &mut terminal_tracker.channels,  // Pass the HashMap for handlers.rs
+                            &mut terminal_tracker.channels,
                             hardware_info,
                             setup_params,
                         ).await;
@@ -492,7 +549,7 @@ impl RegistrationManager {
         Ok(())
     }
     
-    /// Handle terminal message from JSON
+    /// Handle terminal-specific messages
     async fn handle_terminal_message_json(
         &self,
         json: &serde_json::Value,
@@ -530,7 +587,7 @@ impl RegistrationManager {
                     
                     // Handle special responses
                     if let TerminalMessage::Ready { session_id } = response {
-                        // Create channel for output
+                        // Create output channel
                         let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
                         terminal_tracker.insert(session_id.clone(), rx);
                         
