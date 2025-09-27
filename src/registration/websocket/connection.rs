@@ -239,14 +239,17 @@ impl RegistrationManager {
         let mut cleanup_interval = time::interval(Duration::from_secs(60));
         cleanup_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         
-        // CRITICAL: Terminal output check interval - prevents blocking the event loop
-        // This ensures terminal output doesn't prevent ping/pong processing
-        let mut terminal_check_interval = time::interval(Duration::from_millis(50));
+        // CRITICAL: Terminal output check interval - increased to 100ms to reduce CPU usage
+        // and prevent blocking of ping/pong processing
+        let mut terminal_check_interval = time::interval(Duration::from_millis(100));
         terminal_check_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         
         // Authentication timeout
         let auth_timeout = time::sleep(Duration::from_secs(35));
         tokio::pin!(auth_timeout);
+        
+        // Flag to skip terminal checks when processing important messages
+        let mut skip_terminal_check = false;
         
         // Main event loop using tokio::select! for concurrent event handling
         loop {
@@ -254,11 +257,22 @@ impl RegistrationManager {
                 // Priority 1: Handle incoming WebSocket messages (including ping/pong)
                 // This branch has implicit priority by being listed first
                 Some(message) = read.next() => {
-                    // Special logging for ping messages to track their processing
-                    if let Ok(Message::Ping(_)) = &message {
-                        info!("Processing WebSocket ping message with high priority");
+                    // Set flag to skip terminal check on next tick if we're processing messages
+                    skip_terminal_check = true;
+                    
+                    // CRITICAL: Handle ping messages immediately without going through the full handler
+                    if let Ok(Message::Ping(data)) = &message {
+                        info!("Received ping with {} bytes, sending pong IMMEDIATELY", data.len());
+                        // Send pong directly here for fastest response
+                        if let Err(e) = write.send(Message::Pong(data.clone())).await {
+                            error!("Failed to send pong: {}", e);
+                            break;
+                        }
+                        info!("Pong sent successfully, continuing loop");
+                        continue; // Skip the rest of processing for ping messages
                     }
                     
+                    // Handle all other messages normally
                     match self.handle_incoming_message(
                         message, 
                         write, 
@@ -294,9 +308,9 @@ impl RegistrationManager {
                     }
                 }
                 
-                // Priority 3: Check terminal output (rate-limited to prevent blocking)
-                // Only runs every 50ms to ensure other events can be processed
-                _ = terminal_check_interval.tick() => {
+                // Priority 3: Check terminal output (rate-limited and conditional)
+                // Skip this if we just processed a WebSocket message
+                _ = terminal_check_interval.tick(), if !skip_terminal_check => {
                     // Only check if we have active terminal sessions
                     if !terminal_tracker.channels.is_empty() {
                         // Non-blocking check, process only one message per tick
@@ -308,6 +322,7 @@ impl RegistrationManager {
                             }
                         }
                     }
+                    skip_terminal_check = false; // Reset the flag
                 }
                 
                 // Priority 4: Periodic cleanup of closed channels
@@ -323,6 +338,11 @@ impl RegistrationManager {
                     error!("Authentication timeout - no server response within 35 seconds");
                     return Err("Authentication timeout".to_string());
                 }
+            }
+            
+            // Reset skip flag if it wasn't reset in the terminal check branch
+            if skip_terminal_check {
+                skip_terminal_check = false;
             }
         }
         
