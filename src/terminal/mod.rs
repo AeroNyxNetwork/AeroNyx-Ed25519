@@ -182,7 +182,6 @@ impl TerminalSessionManager {
         }
         
         // Create PTY in blocking task
-        let session_id_clone = session_id.clone();
         let pty_result = task::spawn_blocking(move || {
             // Get PTY system
             let pty_system = native_pty_system();
@@ -273,15 +272,15 @@ impl TerminalSessionManager {
         
         let session_clone = session.clone();
         let data = data.to_vec();
-        let session_id = session_id.to_string();
+        let session_id_string = session_id.to_string();
         
         info!("Writing {} bytes to terminal {}: {:?}", 
-              data.len(), session_id, 
+              data.len(), session_id_string, 
               String::from_utf8_lossy(&data));
         
         // Write in blocking task and immediately check for output
         let channels = self.output_channels.read().await;
-        let output_tx = channels.get(&session_id).cloned();
+        let output_tx = channels.get(&session_id_string).cloned();
         drop(channels);
         
         task::spawn_blocking(move || {
@@ -310,7 +309,10 @@ impl TerminalSessionManager {
                 
                 // Set non-blocking mode and try to read
                 match reader.read(&mut buffer) {
-                    Ok(n) if n > 0 => {
+                    Ok(0) => {
+                        debug!("No immediate output available (EOF)");
+                    }
+                    Ok(n) => {
                         buffer.truncate(n);
                         info!("Immediate output after input: {} bytes", n);
                         
@@ -318,7 +320,7 @@ impl TerminalSessionManager {
                         if let Some(tx) = output_tx {
                             let encoded = base64::encode(&buffer);
                             let msg = TerminalMessage::Output {
-                                session_id: session_id.clone(),
+                                session_id: session_id_string.clone(),
                                 data: encoded,
                             };
                             
@@ -326,12 +328,9 @@ impl TerminalSessionManager {
                             if let Err(e) = tx.blocking_send(msg) {
                                 error!("Failed to send immediate output: {}", e);
                             } else {
-                                info!("Sent immediate output for session {}", session_id);
+                                info!("Sent immediate output for session {}", session_id_string);
                             }
                         }
-                    }
-                    Ok(0) => {
-                        debug!("No immediate output available");
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         debug!("No immediate output (would block)");
