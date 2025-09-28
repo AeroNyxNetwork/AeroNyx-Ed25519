@@ -370,12 +370,12 @@ impl TerminalSessionManager {
 impl PtyBridge {
     /// Create a new PTY bridge with dedicated I/O threads
     fn new(pty_handle: PtyHandle) -> Result<Self, String> {
-        let (output_tx, output_rx) = bounded(CHANNEL_BUFFER_SIZE);
-        let (input_tx, input_rx) = bounded(CHANNEL_BUFFER_SIZE);
+        let (output_tx, output_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(CHANNEL_BUFFER_SIZE);
+        let (input_tx, input_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(CHANNEL_BUFFER_SIZE);
         
         let PtyHandle { master, child } = pty_handle;
         let master = Arc::new(Mutex::new(master));
-        let child = Arc::new(Mutex::new(Some(child)));
+        let _child = Arc::new(Mutex::new(Some(child)));
         
         // Reader thread
         let reader_master = master.clone();
