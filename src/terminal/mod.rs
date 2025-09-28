@@ -265,7 +265,7 @@ impl TerminalSessionManager {
         &self,
         session_id: &str,
         data: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<Vec<u8>, String> {
         let sessions = self.sessions.read().await;
         let session = sessions.get(session_id)
             .ok_or_else(|| "Session not found".to_string())?;
@@ -278,12 +278,8 @@ impl TerminalSessionManager {
               data.len(), session_id_string, 
               String::from_utf8_lossy(&data));
         
-        // Write in blocking task and immediately check for output
-        let channels = self.output_channels.read().await;
-        let output_tx = channels.get(&session_id_string).cloned();
-        drop(channels);
-        
-        task::spawn_blocking(move || {
+        // Write in blocking task and immediately read output
+        let output = task::spawn_blocking(move || {
             let handle = session_clone.pty_handle.blocking_lock();
             let master = &handle.master;
             
@@ -297,55 +293,76 @@ impl TerminalSessionManager {
             writer.flush()
                 .map_err(|e| format!("Failed to flush terminal: {}", e))?;
             
-            debug!("Successfully wrote {} bytes to PTY", data.len());
+            info!("Successfully wrote {} bytes to PTY", data.len());
             
-            // CRITICAL: Immediately try to read any output (echo or response)
-            // This is important because terminal echo happens immediately
-            std::thread::sleep(Duration::from_millis(10)); // Small delay for PTY to process
+            // CRITICAL: Immediately read output (echo + any response)
+            // Give PTY a moment to process and echo
+            std::thread::sleep(Duration::from_millis(20));
             
-            // Try to read immediate response
-            if let Ok(mut reader) = master.try_clone_reader() {
-                let mut buffer = vec![0u8; 4096];
-                
-                // Set non-blocking mode and try to read
-                match reader.read(&mut buffer) {
-                    Ok(0) => {
-                        debug!("No immediate output available (EOF)");
-                    }
-                    Ok(n) => {
-                        buffer.truncate(n);
-                        info!("Immediate output after input: {} bytes", n);
-                        
-                        // If we have an output channel, send the output immediately
-                        if let Some(tx) = output_tx {
-                            let encoded = base64::encode(&buffer);
-                            let msg = TerminalMessage::Output {
-                                session_id: session_id_string.clone(),
-                                data: encoded,
-                            };
+            let mut accumulated_output = Vec::new();
+            let mut attempts = 0;
+            const MAX_ATTEMPTS: u32 = 5;
+            
+            // Try multiple times to capture all immediate output
+            while attempts < MAX_ATTEMPTS {
+                if let Ok(mut reader) = master.try_clone_reader() {
+                    let mut buffer = vec![0u8; 4096];
+                    
+                    match reader.read(&mut buffer) {
+                        Ok(0) => {
+                            debug!("EOF on attempt {}", attempts);
+                            break;
+                        }
+                        Ok(n) => {
+                            info!("Read {} bytes on attempt {}", n, attempts);
+                            accumulated_output.extend_from_slice(&buffer[..n]);
                             
-                            // Use blocking send since we're in a blocking context
-                            if let Err(e) = tx.blocking_send(msg) {
-                                error!("Failed to send immediate output: {}", e);
-                            } else {
-                                info!("Sent immediate output for session {}", session_id_string);
+                            // If we got data, try once more after a brief pause
+                            if n > 0 {
+                                std::thread::sleep(Duration::from_millis(5));
                             }
                         }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            debug!("Would block on attempt {}", attempts);
+                            if accumulated_output.is_empty() && attempts < 2 {
+                                // No data yet, wait a bit more
+                                std::thread::sleep(Duration::from_millis(10));
+                            } else {
+                                // We have some data or tried enough times
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Error reading output on attempt {}: {}", attempts, e);
+                            break;
+                        }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        debug!("No immediate output (would block)");
-                    }
-                    Err(e) => {
-                        warn!("Error reading immediate output: {}", e);
-                    }
+                } else {
+                    error!("Failed to clone reader");
+                    break;
                 }
+                
+                attempts += 1;
             }
             
-            Ok::<(), String>(())
+            if !accumulated_output.is_empty() {
+                info!("Total output captured: {} bytes after {} attempts", 
+                      accumulated_output.len(), attempts);
+                
+                // Log first few chars for debugging
+                let preview = String::from_utf8_lossy(
+                    &accumulated_output[..accumulated_output.len().min(50)]
+                );
+                info!("Output preview: {:?}", preview);
+            } else {
+                warn!("No output captured after {} attempts", attempts);
+            }
+            
+            Ok::<Vec<u8>, String>(accumulated_output)
         }).await.map_err(|e| format!("Failed to write task: {}", e))??;
         
         debug!("Input processing complete for terminal {}", session_id);
-        Ok(())
+        Ok(output)
     }
     
     /// Read output from terminal
@@ -537,11 +554,23 @@ pub async fn handle_terminal_message(
                 }));
             }
             
-            // Write to terminal - this will also check for immediate output
+            // Write to terminal and get immediate output
             match manager.write_to_terminal(&session_id, &decoded).await {
-                Ok(()) => {
-                    info!("Successfully wrote {} bytes to terminal {}", decoded.len(), session_id);
-                    Ok(None) // Output will be sent by the write_to_terminal function
+                Ok(output) => {
+                    info!("Successfully wrote to terminal {}, got {} bytes output", 
+                          session_id, output.len());
+                    
+                    // If we got output, return it immediately
+                    if !output.is_empty() {
+                        let encoded = base64::encode(&output);
+                        Ok(Some(TerminalMessage::Output {
+                            session_id,
+                            data: encoded,
+                        }))
+                    } else {
+                        // No immediate output (will be sent by output reader task)
+                        Ok(None)
+                    }
                 }
                 Err(e) => {
                     error!("Failed to write to terminal {}: {}", session_id, e);
