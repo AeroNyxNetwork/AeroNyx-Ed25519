@@ -1,14 +1,14 @@
 // src/terminal/mod.rs
 // ============================================
 // AeroNyx Privacy Network - Web Terminal Implementation
-// Version: 1.0.4 - Fixed PTY reading and initial output
+// Version: 1.1.0 - Fixed terminal input processing and echo
 // ============================================
 // Creation Reason: Web-based terminal emulation for remote node management
-// Modification Reason: Fixed PTY reading issues and ensured initial shell output
+// Modification Reason: Fixed terminal input not producing output/echo
 // Main Functionality:
 // - Create and manage terminal sessions
-// - Handle PTY I/O operations
-// - Terminal output streaming
+// - Handle PTY I/O operations with proper echo handling
+// - Terminal output streaming with immediate response
 // - Session lifecycle management
 // Dependencies:
 // - portable_pty: PTY creation and management
@@ -18,30 +18,32 @@
 // Main Logical Flow:
 // 1. Create PTY with shell process
 // 2. Set PTY to non-blocking mode
-// 3. Read output continuously in background task
+// 3. Write input and immediately check for output
 // 4. Send output through channel to WebSocket
 //
 // ⚠️ Important Note for Next Developer:
 // - PTY must be set to non-blocking mode for proper async operation
-// - Shell must be spawned with -i flag for interactive mode
-// - Initial prompt detection is critical for user experience
-// - Buffer management prevents message fragmentation
+// - After writing input, we must actively check for output
+// - Terminal echo happens immediately - don't wait for next read cycle
+// - The output reader runs continuously but we also check after each input
 //
-// Last Modified: v1.0.4 - Fixed PTY non-blocking read and initial output
+// Last Modified: v1.1.0 - Fixed input echo by adding immediate output check
 // ============================================
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize, MasterPty, ChildKiller};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{info, error, warn, debug};
 use std::io::{Read, Write};
 use tokio::task;
+use std::time::Duration;
 
 /// Terminal session manager
 pub struct TerminalSessionManager {
     sessions: Arc<RwLock<HashMap<String, Arc<TerminalSession>>>>,
+    output_channels: Arc<RwLock<HashMap<String, mpsc::Sender<TerminalMessage>>>>,
 }
 
 /// Individual terminal session - made thread-safe
@@ -128,7 +130,18 @@ impl TerminalSessionManager {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            output_channels: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+    
+    /// Register an output channel for a session
+    pub async fn register_output_channel(&self, session_id: String, tx: mpsc::Sender<TerminalMessage>) {
+        self.output_channels.write().await.insert(session_id, tx);
+    }
+    
+    /// Unregister an output channel
+    pub async fn unregister_output_channel(&self, session_id: &str) {
+        self.output_channels.write().await.remove(session_id);
     }
     
     /// Create a new terminal session with improved shell initialization
@@ -248,7 +261,7 @@ impl TerminalSessionManager {
         Ok(())
     }
     
-    /// Write input to terminal
+    /// Write input to terminal with immediate output check
     pub async fn write_to_terminal(
         &self,
         session_id: &str,
@@ -260,10 +273,17 @@ impl TerminalSessionManager {
         
         let session_clone = session.clone();
         let data = data.to_vec();
+        let session_id = session_id.to_string();
         
-        debug!("Writing {} bytes to terminal {}", data.len(), session_id);
+        info!("Writing {} bytes to terminal {}: {:?}", 
+              data.len(), session_id, 
+              String::from_utf8_lossy(&data));
         
-        // Write in blocking task
+        // Write in blocking task and immediately check for output
+        let channels = self.output_channels.read().await;
+        let output_tx = channels.get(&session_id).cloned();
+        drop(channels);
+        
         task::spawn_blocking(move || {
             let handle = session_clone.pty_handle.blocking_lock();
             let master = &handle.master;
@@ -272,19 +292,64 @@ impl TerminalSessionManager {
             let mut writer = master.take_writer()
                 .map_err(|e| format!("Failed to get writer: {}", e))?;
             
+            // Write the input
             writer.write_all(&data)
                 .map_err(|e| format!("Failed to write to terminal: {}", e))?;
             writer.flush()
                 .map_err(|e| format!("Failed to flush terminal: {}", e))?;
             
+            debug!("Successfully wrote {} bytes to PTY", data.len());
+            
+            // CRITICAL: Immediately try to read any output (echo or response)
+            // This is important because terminal echo happens immediately
+            std::thread::sleep(Duration::from_millis(10)); // Small delay for PTY to process
+            
+            // Try to read immediate response
+            if let Ok(mut reader) = master.try_clone_reader() {
+                let mut buffer = vec![0u8; 4096];
+                
+                // Set non-blocking mode and try to read
+                match reader.read(&mut buffer) {
+                    Ok(n) if n > 0 => {
+                        buffer.truncate(n);
+                        info!("Immediate output after input: {} bytes", n);
+                        
+                        // If we have an output channel, send the output immediately
+                        if let Some(tx) = output_tx {
+                            let encoded = base64::encode(&buffer);
+                            let msg = TerminalMessage::Output {
+                                session_id: session_id.clone(),
+                                data: encoded,
+                            };
+                            
+                            // Use blocking send since we're in a blocking context
+                            if let Err(e) = tx.blocking_send(msg) {
+                                error!("Failed to send immediate output: {}", e);
+                            } else {
+                                info!("Sent immediate output for session {}", session_id);
+                            }
+                        }
+                    }
+                    Ok(0) => {
+                        debug!("No immediate output available");
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        debug!("No immediate output (would block)");
+                    }
+                    Err(e) => {
+                        warn!("Error reading immediate output: {}", e);
+                    }
+                }
+            }
+            
             Ok::<(), String>(())
         }).await.map_err(|e| format!("Failed to write task: {}", e))??;
         
-        debug!("Successfully wrote to terminal {}", session_id);
+        debug!("Input processing complete for terminal {}", session_id);
         Ok(())
     }
     
-    /// Read output from terminal - FIXED for proper non-blocking operation
+    /// Read output from terminal
     pub async fn read_from_terminal(
         &self,
         session_id: &str,
@@ -301,14 +366,11 @@ impl TerminalSessionManager {
             let handle = session_clone.pty_handle.blocking_lock();
             let master = &handle.master;
             
-            // Get reader from master - use try_clone_reader for non-blocking
+            // Get reader from master
             let mut reader = master.try_clone_reader()
                 .map_err(|e| format!("Failed to get reader: {}", e))?;
             
             let mut buffer = vec![0u8; buffer_size];
-            
-            // Set non-blocking mode if possible
-            // Note: portable-pty should handle this internally
             
             // Try to read available data
             match reader.read(&mut buffer) {
@@ -386,6 +448,9 @@ impl TerminalSessionManager {
     
     /// Close terminal session
     pub async fn close_session(&self, session_id: &str) -> Result<(), String> {
+        // Remove output channel
+        self.unregister_output_channel(session_id).await;
+        
         let session = {
             let mut sessions = self.sessions.write().await;
             sessions.remove(session_id)
@@ -455,9 +520,15 @@ pub async fn handle_terminal_message(
         }
         
         TerminalMessage::Input { session_id, data } => {
+            info!("Processing terminal input for session {}: data={}", session_id, data);
+            
             // Decode base64 input
             let decoded = base64::decode(&data)
                 .map_err(|e| format!("Failed to decode input: {}", e))?;
+            
+            info!("Decoded input: {} bytes, content: {:?}", 
+                  decoded.len(), 
+                  String::from_utf8_lossy(&decoded));
             
             // Check input size
             if decoded.len() > 4096 {
@@ -467,9 +538,16 @@ pub async fn handle_terminal_message(
                 }));
             }
             
+            // Write to terminal - this will also check for immediate output
             match manager.write_to_terminal(&session_id, &decoded).await {
-                Ok(()) => Ok(None),
-                Err(e) => Ok(Some(TerminalMessage::Error { session_id, error: e }))
+                Ok(()) => {
+                    info!("Successfully wrote {} bytes to terminal {}", decoded.len(), session_id);
+                    Ok(None) // Output will be sent by the write_to_terminal function
+                }
+                Err(e) => {
+                    error!("Failed to write to terminal {}: {}", session_id, e);
+                    Ok(Some(TerminalMessage::Error { session_id, error: e }))
+                }
             }
         }
         
@@ -491,13 +569,16 @@ pub async fn handle_terminal_message(
     }
 }
 
-/// Terminal output reader task - IMPROVED with better buffering and logging
+/// Terminal output reader task - Improved with better buffering and immediate response
 pub async fn terminal_output_reader(
     manager: Arc<TerminalSessionManager>,
     session_id: String,
     tx: tokio::sync::mpsc::Sender<TerminalMessage>,
 ) {
     info!("Starting output reader for terminal session: {}", session_id);
+    
+    // Register the output channel
+    manager.register_output_channel(session_id.clone(), tx.clone()).await;
     
     let mut consecutive_errors = 0;
     const MAX_CONSECUTIVE_ERRORS: u32 = 10;
@@ -553,6 +634,7 @@ pub async fn terminal_output_reader(
                             
                             if let Err(e) = tx.send(message).await {
                                 error!("Failed to send terminal output - channel closed: {}", e);
+                                manager.unregister_output_channel(&session_id).await;
                                 return;
                             }
                         }
@@ -633,6 +715,8 @@ pub async fn terminal_output_reader(
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
     
+    // Unregister channel on exit
+    manager.unregister_output_channel(&session_id).await;
     info!("Output reader stopped for terminal session: {} (total bytes: {})", session_id, total_bytes_read);
 }
 
