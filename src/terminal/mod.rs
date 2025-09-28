@@ -260,26 +260,25 @@ impl TerminalSessionManager {
         Ok(())
     }
     
-    /// Write input to terminal with immediate output check
+    /// Write input to terminal (simplified - output reader will capture echo)
     pub async fn write_to_terminal(
         &self,
         session_id: &str,
         data: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<(), String> {
         let sessions = self.sessions.read().await;
         let session = sessions.get(session_id)
             .ok_or_else(|| "Session not found".to_string())?;
         
         let session_clone = session.clone();
         let data = data.to_vec();
-        let session_id_string = session_id.to_string();
         
         info!("Writing {} bytes to terminal {}: {:?}", 
-              data.len(), session_id_string, 
+              data.len(), session_id, 
               String::from_utf8_lossy(&data));
         
-        // Write in blocking task and immediately read output
-        let output = task::spawn_blocking(move || {
+        // Write in blocking task
+        task::spawn_blocking(move || {
             let handle = session_clone.pty_handle.blocking_lock();
             let master = &handle.master;
             
@@ -295,74 +294,14 @@ impl TerminalSessionManager {
             
             info!("Successfully wrote {} bytes to PTY", data.len());
             
-            // CRITICAL: Immediately read output (echo + any response)
-            // Give PTY a moment to process and echo
-            std::thread::sleep(Duration::from_millis(20));
+            // The output reader task will capture the echo and any response
+            // No need to read here since the reader is continuously running
             
-            let mut accumulated_output = Vec::new();
-            let mut attempts = 0;
-            const MAX_ATTEMPTS: u32 = 5;
-            
-            // Try multiple times to capture all immediate output
-            while attempts < MAX_ATTEMPTS {
-                if let Ok(mut reader) = master.try_clone_reader() {
-                    let mut buffer = vec![0u8; 4096];
-                    
-                    match reader.read(&mut buffer) {
-                        Ok(0) => {
-                            debug!("EOF on attempt {}", attempts);
-                            break;
-                        }
-                        Ok(n) => {
-                            info!("Read {} bytes on attempt {}", n, attempts);
-                            accumulated_output.extend_from_slice(&buffer[..n]);
-                            
-                            // If we got data, try once more after a brief pause
-                            if n > 0 {
-                                std::thread::sleep(Duration::from_millis(5));
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            debug!("Would block on attempt {}", attempts);
-                            if accumulated_output.is_empty() && attempts < 2 {
-                                // No data yet, wait a bit more
-                                std::thread::sleep(Duration::from_millis(10));
-                            } else {
-                                // We have some data or tried enough times
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Error reading output on attempt {}: {}", attempts, e);
-                            break;
-                        }
-                    }
-                } else {
-                    error!("Failed to clone reader");
-                    break;
-                }
-                
-                attempts += 1;
-            }
-            
-            if !accumulated_output.is_empty() {
-                info!("Total output captured: {} bytes after {} attempts", 
-                      accumulated_output.len(), attempts);
-                
-                // Log first few chars for debugging
-                let preview = String::from_utf8_lossy(
-                    &accumulated_output[..accumulated_output.len().min(50)]
-                );
-                info!("Output preview: {:?}", preview);
-            } else {
-                warn!("No output captured after {} attempts", attempts);
-            }
-            
-            Ok::<Vec<u8>, String>(accumulated_output)
+            Ok::<(), String>(())
         }).await.map_err(|e| format!("Failed to write task: {}", e))??;
         
-        debug!("Input processing complete for terminal {}", session_id);
-        Ok(output)
+        debug!("Input written to terminal {}", session_id);
+        Ok(())
     }
     
     /// Read output from terminal
@@ -554,23 +493,12 @@ pub async fn handle_terminal_message(
                 }));
             }
             
-            // Write to terminal and get immediate output
+            // Write to terminal - output reader will capture echo
             match manager.write_to_terminal(&session_id, &decoded).await {
-                Ok(output) => {
-                    info!("Successfully wrote to terminal {}, got {} bytes output", 
-                          session_id, output.len());
-                    
-                    // If we got output, return it immediately
-                    if !output.is_empty() {
-                        let encoded = base64::encode(&output);
-                        Ok(Some(TerminalMessage::Output {
-                            session_id,
-                            data: encoded,
-                        }))
-                    } else {
-                        // No immediate output (will be sent by output reader task)
-                        Ok(None)
-                    }
+                Ok(()) => {
+                    info!("Successfully wrote {} bytes to terminal {}", decoded.len(), session_id);
+                    // The output reader task will send the echo/response
+                    Ok(None)
                 }
                 Err(e) => {
                     error!("Failed to write to terminal {}: {}", session_id, e);
@@ -597,7 +525,7 @@ pub async fn handle_terminal_message(
     }
 }
 
-/// Terminal output reader task - Fixed continuous reading
+/// Terminal output reader task - Fixed with non-blocking mode and adaptive polling
 pub async fn terminal_output_reader(
     manager: Arc<TerminalSessionManager>,
     session_id: String,
@@ -636,16 +564,36 @@ pub async fn terminal_output_reader(
             }
         };
         
-        let mut consecutive_errors = 0;
-        const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+        // CRITICAL: Set non-blocking mode explicitly
+        // This is essential for proper async operation
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = reader.as_raw_fd();
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+                if flags != -1 {
+                    let result = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    if result != -1 {
+                        info!("Successfully set PTY to non-blocking mode (fd={})", fd);
+                    } else {
+                        error!("Failed to set non-blocking mode on PTY");
+                    }
+                } else {
+                    error!("Failed to get PTY flags");
+                }
+            }
+        }
+        
         let mut total_bytes_read = 0usize;
         let mut buffer = vec![0u8; 4096];
+        let mut last_read_time = std::time::Instant::now();
+        let mut session_alive = true;
         
-        info!("PTY reader ready for session {}", session_id_clone);
+        info!("PTY reader ready for session {} (non-blocking mode set)", session_id_clone);
         
         // Continuous reading loop
-        loop {
-            // Try to read from PTY
+        while session_alive {
             match reader.read(&mut buffer) {
                 Ok(0) => {
                     // EOF - terminal closed
@@ -657,11 +605,12 @@ pub async fn terminal_output_reader(
                         error: "Terminal closed".to_string(),
                     });
                     
-                    break;
+                    session_alive = false;
                 }
                 Ok(n) => {
+                    // Successfully read data
                     total_bytes_read += n;
-                    consecutive_errors = 0;
+                    last_read_time = std::time::Instant::now();
                     
                     info!("Read {} bytes from PTY (total: {})", n, total_bytes_read);
                     
@@ -669,7 +618,7 @@ pub async fn terminal_output_reader(
                     let preview = String::from_utf8_lossy(&buffer[..n.min(100)]);
                     debug!("PTY output preview: {:?}", preview);
                     
-                    // Encode and send
+                    // Encode and send IMMEDIATELY
                     let encoded = base64::encode(&buffer[..n]);
                     let msg = TerminalMessage::Output {
                         session_id: session_id_clone.clone(),
@@ -678,37 +627,62 @@ pub async fn terminal_output_reader(
                     
                     if let Err(e) = tx_clone.blocking_send(msg) {
                         error!("Failed to send terminal output: {}", e);
-                        break;
+                        session_alive = false;
+                    } else {
+                        info!("Sent {} bytes of output for session {}", n, session_id_clone);
                     }
                     
-                    info!("Sent {} bytes of output for session {}", n, session_id_clone);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No data available, sleep briefly
-                    std::thread::sleep(Duration::from_millis(10));
+                    // After successful read, try to read more immediately
+                    // (there might be more data available)
                     continue;
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || 
+                         e.kind() == std::io::ErrorKind::Again => {
+                    // No data available right now - this is normal for non-blocking I/O
+                    
+                    // Adaptive sleep based on recent activity
+                    let sleep_duration = if last_read_time.elapsed() < Duration::from_secs(1) {
+                        // Recent activity - check frequently
+                        Duration::from_millis(5)
+                    } else if last_read_time.elapsed() < Duration::from_secs(10) {
+                        // Some recent activity
+                        Duration::from_millis(20)
+                    } else {
+                        // No recent activity - can sleep longer
+                        Duration::from_millis(50)
+                    };
+                    
+                    std::thread::sleep(sleep_duration);
+                    
+                    // Check for timeout (no data for extended period)
+                    if last_read_time.elapsed() > Duration::from_secs(300) {
+                        // 5 minutes without data - session might be dead
+                        warn!("No data for 5 minutes, checking session health");
+                        
+                        // Try to write a null byte to check if PTY is still alive
+                        if let Err(e) = handle.master.take_writer()
+                            .and_then(|mut w| w.write(&[0]).map(|_| ())) {
+                            error!("PTY appears to be dead: {}", e);
+                            session_alive = false;
+                        }
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                    // Interrupted, retry
+                    // Interrupted - just retry immediately
                     continue;
                 }
                 Err(e) => {
-                    consecutive_errors += 1;
-                    error!("PTY read error #{}: {}", consecutive_errors, e);
+                    // Unexpected error
+                    error!("PTY read error: {} (kind: {:?})", e, e.kind());
                     
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        error!("Too many consecutive PTY read errors");
-                        
-                        let _ = tx_clone.blocking_send(TerminalMessage::Error {
-                            session_id: session_id_clone.clone(),
-                            error: format!("Terminal read error: {}", e),
-                        });
-                        
-                        break;
-                    }
-                    
-                    // Sleep before retry
+                    // Don't give up immediately - might be temporary
                     std::thread::sleep(Duration::from_millis(100));
+                    
+                    // Check if we haven't read anything for a while
+                    if last_read_time.elapsed() > Duration::from_secs(30) {
+                        error!("No successful reads for 30 seconds, stopping reader");
+                        session_alive = false;
+                    }
                 }
             }
         }
