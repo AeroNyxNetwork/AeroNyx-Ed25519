@@ -1,10 +1,10 @@
 // src/registration/websocket/connection.rs
 // ============================================
 // WebSocket connection management and lifecycle
-// Version: 1.1.0 - Fixed terminal blocking issue
+// Version: 1.2.0 - Fixed terminal input message routing
 // ============================================
 // Creation Reason: Manages WebSocket connections between node and backend
-// Modification Reason: Fixed event loop blocking caused by terminal output processing
+// Modification Reason: Fixed terminal input messages being incorrectly parsed as ServerMessage::Unknown
 // Main Functionality:
 // - WebSocket connection establishment with retry logic
 // - Message routing and processing
@@ -15,17 +15,19 @@
 // Main Logical Flow:
 // 1. Establish WebSocket connection with retry
 // 2. Authenticate with backend
-// 3. Process messages in event loop with proper priority
-// 4. Handle terminal I/O without blocking ping/pong
-// 5. Maintain heartbeat for connection health
+// 3. Check message type BEFORE parsing to ServerMessage enum
+// 4. Route terminal messages directly to terminal handler
+// 5. Process other messages through appropriate handlers
+// 6. Maintain heartbeat for connection health
 //
 // ⚠️ Important Note for Next Developer:
-// - The terminal output check MUST be rate-limited to prevent blocking
+// - Terminal messages (term_input, term_resize, term_close) must be checked BEFORE ServerMessage parsing
+// - The ServerMessage::Unknown variant will catch ANY unmatched type due to #[serde(other)]
+// - Terminal output check MUST be rate-limited to prevent blocking
 // - WebSocket ping/pong messages have priority over terminal output
-// - Terminal check interval is set to 50ms to balance responsiveness and CPU usage
 // - Never remove the terminal_check_interval - it prevents connection drops
 //
-// Last Modified: v1.1.0 - Added rate limiting for terminal output checks
+// Last Modified: v1.2.0 - Fixed message routing for terminal input
 // ============================================
 
 use crate::registration::{RegistrationManager, WebSocketMessage};
@@ -351,6 +353,7 @@ impl RegistrationManager {
     }
     
     /// Handle incoming WebSocket messages
+    /// FIXED: Check for terminal messages BEFORE attempting to parse as ServerMessage
     async fn handle_incoming_message(
         &self,
         message: Result<Message, tokio_tungstenite::tungstenite::Error>,
@@ -364,7 +367,22 @@ impl RegistrationManager {
             Ok(Message::Text(text)) => {
                 debug!("Received text message: {} bytes", text.len());
                 
-                // Try to parse as structured message first
+                // CRITICAL FIX: Check for terminal messages FIRST
+                // This prevents them from being caught by ServerMessage::Unknown
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
+                        // Check if this is a client-to-server terminal message
+                        if matches!(msg_type, "term_input" | "term_resize" | "term_close") {
+                            info!("Processing terminal message type: {}", msg_type);
+                            
+                            // Handle terminal message directly
+                            self.handle_terminal_message_json(&json, write, terminal_tracker).await?;
+                            return Ok(true);
+                        }
+                    }
+                }
+                
+                // Now try to parse as ServerMessage for server-to-client messages
                 if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
                     // Update heartbeat acknowledgment for relevant messages
                     if matches!(server_msg, ServerMessage::HeartbeatAck { .. }) {
@@ -525,10 +543,8 @@ impl RegistrationManager {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
             if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
                 match msg_type {
-                    // Terminal-specific messages
-                    "term_init" | "term_input" | "term_resize" | "term_close" => {
-                        self.handle_terminal_message_json(&json, write, terminal_tracker).await?;
-                    }
+                    // NOTE: Terminal input messages are now handled in handle_incoming_message
+                    // before reaching here, so we don't need these cases anymore
                     
                     // Terminal ready response
                     "term_ready" => {
@@ -570,12 +586,15 @@ impl RegistrationManager {
     }
     
     /// Handle terminal-specific messages
+    /// This function is called for client-to-server terminal messages
     async fn handle_terminal_message_json(
         &self,
         json: &serde_json::Value,
         write: &mut WsSink,
         terminal_tracker: &mut TerminalSessionTracker,
     ) -> Result<(), String> {
+        info!("Processing terminal message: {}", json);
+        
         // Check if remote management is enabled
         if !*self.remote_management_enabled.read().await {
             let session_id = json.get("session_id")
@@ -594,50 +613,70 @@ impl RegistrationManager {
         }
         
         // Parse and handle terminal message
-        if let Ok(term_msg) = serde_json::from_value::<TerminalMessage>(json.clone()) {
-            let terminal_manager = self.get_terminal_manager();
-            
-            match super::terminal::handle_terminal_message(&terminal_manager, term_msg).await {
-                Ok(Some(response)) => {
-                    let response_json = serde_json::to_string(&response)
-                        .unwrap_or_else(|_| "{}".to_string());
-                    
-                    write.send(Message::Text(response_json)).await
-                        .map_err(|e| format!("Failed to send terminal response: {}", e))?;
-                    
-                    // Handle special responses
-                    if let TerminalMessage::Ready { session_id } = response {
-                        // Create output channel
-                        let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
-                        terminal_tracker.insert(session_id.clone(), rx);
+        match serde_json::from_value::<TerminalMessage>(json.clone()) {
+            Ok(term_msg) => {
+                info!("Successfully parsed terminal message: {:?}", term_msg);
+                
+                let terminal_manager = self.get_terminal_manager();
+                
+                match super::terminal::handle_terminal_message(&terminal_manager, term_msg).await {
+                    Ok(Some(response)) => {
+                        let response_json = serde_json::to_string(&response)
+                            .unwrap_or_else(|_| "{}".to_string());
                         
-                        // Start output reader
-                        self.start_terminal_output_reader(
-                            terminal_manager.clone(),
-                            session_id,
-                            tx
-                        ).await;
+                        write.send(Message::Text(response_json)).await
+                            .map_err(|e| format!("Failed to send terminal response: {}", e))?;
+                        
+                        // Handle special responses
+                        if let TerminalMessage::Ready { session_id } = response {
+                            // Create output channel
+                            let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
+                            terminal_tracker.insert(session_id.clone(), rx);
+                            
+                            // Start output reader
+                            self.start_terminal_output_reader(
+                                terminal_manager.clone(),
+                                session_id,
+                                tx
+                            ).await;
+                        }
+                    }
+                    Ok(None) => {
+                        info!("Terminal message processed successfully, no response needed");
+                    }
+                    Err(e) => {
+                        error!("Terminal message handling error: {}", e);
+                        
+                        let session_id = json.get("session_id")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("unknown");
+                        
+                        let error_response = serde_json::json!({
+                            "type": "term_error",
+                            "session_id": session_id,
+                            "error": e.to_string()
+                        });
+                        
+                        write.send(Message::Text(error_response.to_string())).await
+                            .map_err(|e| format!("Failed to send error response: {}", e))?;
                     }
                 }
-                Ok(None) => {
-                    // No response needed
-                }
-                Err(e) => {
-                    error!("Terminal message handling error: {}", e);
-                    
-                    let session_id = json.get("session_id")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("unknown");
-                    
-                    let error_response = serde_json::json!({
-                        "type": "term_error",
-                        "session_id": session_id,
-                        "error": e.to_string()
-                    });
-                    
-                    write.send(Message::Text(error_response.to_string())).await
-                        .map_err(|e| format!("Failed to send error response: {}", e))?;
-                }
+            }
+            Err(e) => {
+                error!("Failed to parse terminal message: {}, JSON was: {}", e, json);
+                
+                let session_id = json.get("session_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("unknown");
+                
+                let error_response = serde_json::json!({
+                    "type": "term_error",
+                    "session_id": session_id,
+                    "error": format!("Failed to parse message: {}", e)
+                });
+                
+                write.send(Message::Text(error_response.to_string())).await
+                    .map_err(|e| format!("Failed to send error response: {}", e))?;
             }
         }
         
