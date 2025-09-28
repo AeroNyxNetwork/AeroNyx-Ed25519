@@ -1,14 +1,13 @@
 // src/terminal/mod.rs
 // ============================================
 // AeroNyx Privacy Network - Production Terminal Implementation
-// Version: 3.0.0 - Industry-standard implementation with thread-based I/O
+// Version: 3.0.1 - Fixed bracket structure and EOF handling
 // ============================================
 // Architecture Overview:
 // - Thread-based I/O handling for blocking PTY operations
 // - Channel-based communication between threads and async runtime
 // - Robust error handling and recovery mechanisms
-// - Performance-optimized with minimal latency
-// - Compatible with portable_pty's blocking I/O model
+// - Keeps child process alive to prevent premature EOF
 // ============================================
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize, MasterPty, ChildKiller};
@@ -497,121 +496,6 @@ impl PtyBridge {
             _master: master_handle,
         })
     }
-        
-        // Reader thread
-        let reader_clone = reader.clone();
-        let reader_thread = thread::spawn(move || {
-            let mut buffer = vec![0u8; READ_BUFFER_SIZE];
-            let mut total_bytes = 0u64;
-            let mut consecutive_errors = 0;
-            const MAX_ERRORS: u32 = 10;
-            
-            info!("PTY reader thread started");
-            
-            loop {
-                let mut reader_guard = reader_clone.blocking_lock();
-                match reader_guard.read(&mut buffer) {
-                    Ok(0) => {
-                        info!("PTY reader: EOF received after {} bytes", total_bytes);
-                        // Send EOF notification
-                        let _ = output_tx.send(Vec::new());
-                        break;
-                    }
-                    Ok(n) => {
-                        total_bytes += n as u64;
-                        consecutive_errors = 0;
-                        
-                        // Log first few bytes for debugging
-                        if total_bytes <= 100 {
-                            debug!("PTY reader: read {} bytes: {:?}", n, 
-                                   String::from_utf8_lossy(&buffer[..n.min(50)]));
-                        } else {
-                            debug!("PTY reader: read {} bytes (total: {})", n, total_bytes);
-                        }
-                        
-                        if output_tx.send(buffer[..n].to_vec()).is_err() {
-                            warn!("PTY reader: channel closed");
-                            break;
-                        }
-                    }
-                    Err(e) if e.kind() == ErrorKind::Interrupted => {
-                        continue; // Retry on interrupt
-                    }
-                    Err(e) => {
-                        consecutive_errors += 1;
-                        error!("PTY reader error (attempt {}/{}): {}", consecutive_errors, MAX_ERRORS, e);
-                        
-                        if consecutive_errors >= MAX_ERRORS {
-                            error!("PTY reader: too many errors, exiting");
-                            break;
-                        }
-                        
-                        // Wait before retry
-                        drop(reader_guard);
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                }
-            }
-            
-            info!("PTY reader thread ended (total bytes: {})", total_bytes);
-        });
-        
-        // Writer thread
-        let writer_clone = writer.clone();
-        let writer_thread = thread::spawn(move || {
-            let mut total_bytes = 0u64;
-            
-            info!("PTY writer thread started");
-            
-            while let Ok(data) = input_rx.recv() {
-                if data.is_empty() {
-                    debug!("PTY writer: received empty data, ignoring");
-                    continue;
-                }
-                
-                let mut writer_guard = writer_clone.blocking_lock();
-                
-                // Debug log for first few writes
-                if total_bytes < 100 {
-                    debug!("PTY writer: writing {} bytes: {:?}", 
-                           data.len(), String::from_utf8_lossy(&data[..data.len().min(50)]));
-                }
-                
-                match writer_guard.write_all(&data) {
-                    Ok(()) => {
-                        match writer_guard.flush() {
-                            Ok(()) => {
-                                total_bytes += data.len() as u64;
-                                debug!("PTY writer: wrote {} bytes (total: {})", data.len(), total_bytes);
-                            }
-                            Err(e) => {
-                                error!("PTY writer flush error: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("PTY writer error: {}", e);
-                        break;
-                    }
-                }
-            }
-            
-            info!("PTY writer thread ended (total bytes: {})", total_bytes);
-        });
-        
-        // Store the child handle to keep it alive
-        let child_handle = child.clone();
-        
-        Ok(Self {
-            output_rx,
-            input_tx,
-            reader_thread: Mutex::new(Some(reader_thread)),
-            writer_thread: Mutex::new(Some(writer_thread)),
-            _child_handle: child_handle,
-            _master: Arc::new(Mutex::new(master)),
-        })
-    }
     
     /// Read output from PTY (async wrapper)
     async fn read(&self) -> Option<Vec<u8>> {
@@ -723,7 +607,7 @@ pub async fn terminal_output_reader(
         while session.active.load(Ordering::Relaxed) {
             // Read from PTY bridge (this internally uses the blocking thread)
             match session.pty_bridge.read().await {
-                Some(data) => {
+                Some(data) if !data.is_empty() => {
                     let data_len = data.len();
                     total_bytes += data_len as u64;
                     
@@ -746,13 +630,18 @@ pub async fn terminal_output_reader(
                         *last_activity = Instant::now();
                     }
                 }
-                None => {
-                    // Channel closed or EOF
-                    info!("Output reader: PTY closed for session {}", session_id_clone);
+                Some(_) => {
+                    // Empty data indicates EOF
+                    info!("Output reader: EOF received for session {}", session_id_clone);
                     let _ = tx.send(TerminalMessage::Error {
                         session_id: session_id_clone.clone(),
                         error: "Terminal closed".to_string(),
                     }).await;
+                    break;
+                }
+                None => {
+                    // Channel closed
+                    info!("Output reader: channel closed for session {}", session_id_clone);
                     break;
                 }
             }
