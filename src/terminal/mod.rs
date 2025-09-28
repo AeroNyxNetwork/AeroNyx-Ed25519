@@ -65,6 +65,8 @@ struct PtyBridge {
     input_tx: Sender<Vec<u8>>,
     reader_thread: Mutex<Option<thread::JoinHandle<()>>>,
     writer_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    _child_handle: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
+    _master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
 }
 
 /// PTY handle wrapper
@@ -374,44 +376,66 @@ impl PtyBridge {
         let (input_tx, input_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(CHANNEL_BUFFER_SIZE);
         
         let PtyHandle { master, child } = pty_handle;
-        let master = Arc::new(Mutex::new(master));
-        let _child = Arc::new(Mutex::new(Some(child)));
         
-        // Reader thread
-        let reader_master = master.clone();
+        // CRITICAL: Keep the child process alive by storing it
+        let child = Arc::new(Mutex::new(Some(child)));
+        
+        // Clone reader for the reader thread
+        let mut reader = master.try_clone_reader()
+            .map_err(|e| format!("Failed to clone reader: {}", e))?;
+        
+        // Get writer for the writer thread
+        let mut writer = master.take_writer()
+            .map_err(|e| format!("Failed to get writer: {}", e))?;
+        
+        // Reader thread - owns the reader
         let reader_thread = thread::spawn(move || {
             let mut buffer = vec![0u8; READ_BUFFER_SIZE];
             let mut total_bytes = 0u64;
+            let mut consecutive_errors = 0;
+            const MAX_ERRORS: u32 = 10;
+            
+            info!("PTY reader thread started");
             
             loop {
-                let mut master_guard = reader_master.blocking_lock();
-                match master_guard.try_clone_reader() {
-                    Ok(mut reader) => {
-                        drop(master_guard); // Release lock before blocking read
+                match reader.read(&mut buffer) {
+                    Ok(0) => {
+                        info!("PTY reader: EOF received after {} bytes", total_bytes);
+                        // Send empty vec to signal EOF
+                        let _ = output_tx.send(Vec::new());
+                        break;
+                    }
+                    Ok(n) => {
+                        total_bytes += n as u64;
+                        consecutive_errors = 0;
                         
-                        match reader.read(&mut buffer) {
-                            Ok(0) => {
-                                info!("PTY reader: EOF received");
-                                break;
-                            }
-                            Ok(n) => {
-                                total_bytes += n as u64;
-                                debug!("PTY reader: read {} bytes (total: {})", n, total_bytes);
-                                
-                                if output_tx.send(buffer[..n].to_vec()).is_err() {
-                                    warn!("PTY reader: channel closed");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                error!("PTY reader error: {}", e);
-                                break;
-                            }
+                        // Log first few bytes for debugging
+                        if total_bytes <= 100 {
+                            debug!("PTY reader: read {} bytes: {:?}", n, 
+                                   String::from_utf8_lossy(&buffer[..n.min(50)]));
+                        } else {
+                            debug!("PTY reader: read {} bytes (total: {})", n, total_bytes);
+                        }
+                        
+                        if output_tx.send(buffer[..n].to_vec()).is_err() {
+                            warn!("PTY reader: channel closed");
+                            break;
                         }
                     }
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {
+                        continue; // Retry on interrupt
+                    }
                     Err(e) => {
-                        error!("Failed to clone reader: {}", e);
-                        break;
+                        consecutive_errors += 1;
+                        error!("PTY reader error (attempt {}/{}): {}", consecutive_errors, MAX_ERRORS, e);
+                        
+                        if consecutive_errors >= MAX_ERRORS {
+                            error!("PTY reader: too many errors, exiting");
+                            break;
+                        }
+                        
+                        // Wait before retry
+                        thread::sleep(Duration::from_millis(100));
                     }
                 }
             }
@@ -419,31 +443,39 @@ impl PtyBridge {
             info!("PTY reader thread ended (total bytes: {})", total_bytes);
         });
         
-        // Writer thread
-        let writer_master = master.clone();
+        // Writer thread - owns the writer
         let writer_thread = thread::spawn(move || {
             let mut total_bytes = 0u64;
             
+            info!("PTY writer thread started");
+            
             while let Ok(data) = input_rx.recv() {
-                let mut master_guard = writer_master.blocking_lock();
-                match master_guard.take_writer() {
-                    Ok(mut writer) => {
-                        drop(master_guard); // Release lock before writing
-                        
-                        match writer.write_all(&data) {
+                if data.is_empty() {
+                    debug!("PTY writer: received empty data, ignoring");
+                    continue;
+                }
+                
+                // Debug log for first few writes
+                if total_bytes < 100 {
+                    debug!("PTY writer: writing {} bytes: {:?}", 
+                           data.len(), String::from_utf8_lossy(&data[..data.len().min(50)]));
+                }
+                
+                match writer.write_all(&data) {
+                    Ok(()) => {
+                        match writer.flush() {
                             Ok(()) => {
-                                let _ = writer.flush();
                                 total_bytes += data.len() as u64;
                                 debug!("PTY writer: wrote {} bytes (total: {})", data.len(), total_bytes);
                             }
                             Err(e) => {
-                                error!("PTY writer error: {}", e);
+                                error!("PTY writer flush error: {}", e);
                                 break;
                             }
                         }
                     }
                     Err(e) => {
-                        error!("Failed to get writer: {}", e);
+                        error!("PTY writer error: {}", e);
                         break;
                     }
                 }
@@ -452,11 +484,132 @@ impl PtyBridge {
             info!("PTY writer thread ended (total bytes: {})", total_bytes);
         });
         
+        // Store handles to keep them alive
+        let child_handle = child.clone();
+        let master_handle = Arc::new(Mutex::new(master));
+        
         Ok(Self {
             output_rx,
             input_tx,
             reader_thread: Mutex::new(Some(reader_thread)),
             writer_thread: Mutex::new(Some(writer_thread)),
+            _child_handle: child_handle,
+            _master: master_handle,
+        })
+    }
+        
+        // Reader thread
+        let reader_clone = reader.clone();
+        let reader_thread = thread::spawn(move || {
+            let mut buffer = vec![0u8; READ_BUFFER_SIZE];
+            let mut total_bytes = 0u64;
+            let mut consecutive_errors = 0;
+            const MAX_ERRORS: u32 = 10;
+            
+            info!("PTY reader thread started");
+            
+            loop {
+                let mut reader_guard = reader_clone.blocking_lock();
+                match reader_guard.read(&mut buffer) {
+                    Ok(0) => {
+                        info!("PTY reader: EOF received after {} bytes", total_bytes);
+                        // Send EOF notification
+                        let _ = output_tx.send(Vec::new());
+                        break;
+                    }
+                    Ok(n) => {
+                        total_bytes += n as u64;
+                        consecutive_errors = 0;
+                        
+                        // Log first few bytes for debugging
+                        if total_bytes <= 100 {
+                            debug!("PTY reader: read {} bytes: {:?}", n, 
+                                   String::from_utf8_lossy(&buffer[..n.min(50)]));
+                        } else {
+                            debug!("PTY reader: read {} bytes (total: {})", n, total_bytes);
+                        }
+                        
+                        if output_tx.send(buffer[..n].to_vec()).is_err() {
+                            warn!("PTY reader: channel closed");
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {
+                        continue; // Retry on interrupt
+                    }
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        error!("PTY reader error (attempt {}/{}): {}", consecutive_errors, MAX_ERRORS, e);
+                        
+                        if consecutive_errors >= MAX_ERRORS {
+                            error!("PTY reader: too many errors, exiting");
+                            break;
+                        }
+                        
+                        // Wait before retry
+                        drop(reader_guard);
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+            
+            info!("PTY reader thread ended (total bytes: {})", total_bytes);
+        });
+        
+        // Writer thread
+        let writer_clone = writer.clone();
+        let writer_thread = thread::spawn(move || {
+            let mut total_bytes = 0u64;
+            
+            info!("PTY writer thread started");
+            
+            while let Ok(data) = input_rx.recv() {
+                if data.is_empty() {
+                    debug!("PTY writer: received empty data, ignoring");
+                    continue;
+                }
+                
+                let mut writer_guard = writer_clone.blocking_lock();
+                
+                // Debug log for first few writes
+                if total_bytes < 100 {
+                    debug!("PTY writer: writing {} bytes: {:?}", 
+                           data.len(), String::from_utf8_lossy(&data[..data.len().min(50)]));
+                }
+                
+                match writer_guard.write_all(&data) {
+                    Ok(()) => {
+                        match writer_guard.flush() {
+                            Ok(()) => {
+                                total_bytes += data.len() as u64;
+                                debug!("PTY writer: wrote {} bytes (total: {})", data.len(), total_bytes);
+                            }
+                            Err(e) => {
+                                error!("PTY writer flush error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("PTY writer error: {}", e);
+                        break;
+                    }
+                }
+            }
+            
+            info!("PTY writer thread ended (total bytes: {})", total_bytes);
+        });
+        
+        // Store the child handle to keep it alive
+        let child_handle = child.clone();
+        
+        Ok(Self {
+            output_rx,
+            input_tx,
+            reader_thread: Mutex::new(Some(reader_thread)),
+            writer_thread: Mutex::new(Some(writer_thread)),
+            _child_handle: child_handle,
+            _master: Arc::new(Mutex::new(master)),
         })
     }
     
