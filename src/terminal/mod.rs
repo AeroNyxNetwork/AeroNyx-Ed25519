@@ -597,7 +597,7 @@ pub async fn handle_terminal_message(
     }
 }
 
-/// Terminal output reader task - Improved with better buffering and immediate response
+/// Terminal output reader task - Fixed continuous reading
 pub async fn terminal_output_reader(
     manager: Arc<TerminalSessionManager>,
     session_id: String,
@@ -605,147 +605,122 @@ pub async fn terminal_output_reader(
 ) {
     info!("Starting output reader for terminal session: {}", session_id);
     
-    // Register the output channel
-    manager.register_output_channel(session_id.clone(), tx.clone()).await;
+    // Get the session once
+    let session = {
+        let sessions = manager.sessions.read().await;
+        sessions.get(&session_id).cloned()
+    };
     
-    let mut consecutive_errors = 0;
-    const MAX_CONSECUTIVE_ERRORS: u32 = 10;
-    let mut buffer = Vec::with_capacity(4096);
-    let mut last_send = std::time::Instant::now();
-    let mut total_bytes_read = 0usize;
-    let mut last_log = std::time::Instant::now();
-    let mut initial_output_sent = false;
-    
-    // Give the shell a moment to start and produce initial output
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    
-    loop {
-        // Check if session still exists
-        if !manager.has_session(&session_id).await {
-            info!("Session {} no longer exists, stopping output reader", session_id);
-            break;
+    let session = match session {
+        Some(s) => s,
+        None => {
+            error!("Session {} not found for output reader", session_id);
+            return;
         }
+    };
+    
+    // Create a dedicated reader in blocking context
+    let session_id_clone = session_id.clone();
+    let tx_clone = tx.clone();
+    
+    // Spawn blocking task for continuous reading
+    let read_handle = task::spawn_blocking(move || {
+        let handle = session.pty_handle.blocking_lock();
         
-        // Try to read from terminal
-        match manager.read_from_terminal(&session_id, 4096).await {
-            Ok(data) => {
-                if !data.is_empty() {
-                    info!("Read {} bytes from terminal {}", data.len(), session_id);
-                    total_bytes_read += data.len();
-                    consecutive_errors = 0;
-                    buffer.extend_from_slice(&data);
-                    
-                    // Log the actual content for debugging (first output only)
-                    if !initial_output_sent {
-                        let preview = String::from_utf8_lossy(&data[..data.len().min(100)]);
-                        info!("Initial terminal output preview: {:?}", preview);
-                        initial_output_sent = true;
-                    }
-                    
-                    // Send immediately for initial output or if buffer has enough data
-                    let should_send = !initial_output_sent ||
-                        buffer.len() >= 1024 ||
-                        last_send.elapsed() > tokio::time::Duration::from_millis(50) ||
-                        buffer.contains(&b'\n') ||
-                        buffer.contains(&b'\r');
-                    
-                    if should_send && !buffer.is_empty() {
-                        info!("Sending {} bytes of terminal output for session {}", buffer.len(), session_id);
-                        
-                        // Split into chunks if too large
-                        for chunk in buffer.chunks(1024 * 1024) { // 1MB chunks
-                            let encoded = base64::encode(chunk);
-                            let message = TerminalMessage::Output {
-                                session_id: session_id.clone(),
-                                data: encoded,
-                            };
-                            
-                            if let Err(e) = tx.send(message).await {
-                                error!("Failed to send terminal output - channel closed: {}", e);
-                                manager.unregister_output_channel(&session_id).await;
-                                return;
-                            }
-                        }
-                        
-                        buffer.clear();
-                        last_send = std::time::Instant::now();
-                    }
-                } else {
-                    // Log status periodically
-                    if last_log.elapsed() > std::time::Duration::from_secs(10) {
-                        debug!("Terminal {} reader active, total bytes read: {}", session_id, total_bytes_read);
-                        last_log = std::time::Instant::now();
-                    }
-                }
-            }
+        // Get a reader once and keep using it
+        let mut reader = match handle.master.try_clone_reader() {
+            Ok(r) => r,
             Err(e) => {
-                // Check if it's a "session not found" error
-                if e.contains("Session not found") {
-                    info!("Session {} ended, total bytes read: {}", session_id, total_bytes_read);
-                    
-                    // Send any remaining buffered data
-                    if !buffer.is_empty() {
-                        let encoded = base64::encode(&buffer);
-                        let _ = tx.send(TerminalMessage::Output {
-                            session_id: session_id.clone(),
-                            data: encoded,
-                        }).await;
-                    }
-                    
-                    // Send process exit message
-                    let _ = tx.send(TerminalMessage::Error {
-                        session_id: session_id.clone(),
-                        error: "Process exited".to_string(),
-                    }).await;
-                    
-                    break;
-                }
-                
-                consecutive_errors += 1;
-                warn!("Error #{} reading terminal {}: {}", consecutive_errors, session_id, e);
-                
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                    error!("Too many consecutive errors reading terminal output: {}", e);
+                error!("Failed to create PTY reader: {}", e);
+                return;
+            }
+        };
+        
+        let mut consecutive_errors = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+        let mut total_bytes_read = 0usize;
+        let mut buffer = vec![0u8; 4096];
+        
+        info!("PTY reader ready for session {}", session_id_clone);
+        
+        // Continuous reading loop
+        loop {
+            // Try to read from PTY
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    // EOF - terminal closed
+                    info!("Terminal EOF for session {}", session_id_clone);
                     
                     // Send error message
-                    let _ = tx.send(TerminalMessage::Error {
-                        session_id: session_id.clone(),
-                        error: format!("Terminal read error: {}", e),
-                    }).await;
+                    let _ = tx_clone.blocking_send(TerminalMessage::Error {
+                        session_id: session_id_clone.clone(),
+                        error: "Terminal closed".to_string(),
+                    });
                     
                     break;
                 }
-                
-                // Brief pause before retry
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                Ok(n) => {
+                    total_bytes_read += n;
+                    consecutive_errors = 0;
+                    
+                    info!("Read {} bytes from PTY (total: {})", n, total_bytes_read);
+                    
+                    // Log first 100 chars for debugging
+                    let preview = String::from_utf8_lossy(&buffer[..n.min(100)]);
+                    debug!("PTY output preview: {:?}", preview);
+                    
+                    // Encode and send
+                    let encoded = base64::encode(&buffer[..n]);
+                    let msg = TerminalMessage::Output {
+                        session_id: session_id_clone.clone(),
+                        data: encoded,
+                    };
+                    
+                    if let Err(e) = tx_clone.blocking_send(msg) {
+                        error!("Failed to send terminal output: {}", e);
+                        break;
+                    }
+                    
+                    info!("Sent {} bytes of output for session {}", n, session_id_clone);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No data available, sleep briefly
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    // Interrupted, retry
+                    continue;
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    error!("PTY read error #{}: {}", consecutive_errors, e);
+                    
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        error!("Too many consecutive PTY read errors");
+                        
+                        let _ = tx_clone.blocking_send(TerminalMessage::Error {
+                            session_id: session_id_clone.clone(),
+                            error: format!("Terminal read error: {}", e),
+                        });
+                        
+                        break;
+                    }
+                    
+                    // Sleep before retry
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
         }
         
-        // Send buffered data after timeout
-        if !buffer.is_empty() && last_send.elapsed() > tokio::time::Duration::from_millis(50) {
-            info!("Sending buffered {} bytes for session {} (timeout)", buffer.len(), session_id);
-            let encoded = base64::encode(&buffer);
-            let message = TerminalMessage::Output {
-                session_id: session_id.clone(),
-                data: encoded,
-            };
-            
-            if let Err(e) = tx.send(message).await {
-                error!("Failed to send terminal output - channel closed: {}", e);
-                break;
-            }
-            
-            buffer.clear();
-            last_send = std::time::Instant::now();
-        }
-        
-        // Small delay to prevent CPU spinning
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    }
+        info!("PTY reader stopped for session {} (total bytes: {})", 
+              session_id_clone, total_bytes_read);
+    });
     
-    // Unregister channel on exit
-    manager.unregister_output_channel(&session_id).await;
-    info!("Output reader stopped for terminal session: {} (total bytes: {})", session_id, total_bytes_read);
+    // Wait for the blocking task to complete
+    let _ = read_handle.await;
+    
+    info!("Output reader stopped for terminal session: {}", session_id);
 }
 
 // Implement Default for TerminalSessionManager
