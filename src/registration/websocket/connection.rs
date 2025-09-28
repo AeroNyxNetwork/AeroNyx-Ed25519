@@ -369,8 +369,11 @@ impl RegistrationManager {
                 
                 // CRITICAL FIX: Check for terminal messages FIRST
                 // This prevents them from being caught by ServerMessage::Unknown
+                // Parse JSON once and check the type
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(msg_type) = json.get("type").and_then(|t| t.as_str()) {
+                        debug!("Message type detected: {}", msg_type);
+                        
                         // Check if this is a client-to-server terminal message
                         if matches!(msg_type, "term_input" | "term_resize" | "term_close") {
                             info!("Processing terminal message type: {}", msg_type);
@@ -379,10 +382,18 @@ impl RegistrationManager {
                             self.handle_terminal_message_json(&json, write, terminal_tracker).await?;
                             return Ok(true);
                         }
+                        
+                        // Check if it's a heartbeat ack (common 114-116 byte messages)
+                        if msg_type == "heartbeat_ack" || msg_type == "pong" {
+                            debug!("Received heartbeat/pong response");
+                            state.last_heartbeat_ack = std::time::Instant::now();
+                            state.missed_heartbeats = 0;
+                            return Ok(true);
+                        }
                     }
                 }
                 
-                // Now try to parse as ServerMessage for server-to-client messages
+                // Now try to parse as ServerMessage for other server-to-client messages
                 if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
                     // Update heartbeat acknowledgment for relevant messages
                     if matches!(server_msg, ServerMessage::HeartbeatAck { .. }) {
