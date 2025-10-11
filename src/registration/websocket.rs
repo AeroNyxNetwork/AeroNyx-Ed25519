@@ -1,19 +1,19 @@
 // src/registration/websocket.rs
 // ============================================
 // AeroNyx Privacy Network - WebSocket Communication Module
-// Version: 1.0.3 - Complete implementation with proper heartbeat handling
+// Version: 1.0.4 - Fixed compilation errors and method references
 // ============================================
 // Copyright (c) 2024 AeroNyx Team
 // SPDX-License-Identifier: MIT
 //
 // Creation Reason: WebSocket connection management for node communication
-// Modification Reason: Fixed heartbeat implementation and field naming consistency
+// Modification Reason: Fixed send_message method reference and compilation errors
 // Main Functionality:
 // - WebSocket connection establishment and maintenance
 // - Message handling and routing
 // - Heartbeat and metrics reporting with correct field names
 // Dependencies:
-// - connection.rs: Connection lifecycle management
+// - connection.rs: Connection lifecycle management and WebSocket trait
 // - handlers.rs: Message processing
 // - terminal.rs: Terminal-specific handlers
 // - ../registration.rs: Provides get_terminal_manager
@@ -32,8 +32,9 @@
 // - WebSocket reconnection logic is critical for reliability
 // - Heartbeat messages maintain connection alive status
 // - CRITICAL: Use 'memory' and 'network' field names in heartbeat metrics for Django compatibility
+// - send_heartbeat is called through WebSocket connection context, not directly on RegistrationManager
 //
-// Last Modified: v1.0.3 - Fixed heartbeat field naming for Django compatibility
+// Last Modified: v1.0.4 - Fixed method references and compilation errors
 // ============================================
 
 use super::{RegistrationManager, WebSocketMessage, LegacyHeartbeatMetrics};
@@ -47,6 +48,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn, error, debug};
 use std::error::Error;
+use tokio_tungstenite::tungstenite::Message;
 
 // Sub-modules
 mod connection;
@@ -163,8 +165,9 @@ impl RegistrationManager {
         }
     }
 
-    /// Send periodic heartbeat messages with Django-compatible field names
-    pub async fn send_heartbeat(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+    /// Create a heartbeat message that can be sent through a WebSocket connection
+    /// This returns the serialized message ready to be sent
+    pub async fn create_heartbeat_websocket_message(&self) -> Result<Message, Box<dyn Error + Send + Sync>> {
         use crate::registration::types::LegacyHeartbeatMetrics;
         use crate::utils;
         
@@ -196,7 +199,7 @@ impl RegistrationManager {
         };
         
         // Log the metrics for debugging
-        info!("Sending heartbeat - CPU: {:.1}%, Memory: {:.1}%, Disk: {:.1}%, Network: {:.1} KB/s",
+        info!("Creating heartbeat - CPU: {:.1}%, Memory: {:.1}%, Disk: {:.1}%, Network: {:.1} KB/s",
               metrics.cpu, metrics.memory, metrics.disk, metrics.network);
         
         // Debug: Verify JSON format has correct field names
@@ -213,16 +216,34 @@ impl RegistrationManager {
             }
         }
         
-        // Create and send heartbeat message
+        // Create heartbeat message
         let message = WebSocketMessage::Heartbeat {
             status: "active".to_string(),
             uptime_seconds,
             metrics,
         };
         
-        // Send the message
-        self.send_message(message).await?;
+        // Serialize to JSON and wrap in WebSocket text message
+        let json = serde_json::to_string(&message)?;
+        Ok(Message::Text(json))
+    }
+
+    /// Send heartbeat through an active WebSocket connection
+    /// This method should be called from within a WebSocket connection context
+    /// where `ws_stream` is available
+    pub async fn send_heartbeat_through_connection<S>(
+        &self,
+        ws_stream: &mut S,
+    ) -> Result<(), Box<dyn Error + Send + Sync>>
+    where
+        S: futures_util::Sink<Message> + Unpin,
+        S::Error: Error + Send + Sync + 'static,
+    {
+        use futures_util::SinkExt;
         
+        let heartbeat_msg = self.create_heartbeat_websocket_message().await?;
+        ws_stream.send(heartbeat_msg).await?;
+        info!("Heartbeat sent successfully");
         Ok(())
     }
 
@@ -292,6 +313,10 @@ impl RegistrationManager {
     // Example usage from this file:
     // let terminal_mgr = self.get_terminal_manager();
     // self.start_terminal_output_reader(session_id, tx).await;
+    //
+    // The send_message method is part of the WebSocket connection trait,
+    // not directly on RegistrationManager. Use it through the connection:
+    // ws_stream.send(message).await
     // ============================================
     
     /// Helper method to validate heartbeat metrics before sending
@@ -348,22 +373,47 @@ mod tests {
     
     #[tokio::test]
     async fn test_websocket_url_construction() {
-        let mut manager = RegistrationManager::new("https://api.example.com".to_string());
+        // Create a test instance
+        let api_url = "https://api.example.com".to_string();
         
         // Test HTTPS to WSS conversion
-        manager.api_url = "https://api.example.com".to_string();
-        let ws_url = manager.api_url
+        let ws_url = api_url
             .replace("https://", "wss://")
             .replace("http://", "ws://");
         let ws_url = format!("{}/ws/aeronyx/node/", ws_url.trim_end_matches('/'));
         assert_eq!(ws_url, "wss://api.example.com/ws/aeronyx/node/");
         
         // Test HTTP to WS conversion
-        manager.api_url = "http://localhost:8000".to_string();
-        let ws_url = manager.api_url
+        let api_url = "http://localhost:8000".to_string();
+        let ws_url = api_url
             .replace("https://", "wss://")
             .replace("http://", "ws://");
         let ws_url = format!("{}/ws/aeronyx/node/", ws_url.trim_end_matches('/'));
         assert_eq!(ws_url, "ws://localhost:8000/ws/aeronyx/node/");
+    }
+    
+    #[tokio::test]
+    async fn test_heartbeat_message_creation() {
+        use crate::registration::RegistrationManager;
+        
+        // Create a test registration manager
+        let manager = RegistrationManager::new("https://api.example.com".to_string());
+        
+        // Create heartbeat message
+        let result = manager.create_heartbeat_websocket_message().await;
+        
+        // Should create a valid WebSocket message
+        assert!(result.is_ok(), "Should create heartbeat message successfully");
+        
+        if let Ok(Message::Text(json)) = result {
+            // Verify it's valid JSON
+            assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+            
+            // Verify it contains expected fields
+            assert!(json.contains("\"status\":\"active\""));
+            assert!(json.contains("\"metrics\""));
+            assert!(json.contains("\"memory\""));  // Not 'mem'
+            assert!(json.contains("\"network\"")); // Not 'net'
+        }
     }
 }
