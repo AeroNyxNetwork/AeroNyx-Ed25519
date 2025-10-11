@@ -139,7 +139,7 @@ impl RegistrationManager {
     
     /// Alternative memory usage calculation method for Linux
     #[cfg(target_os = "linux")]
-    async fn get_memory_usage_alternative(&self) -> Result<f64, Box<dyn std::error::Error>> {
+    async fn get_memory_usage_alternative(&self) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         let content = tokio::fs::read_to_string("/proc/meminfo").await?;
         
         let mut mem_total = None;
@@ -214,7 +214,7 @@ impl RegistrationManager {
     
     /// Read network statistics from /proc/net/dev
     #[cfg(target_os = "linux")]
-    pub async fn read_network_stats(&self) -> Result<NetworkStats, Box<dyn std::error::Error>> {
+    pub async fn read_network_stats(&self) -> Result<NetworkStats, Box<dyn std::error::Error + Send + Sync>> {
         let content = tokio::fs::read_to_string("/proc/net/dev").await?;
         
         let mut total_rx_bytes = 0u64;
@@ -265,13 +265,13 @@ impl RegistrationManager {
     }
     
     #[cfg(not(target_os = "linux"))]
-    pub async fn read_network_stats(&self) -> Result<NetworkStats, Box<dyn std::error::Error>> {
+    pub async fn read_network_stats(&self) -> Result<NetworkStats, Box<dyn std::error::Error + Send + Sync>> {
         Ok(NetworkStats::default())
     }
     
     /// Try to detect the actual network link speed
     #[cfg(target_os = "linux")]
-    pub async fn detect_link_speed(&self) -> Result<u64, Box<dyn std::error::Error>> {
+    pub async fn detect_link_speed(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Try to read speed from common network interfaces
         let interfaces = ["eth0", "enp3s0", "ens3", "eno1", "enp0s3", "enp0s25", "em1"];
         
@@ -293,7 +293,7 @@ impl RegistrationManager {
     }
     
     #[cfg(not(target_os = "linux"))]
-    pub async fn detect_link_speed(&self) -> Result<u64, Box<dyn std::error::Error>> {
+    pub async fn detect_link_speed(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Default to 1 Gbps for non-Linux systems
         Ok(1000)
     }
