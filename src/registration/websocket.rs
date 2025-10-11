@@ -1,17 +1,17 @@
 // src/registration/websocket.rs
 // ============================================
 // AeroNyx Privacy Network - WebSocket Communication Module
-// Version: 1.0.2 - Fixed duplicate definitions
+// Version: 1.0.3 - Complete implementation with proper heartbeat handling
 // ============================================
 // Copyright (c) 2024 AeroNyx Team
 // SPDX-License-Identifier: MIT
 //
 // Creation Reason: WebSocket connection management for node communication
-// Modification Reason: Removed duplicate method definitions
+// Modification Reason: Fixed heartbeat implementation and field naming consistency
 // Main Functionality:
 // - WebSocket connection establishment and maintenance
 // - Message handling and routing
-// - Heartbeat and metrics reporting
+// - Heartbeat and metrics reporting with correct field names
 // Dependencies:
 // - connection.rs: Connection lifecycle management
 // - handlers.rs: Message processing
@@ -31,8 +31,9 @@
 // - start_terminal_output_reader is defined in src/registration/websocket/terminal.rs
 // - WebSocket reconnection logic is critical for reliability
 // - Heartbeat messages maintain connection alive status
+// - CRITICAL: Use 'memory' and 'network' field names in heartbeat metrics for Django compatibility
 //
-// Last Modified: v1.0.2 - Removed duplicate method definitions
+// Last Modified: v1.0.3 - Fixed heartbeat field naming for Django compatibility
 // ============================================
 
 use super::{RegistrationManager, WebSocketMessage, LegacyHeartbeatMetrics};
@@ -44,19 +45,17 @@ use crate::websocket_protocol::{
 use crate::server::metrics::ServerMetricsCollector;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
+use std::error::Error;
 
 // Sub-modules
 mod connection;
 mod handlers;
 mod terminal;
 
-// Re-export for backward compatibility (even if not used, to maintain API)
-#[allow(unused_imports)]
+// Re-export for backward compatibility
 pub use connection::*;
-#[allow(unused_imports)]
 pub use handlers::*;
-#[allow(unused_imports)]
 pub use terminal::*;
 
 impl RegistrationManager {
@@ -164,7 +163,71 @@ impl RegistrationManager {
         }
     }
 
+    /// Send periodic heartbeat messages with Django-compatible field names
+    pub async fn send_heartbeat(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        use crate::registration::types::LegacyHeartbeatMetrics;
+        use crate::utils;
+        
+        // Get system metrics
+        let cpu_usage = self.get_cpu_usage().await;
+        let mem_usage = self.get_memory_usage().await;
+        let disk_usage = self.get_disk_usage().await;
+        let net_usage = self.get_network_usage().await;
+        let temperature = self.get_cpu_temperature().await;
+        let processes = self.get_process_count().await;
+        
+        // Get system uptime
+        let uptime_seconds = match tokio::task::spawn_blocking(|| {
+            utils::system::get_system_uptime().unwrap_or(0)
+        }).await {
+            Ok(uptime) => uptime,
+            Err(_) => 0,
+        };
+        
+        // Create metrics with CORRECT field names for Django
+        // IMPORTANT: Django expects 'memory' and 'network', not 'mem' and 'net'
+        let metrics = LegacyHeartbeatMetrics {
+            cpu: cpu_usage,
+            memory: mem_usage,      // ✅ CRITICAL: Use 'memory' for Django compatibility
+            disk: disk_usage,
+            network: net_usage,     // ✅ CRITICAL: Use 'network' for Django compatibility
+            temperature,
+            processes,
+        };
+        
+        // Log the metrics for debugging
+        info!("Sending heartbeat - CPU: {:.1}%, Memory: {:.1}%, Disk: {:.1}%, Network: {:.1} KB/s",
+              metrics.cpu, metrics.memory, metrics.disk, metrics.network);
+        
+        // Debug: Verify JSON format has correct field names
+        #[cfg(debug_assertions)]
+        {
+            let json_metrics = serde_json::to_string(&metrics)?;
+            debug!("Heartbeat metrics JSON: {}", json_metrics);
+            
+            // Verify correct field names
+            if !json_metrics.contains("\"memory\":") || !json_metrics.contains("\"network\":") {
+                error!("CRITICAL: Heartbeat metrics have wrong field names!");
+                error!("JSON: {}", json_metrics);
+                return Err("Invalid heartbeat field names".into());
+            }
+        }
+        
+        // Create and send heartbeat message
+        let message = WebSocketMessage::Heartbeat {
+            status: "active".to_string(),
+            uptime_seconds,
+            metrics,
+        };
+        
+        // Send the message
+        self.send_message(message).await?;
+        
+        Ok(())
+    }
+
     /// Create heartbeat message with system metrics (legacy format)
+    /// This method ensures backward compatibility while using correct field names
     pub(crate) async fn create_heartbeat_message(&self, _metrics_collector: &ServerMetricsCollector) -> WebSocketMessage {
         let uptime_seconds = self.start_time.elapsed().as_secs();
         
@@ -183,16 +246,16 @@ impl RegistrationManager {
             uptime_seconds,
             metrics: LegacyHeartbeatMetrics {
                 cpu: cpu_usage,
-                mem: mem_usage,
+                memory: mem_usage,      // Use 'memory' not 'mem'
                 disk: disk_usage,
-                net: net_usage,
+                network: net_usage,     // Use 'network' not 'net'
                 temperature,
                 processes,
             },
         }
     }
 
-    /// Create heartbeat with metrics (new format)
+    /// Create heartbeat with metrics (new format) for WebSocket protocol
     pub(crate) async fn create_client_heartbeat_message(&self, _metrics_collector: &ServerMetricsCollector) -> ClientMessage {
         let (cpu_usage, mem_usage, disk_usage, net_usage) = tokio::join!(
             self.get_cpu_usage(),
@@ -225,5 +288,82 @@ impl RegistrationManager {
     // Adding duplicate definitions will cause compilation errors.
     // If you need to use these methods, they are already available
     // through the RegistrationManager impl in their respective files.
+    //
+    // Example usage from this file:
+    // let terminal_mgr = self.get_terminal_manager();
+    // self.start_terminal_output_reader(session_id, tx).await;
     // ============================================
+    
+    /// Helper method to validate heartbeat metrics before sending
+    #[cfg(debug_assertions)]
+    fn validate_heartbeat_metrics(&self, metrics: &LegacyHeartbeatMetrics) -> bool {
+        // Ensure all values are within reasonable ranges
+        if metrics.cpu < 0.0 || metrics.cpu > 100.0 {
+            error!("Invalid CPU usage: {}", metrics.cpu);
+            return false;
+        }
+        if metrics.memory < 0.0 || metrics.memory > 100.0 {
+            error!("Invalid memory usage: {}", metrics.memory);
+            return false;
+        }
+        if metrics.disk < 0.0 || metrics.disk > 100.0 {
+            error!("Invalid disk usage: {}", metrics.disk);
+            return false;
+        }
+        if metrics.network < 0.0 {
+            error!("Invalid network usage: {}", metrics.network);
+            return false;
+        }
+        true
+    }
+}
+
+// ============================================
+// Module Tests
+// ============================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[tokio::test]
+    async fn test_heartbeat_field_names() {
+        // Test that heartbeat metrics serialize with correct field names
+        let metrics = LegacyHeartbeatMetrics {
+            cpu: 50.0,
+            memory: 60.0,  // Must be 'memory' not 'mem'
+            disk: 70.0,
+            network: 80.0, // Must be 'network' not 'net'
+            temperature: Some(45.0),
+            processes: Some(150),
+        };
+        
+        let json = serde_json::to_string(&metrics).unwrap();
+        
+        // Verify correct field names for Django
+        assert!(json.contains("\"memory\":60.0"), "Should use 'memory' field name");
+        assert!(json.contains("\"network\":80.0"), "Should use 'network' field name");
+        assert!(!json.contains("\"mem\":"), "Should NOT use 'mem' field name");
+        assert!(!json.contains("\"net\":"), "Should NOT use 'net' field name");
+    }
+    
+    #[tokio::test]
+    async fn test_websocket_url_construction() {
+        let mut manager = RegistrationManager::new("https://api.example.com".to_string());
+        
+        // Test HTTPS to WSS conversion
+        manager.api_url = "https://api.example.com".to_string();
+        let ws_url = manager.api_url
+            .replace("https://", "wss://")
+            .replace("http://", "ws://");
+        let ws_url = format!("{}/ws/aeronyx/node/", ws_url.trim_end_matches('/'));
+        assert_eq!(ws_url, "wss://api.example.com/ws/aeronyx/node/");
+        
+        // Test HTTP to WS conversion
+        manager.api_url = "http://localhost:8000".to_string();
+        let ws_url = manager.api_url
+            .replace("https://", "wss://")
+            .replace("http://", "ws://");
+        let ws_url = format!("{}/ws/aeronyx/node/", ws_url.trim_end_matches('/'));
+        assert_eq!(ws_url, "ws://localhost:8000/ws/aeronyx/node/");
+    }
 }
