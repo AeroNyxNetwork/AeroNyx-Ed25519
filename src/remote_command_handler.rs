@@ -170,7 +170,7 @@ impl RemoteCommandHandler {
         request_id: String,
         command: RemoteCommandData,
     ) -> RemoteCommandResponse {
-        let start_time = std::time::Instant::now();
+        let _start_time = std::time::Instant::now();
         
         let result = match command.command_type.as_str() {
             "execute" => self.handle_execute(command).await,
