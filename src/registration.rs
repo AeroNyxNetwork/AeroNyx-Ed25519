@@ -169,9 +169,9 @@ impl RegistrationManager {
     /// Call this method periodically to track network usage over time
     pub async fn update_network_stats(&self, new_stats: NetworkStats) {
         let mut last_stats = self.last_network_stats.write().await;
-        *last_stats = Some(new_stats);
         debug!("Network stats updated: TX={} bytes, RX={} bytes", 
                new_stats.bytes_sent, new_stats.bytes_received);
+        *last_stats = Some(new_stats);
     }
     
     /// Get the last network statistics
