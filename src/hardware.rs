@@ -1,17 +1,36 @@
 // src/hardware.rs
+// ============================================
 // AeroNyx Privacy Network - Hardware Information Collection Module
-// Version: 1.0.0
-// 
+// Version: 1.0.1 - Fixed compilation warnings
+// ============================================
 // Copyright (c) 2024 AeroNyx Team
 // SPDX-License-Identifier: MIT
 //
-// This module is responsible for collecting hardware information from the host system
-// and generating stable hardware fingerprints for node identification and security.
-// The fingerprint algorithm focuses on stable hardware characteristics that rarely
-// change in cloud environments, avoiding volatile attributes like disk size or memory.
+// Creation Reason: Hardware information collection and fingerprinting
+// Modification Reason: Fixed unused variable warnings and unnecessary mut
+// Main Functionality:
+// - Collect comprehensive hardware information from the host system
+// - Generate stable hardware fingerprints for node identification
+// - Support for both server and mobile platforms
+// - ZKP commitment generation for hardware attestation
+// Dependencies:
+// - zkp_halo2: For generating zero-knowledge commitments
+// - System libraries for hardware detection
 //
-// MOBILE SUPPORT: This module now supports mobile devices (iOS/Android) through
-// conditional compilation and platform-specific implementations.
+// Main Logical Flow:
+// 1. Detect platform (server/mobile)
+// 2. Collect hardware information appropriate to platform
+// 3. Generate stable fingerprint from non-volatile attributes
+// 4. Create ZKP commitment for verification
+//
+// ⚠️ Important Note for Next Developer:
+// - The fingerprint algorithm prioritizes stable attributes
+// - Mobile support uses conditional compilation
+// - Do not use volatile attributes (disk size, available memory) for fingerprinting
+// - The unused bandwidth variable is intentionally prefixed with underscore for future use
+//
+// Last Modified: v1.0.1 - Fixed compilation warnings
+// ============================================
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn, info};
@@ -51,6 +70,9 @@ pub struct HardwareInfo {
     /// Mobile device information (if applicable)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mobile_info: Option<MobileInfo>,
+    /// Network speed in bytes per second (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_speed: Option<u64>,
 }
 
 /// Mobile device specific information
@@ -158,6 +180,23 @@ pub struct BiosInfo {
 }
 
 impl HardwareInfo {
+    /// Calculate network bandwidth capacity
+    /// Returns estimated network speed in bytes per second
+    pub async fn calculate_network_bandwidth(&self) -> u64 {
+        // Prefix with underscore to indicate intentionally unused for now
+        // This will be used in future bandwidth monitoring features
+        let _max_bandwidth_bytes_per_sec = 125_000_000_u64; // 1 Gbps = 125 MB/s
+        
+        // For now, return the detected speed or a conservative estimate
+        match self.network_speed {
+            Some(speed) if speed > 0 => speed,
+            _ => {
+                // Default to 100 Mbps if not detected
+                12_500_000_u64 // 100 Mbps = 12.5 MB/s
+            }
+        }
+    }
+
     /// Generate a stable hardware fingerprint for node identification
     /// This fingerprint uses only stable hardware characteristics that rarely change
     pub fn generate_fingerprint(&self) -> String {
@@ -325,6 +364,7 @@ impl HardwareInfo {
             machine_id: None,
             bios_info: None,
             mobile_info: None,
+            network_speed: None,
         };
         
         // Platform-specific collection
@@ -336,8 +376,30 @@ impl HardwareInfo {
             hw_info.bios_info = Self::collect_bios_info();
         }
         
+        // Detect network speed if possible
+        hw_info.network_speed = Self::detect_network_speed().await;
+        
         debug!("Hardware information collection completed");
         Ok(hw_info)
+    }
+    
+    /// Detect network interface speed
+    async fn detect_network_speed() -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::fs;
+            // Try to read network speed from sysfs
+            for interface in &["eth0", "enp3s0", "ens3", "wlan0"] {
+                let speed_path = format!("/sys/class/net/{}/speed", interface);
+                if let Ok(speed_str) = fs::read_to_string(&speed_path) {
+                    if let Ok(speed_mbps) = speed_str.trim().parse::<u64>() {
+                        // Convert from Mbps to bytes per second
+                        return Some(speed_mbps * 125_000);
+                    }
+                }
+            }
+        }
+        None
     }
     
     /// Get hostname with mobile device support
@@ -709,18 +771,16 @@ impl HardwareInfo {
     }
     
     /// Collect operating system information
+    /// Fixed: Removed unnecessary mut keyword
     fn collect_os_info() -> Result<OsInfo, String> {
-        let mut os_type = std::env::consts::OS.to_string();
+        // FIX: Removed 'mut' - variable is never modified
+        let os_type = std::env::consts::OS.to_string();
         
-        // Detect mobile OS types
+        // Detect mobile OS types with proper shadowing
         #[cfg(target_os = "ios")]
-        {
-            os_type = "ios".to_string();
-        }
+        let os_type = "ios".to_string();
         #[cfg(target_os = "android")]
-        {
-            os_type = "android".to_string();
-        }
+        let os_type = "android".to_string();
         
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         let kernel = sys_info::os_release()
@@ -977,6 +1037,9 @@ impl HardwareInfo {
     }
 }
 
+// ============================================
+// Module Tests
+// ============================================
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,6 +1077,10 @@ mod tests {
         } else {
             assert!(info.mobile_info.is_none());
         }
+        
+        // Test network bandwidth calculation
+        let bandwidth = info.calculate_network_bandwidth().await;
+        assert!(bandwidth > 0, "Network bandwidth should be positive");
     }
     
     #[test]
@@ -1057,6 +1124,7 @@ mod tests {
                 is_physical: true,
                 advertising_id: None,
             }),
+            network_speed: None,
         };
         
         let fingerprint1 = mobile_hw_info.generate_fingerprint();
@@ -1115,6 +1183,7 @@ mod tests {
             machine_id: Some("abcdef1234567890".to_string()),
             bios_info: None,
             mobile_info: None,
+            network_speed: Some(125_000_000), // 1 Gbps
         };
         
         let mut hw_info2 = hw_info1.clone();
@@ -1169,6 +1238,53 @@ mod tests {
         assert_eq!(HardwareInfo::determine_interface_type("weird0"), "other");
     }
     
+    #[tokio::test]
+    async fn test_network_bandwidth_calculation() {
+        let hw_info = HardwareInfo {
+            hostname: "test".to_string(),
+            cpu: CpuInfo {
+                cores: 4,
+                model: "Test CPU".to_string(),
+                frequency: 2400000000,
+                architecture: "x86_64".to_string(),
+                vendor_id: None,
+            },
+            memory: MemoryInfo {
+                total: 8000000000,
+                available: 4000000000,
+            },
+            disk: DiskInfo {
+                total: 500000000000,
+                available: 250000000000,
+                filesystem: "ext4".to_string(),
+            },
+            network: NetworkInfo {
+                interfaces: vec![],
+                public_ip: "1.2.3.4".to_string(),
+            },
+            os: OsInfo {
+                os_type: "linux".to_string(),
+                version: "22.04".to_string(),
+                distribution: "Ubuntu".to_string(),
+                kernel: "5.15.0".to_string(),
+            },
+            system_uuid: None,
+            machine_id: None,
+            bios_info: None,
+            mobile_info: None,
+            network_speed: Some(1_000_000_000), // Set to 1 Gbps for testing
+        };
+        
+        let bandwidth = hw_info.calculate_network_bandwidth().await;
+        assert_eq!(bandwidth, 1_000_000_000, "Should return detected speed");
+        
+        // Test with no detected speed
+        let mut hw_info2 = hw_info.clone();
+        hw_info2.network_speed = None;
+        let bandwidth2 = hw_info2.calculate_network_bandwidth().await;
+        assert_eq!(bandwidth2, 12_500_000, "Should return default 100 Mbps");
+    }
+    
     #[test]
     fn test_zkp_serialization() {
         // Test mobile hardware
@@ -1210,6 +1326,7 @@ mod tests {
                 is_physical: true,
                 advertising_id: None,
             }),
+            network_speed: None,
         };
         
         let mobile_zkp_bytes = mobile_hw.to_zkp_bytes();
@@ -1249,6 +1366,7 @@ mod tests {
             machine_id: None,
             bios_info: None,
             mobile_info: None,
+            network_speed: None,
         };
         
         let server_zkp_bytes = server_hw.to_zkp_bytes();
