@@ -3,6 +3,27 @@
 //!
 //! This module provides functions for interacting with the operating system,
 //! checking system capabilities, and managing resources.
+//!
+//! ============================================
+//! File Creation/Modification Notes
+//! ============================================
+//! Creation Reason: System utilities module for OS interaction
+//! Modification Reason: Fixed get_system_memory() to handle parsing errors better
+//! Main Functionality: System metrics collection, resource management
+//! Dependencies: Used by registration/metrics.rs for system monitoring
+//!
+//! Main Logical Flow:
+//! 1. Check system capabilities (root permissions, platform support)
+//! 2. Collect system metrics (memory, CPU, disk usage)
+//! 3. Manage network interfaces and IP forwarding
+//!
+//! ⚠️ Important Note for Next Developer:
+//! - The memory parsing logic is critical for metrics collection
+//! - Platform-specific code paths must be maintained
+//! - Error handling should gracefully degrade on unsupported platforms
+//!
+//! Last Modified: v1.0.1 - Fixed memory parsing robustness
+//! ============================================
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -32,6 +53,7 @@ pub fn is_root() -> bool {
     }
 }
 
+/// Get disk usage percentage for the root filesystem
 pub fn get_disk_usage() -> io::Result<u8> {
     #[cfg(target_os = "linux")]
     {
@@ -80,6 +102,7 @@ pub fn get_disk_usage() -> io::Result<u8> {
     }
 }
 
+/// Get system uptime in seconds
 pub fn get_system_uptime() -> io::Result<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -105,17 +128,19 @@ pub fn get_system_uptime() -> io::Result<u64> {
     }
 }
 
-/// Get system memory information with better error handling
+/// Get system memory information with improved error handling
+/// Returns (total_bytes, available_bytes)
 pub fn get_system_memory() -> io::Result<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
         let file = File::open("/proc/meminfo")?;
         let reader = BufReader::new(file);
         
-        let mut total = None;
-        let mut free = None;
-        let mut buffers = None;
-        let mut cached = None;
+        let mut total_kb = None;
+        let mut free_kb = None;
+        let mut buffers_kb = None;
+        let mut cached_kb = None;
+        let mut available_kb = None;
         
         for line in reader.lines() {
             let line = line?;
@@ -125,37 +150,79 @@ pub fn get_system_memory() -> io::Result<(u64, u64)> {
                 continue;
             }
             
+            // Parse the value (second field should be numeric)
+            let value = match parts[1].parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            
             match parts[0] {
                 "MemTotal:" => {
-                    total = parts[1].parse::<u64>().ok();
+                    total_kb = Some(value);
+                    debug!("Found MemTotal: {} kB", value);
                 }
                 "MemFree:" => {
-                    free = parts[1].parse::<u64>().ok();
+                    free_kb = Some(value);
+                    debug!("Found MemFree: {} kB", value);
+                }
+                "MemAvailable:" => {
+                    // Prefer MemAvailable if present (kernel 3.14+)
+                    available_kb = Some(value);
+                    debug!("Found MemAvailable: {} kB", value);
                 }
                 "Buffers:" => {
-                    buffers = parts[1].parse::<u64>().ok();
+                    buffers_kb = Some(value);
+                    debug!("Found Buffers: {} kB", value);
                 }
                 "Cached:" => {
+                    // Make sure we're not parsing SwapCached
                     if !line.contains("SwapCached:") {
-                        cached = parts[1].parse::<u64>().ok();
+                        cached_kb = Some(value);
+                        debug!("Found Cached: {} kB", value);
                     }
                 }
                 _ => {}
             }
             
-            if total.is_some() && free.is_some() && buffers.is_some() && cached.is_some() {
-                break;
+            // If we have MemTotal and MemAvailable, we can return early
+            if let (Some(total), Some(available)) = (total_kb, available_kb) {
+                let total_bytes = total * 1024;
+                let available_bytes = available * 1024;
+                debug!("Using MemAvailable for calculation: total={} bytes, available={} bytes", 
+                       total_bytes, available_bytes);
+                return Ok((total_bytes, available_bytes));
             }
         }
         
-        // Calculate values in bytes
-        if let (Some(total), Some(free), Some(buffers), Some(cached)) = (total, free, buffers, cached) {
+        // Fallback: Calculate available memory from free + buffers + cached
+        // This is the old way before kernel 3.14
+        if let (Some(total), Some(free), Some(buffers), Some(cached)) = 
+            (total_kb, free_kb, buffers_kb, cached_kb) {
+            
             let total_bytes = total * 1024;
             let available_bytes = (free + buffers + cached) * 1024;
+            
+            debug!("Using fallback calculation (free+buffers+cached): total={} bytes, available={} bytes", 
+                   total_bytes, available_bytes);
+            
             return Ok((total_bytes, available_bytes));
         }
         
-        Err(io::Error::new(io::ErrorKind::NotFound, "Could not parse memory info"))
+        // If we at least have total and free, use that as a last resort
+        if let (Some(total), Some(free)) = (total_kb, free_kb) {
+            let total_bytes = total * 1024;
+            let available_bytes = free * 1024;
+            
+            warn!("Using minimal fallback (only free memory): total={} bytes, available={} bytes", 
+                  total_bytes, available_bytes);
+            
+            return Ok((total_bytes, available_bytes));
+        }
+        
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData, 
+            "Could not parse memory info from /proc/meminfo"
+        ))
     }
     
     #[cfg(not(target_os = "linux"))]
@@ -169,7 +236,7 @@ pub fn get_system_memory() -> io::Result<(u64, u64)> {
     }
 }
 
-/// Get CPU load average with better error handling
+/// Get CPU load average (1-minute, 5-minute, 15-minute)
 pub fn get_load_average() -> io::Result<(f64, f64, f64)> {
     #[cfg(target_os = "linux")]
     {
@@ -199,6 +266,7 @@ pub fn get_load_average() -> io::Result<(f64, f64, f64)> {
 }
 
 /// Set up IP forwarding (for VPN server) with improved error handling
+/// Returns true if successfully enabled, false if failed but non-critical
 pub fn enable_ip_forwarding() -> io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
@@ -341,6 +409,7 @@ mod tests {
             Ok((total, available)) => {
                 println!("Total memory: {} bytes, Available: {} bytes", total, available);
                 assert!(total >= available);
+                assert!(total > 0);
             }
             Err(e) => {
                 println!("Error getting system memory: {}", e);
@@ -350,9 +419,37 @@ mod tests {
     }
     
     #[test]
+    fn test_get_load_average() {
+        match get_load_average() {
+            Ok((one, five, fifteen)) => {
+                println!("Load average: {:.2}, {:.2}, {:.2}", one, five, fifteen);
+                assert!(one >= 0.0);
+                assert!(five >= 0.0);
+                assert!(fifteen >= 0.0);
+            }
+            Err(e) => {
+                println!("Error getting load average: {}", e);
+            }
+        }
+    }
+    
+    #[test]
     fn test_interface_exists() {
         // Test with a commonly existing interface name
         let exists = interface_exists("lo");
         println!("Interface 'lo' exists: {}", exists);
+    }
+    
+    #[test]
+    fn test_disk_usage() {
+        match get_disk_usage() {
+            Ok(usage) => {
+                println!("Disk usage: {}%", usage);
+                assert!(usage <= 100);
+            }
+            Err(e) => {
+                println!("Error getting disk usage: {}", e);
+            }
+        }
     }
 }
