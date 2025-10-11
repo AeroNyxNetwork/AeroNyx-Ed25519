@@ -1,12 +1,37 @@
 // src/registration.rs
+// ============================================
 // AeroNyx Privacy Network - Node Registration Module Entry Point
-// Version: 1.0.1
-//
+// Version: 1.1.0 - Added network statistics tracking
+// ============================================
 // Copyright (c) 2024 AeroNyx Team
 // SPDX-License-Identifier: MIT
 //
-// This is the main entry point for the registration module.
-// It re-exports all public types and functionality from the submodules.
+// Creation Reason: Main entry point for the registration module
+// Modification Reason: Added network statistics tracking for accurate bandwidth monitoring
+// Main Functionality:
+// - Node registration and lifecycle management
+// - Hardware fingerprinting and verification
+// - WebSocket connection management
+// - Network statistics tracking for accurate metrics
+// Dependencies:
+// - types: Registration data structures
+// - websocket: WebSocket connection handling
+// - hardware_verification: Hardware change detection
+// - metrics: System metrics collection with network tracking
+//
+// Main Logical Flow:
+// 1. Initialize registration manager with network stats tracking
+// 2. Load existing registration or perform new registration
+// 3. Track network statistics over time for accurate bandwidth calculation
+// 4. Report metrics via heartbeat with real network usage percentages
+//
+// ⚠️ Important Note for Next Developer:
+// - Network stats must be updated before each heartbeat for accurate rates
+// - The last_network_stats field is critical for bandwidth calculation
+// - Network usage is calculated as rate over time, not absolute values
+//
+// Last Modified: v1.1.0 - Added network statistics tracking
+// ============================================
 
 mod types;
 mod websocket;
@@ -49,7 +74,10 @@ use crate::remote_command_handler::{
 };
 use crate::terminal::TerminalSessionManager;
 
-/// Main registration manager handling node lifecycle
+// Import NetworkStats from metrics module
+use crate::registration::metrics::NetworkStats;
+
+/// Main registration manager handling node lifecycle with network tracking
 #[derive(Clone)]
 pub struct RegistrationManager {
     /// HTTP client for API communication
@@ -86,10 +114,17 @@ pub struct RegistrationManager {
     remote_management_enabled: Arc<RwLock<bool>>,
     /// Terminal session manager
     terminal_manager: Arc<TerminalSessionManager>,
+    
+    // ============================================
+    // NEW FIELD FOR NETWORK STATISTICS TRACKING
+    // ============================================
+    /// Last network statistics for rate calculation
+    /// This stores the previous network stats to calculate bandwidth usage over time
+    pub last_network_stats: Arc<RwLock<Option<NetworkStats>>>,
 }
 
 impl RegistrationManager {
-    /// Create a new registration manager instance
+    /// Create a new registration manager instance with network tracking
     pub fn new(api_url: &str) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -125,7 +160,81 @@ impl RegistrationManager {
             remote_command_handler,
             remote_management_enabled: Arc::new(RwLock::new(false)),
             terminal_manager: Arc::new(TerminalSessionManager::new()),
+            // Initialize network stats tracking
+            last_network_stats: Arc::new(RwLock::new(None)),
         }
+    }
+    
+    /// Update network statistics
+    /// Call this method periodically to track network usage over time
+    pub async fn update_network_stats(&self, new_stats: NetworkStats) {
+        let mut last_stats = self.last_network_stats.write().await;
+        *last_stats = Some(new_stats);
+        debug!("Network stats updated: TX={} bytes, RX={} bytes", 
+               new_stats.bytes_sent, new_stats.bytes_received);
+    }
+    
+    /// Get the last network statistics
+    pub async fn get_last_network_stats(&self) -> Option<NetworkStats> {
+        self.last_network_stats.read().await.clone()
+    }
+    
+    /// Calculate actual network usage percentage based on rate over time
+    pub async fn calculate_network_usage_rate(&self) -> f64 {
+        #[cfg(target_os = "linux")]
+        {
+            // Get current network stats
+            if let Ok(current_stats) = self.read_network_stats().await {
+                // Get previous stats
+                let last_stats_option = self.get_last_network_stats().await;
+                
+                // Update stored stats for next calculation
+                self.update_network_stats(current_stats.clone()).await;
+                
+                // Calculate rate if we have previous stats
+                if let Some(last_stats) = last_stats_option {
+                    let time_diff = current_stats.timestamp.saturating_sub(last_stats.timestamp);
+                    
+                    if time_diff > 0 {
+                        // Calculate bytes transferred since last measurement
+                        let bytes_sent_diff = current_stats.bytes_sent.saturating_sub(last_stats.bytes_sent);
+                        let bytes_received_diff = current_stats.bytes_received.saturating_sub(last_stats.bytes_received);
+                        
+                        // Calculate rate in bytes per second
+                        let send_rate = bytes_sent_diff / time_diff;
+                        let receive_rate = bytes_received_diff / time_diff;
+                        let total_rate = send_rate + receive_rate;
+                        
+                        // Try to detect actual link speed
+                        let link_speed_mbps = self.detect_link_speed().await.unwrap_or(1000); // Default 1Gbps
+                        let max_bandwidth_bytes_per_sec = (link_speed_mbps * 1_000_000) / 8;
+                        
+                        // Calculate percentage
+                        let usage_percentage = (total_rate as f64 / max_bandwidth_bytes_per_sec as f64 * 100.0)
+                            .min(100.0)
+                            .max(0.0);
+                        
+                        // Log the calculated rate
+                        let rate_mbps = (total_rate * 8) as f64 / 1_000_000.0;
+                        info!("Network rate: {:.2} Mbps (↑{:.2} Mbps, ↓{:.2} Mbps), Usage: {:.2}%",
+                            rate_mbps,
+                            (send_rate * 8) as f64 / 1_000_000.0,
+                            (receive_rate * 8) as f64 / 1_000_000.0,
+                            usage_percentage
+                        );
+                        
+                        return usage_percentage;
+                    }
+                }
+                
+                // First measurement, no rate available yet
+                info!("Network stats initialized, waiting for next measurement for rate calculation");
+                return 0.0;
+            }
+        }
+        
+        // Fallback for non-Linux or error cases
+        0.0
     }
     
     /// Set security mode for remote commands
