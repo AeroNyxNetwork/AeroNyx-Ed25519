@@ -243,105 +243,117 @@ pub async fn handle_search(
     handler: &RemoteCommandHandler,
     command: RemoteCommandData,
 ) -> Result<serde_json::Value, RemoteCommandError> {
-    let base_path = command.path.unwrap_or_else(|| ".".to_string());
-    let query = command.query.ok_or_else(|| {
-        handler.create_error("INVALID_COMMAND", "Missing 'query' field".to_string(), None)
-    })?;
-
-    let full_path = handler.validate_path(&base_path)?;
-
-    if !full_path.exists() {
+    #[cfg(not(all(feature = "regex", feature = "walkdir")))]
+    {
         return Err(handler.create_error(
-            "FILE_NOT_FOUND",
-            format!("Search path not found: {}", base_path),
+            "FEATURE_DISABLED",
+            "Search functionality requires 'regex' and 'walkdir' features".to_string(),
             None,
         ));
     }
 
-    let use_regex = command.use_regex.unwrap_or(false);
-    let case_sensitive = command.case_sensitive.unwrap_or(false);
-    let include_hidden = command.include_hidden.unwrap_or(false);
-    let max_depth = command.max_depth
-        .unwrap_or(handler.config().max_search_depth)
-        .min(handler.config().max_search_depth);
-    let file_type = command.file_type.as_deref().unwrap_or("any");
+    #[cfg(all(feature = "regex", feature = "walkdir"))]
+    {
+        let base_path = command.path.unwrap_or_else(|| ".".to_string());
+        let query = command.query.ok_or_else(|| {
+            handler.create_error("INVALID_COMMAND", "Missing 'query' field".to_string(), None)
+        })?;
 
-    let pattern = if use_regex {
-        let flags = if case_sensitive { "" } else { "(?i)" };
-        let pattern_str = format!("{}{}", flags, query);
-        Some(Regex::new(&pattern_str).map_err(|e| {
-            handler.create_error("INVALID_REGEX", format!("Invalid regex pattern: {}", e), None)
-        })?)
-    } else {
-        None
-    };
+        let full_path = handler.validate_path(&base_path)?;
 
-    let mut results = Vec::new();
-    let walker = WalkDir::new(&full_path)
-        .max_depth(max_depth as usize)
-        .follow_links(false);
-
-    for entry in walker {
-        if results.len() >= handler.config().max_search_results {
-            break;
+        if !full_path.exists() {
+            return Err(handler.create_error(
+                "FILE_NOT_FOUND",
+                format!("Search path not found: {}", base_path),
+                None,
+            ));
         }
 
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let use_regex = command.use_regex.unwrap_or(false);
+        let case_sensitive = command.case_sensitive.unwrap_or(false);
+        let include_hidden = command.include_hidden.unwrap_or(false);
+        let max_depth = command.max_depth
+            .unwrap_or(handler.config().max_search_depth)
+            .min(handler.config().max_search_depth);
+        let file_type = command.file_type.as_deref().unwrap_or("any");
 
-        let path = entry.path();
-        let name = path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-
-        if !include_hidden && name.starts_with('.') {
-            continue;
-        }
-
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        let is_match = match file_type {
-            "file" if !metadata.is_file() => false,
-            "directory" if !metadata.is_dir() => false,
-            _ => true,
-        };
-
-        if !is_match {
-            continue;
-        }
-
-        let name_matches = if use_regex {
-            pattern.as_ref().unwrap().is_match(name)
-        } else if case_sensitive {
-            name.contains(&query)
+        let pattern = if use_regex {
+            let flags = if case_sensitive { "" } else { "(?i)" };
+            let pattern_str = format!("{}{}", flags, query);
+            Some(Regex::new(&pattern_str).map_err(|e| {
+                handler.create_error("INVALID_REGEX", format!("Invalid regex pattern: {}", e), None)
+            })?)
         } else {
-            name.to_lowercase().contains(&query.to_lowercase())
+            None
         };
 
-        if name_matches {
-            let modified = common::format_modified_time(metadata.modified());
+        let mut results = Vec::new();
+        let walker = WalkDir::new(&full_path)
+            .max_depth(max_depth as usize)
+            .follow_links(false);
 
-            results.push(SearchResult {
-                path: path.display().to_string(),
-                name: name.to_string(),
-                file_type: if metadata.is_dir() { "directory" } else { "file" }.to_string(),
-                size: metadata.len(),
-                modified,
-                match_context: None,
-            });
+        for entry in walker {
+            if results.len() >= handler.config().max_search_results {
+                break;
+            }
+
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let path = entry.path();
+            let name = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            if !include_hidden && name.starts_with('.') {
+                continue;
+            }
+
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let is_match = match file_type {
+                "file" if !metadata.is_file() => false,
+                "directory" if !metadata.is_dir() => false,
+                _ => true,
+            };
+
+            if !is_match {
+                continue;
+            }
+
+            let name_matches = if use_regex {
+                pattern.as_ref().unwrap().is_match(name)
+            } else if case_sensitive {
+                name.contains(&query)
+            } else {
+                name.to_lowercase().contains(&query.to_lowercase())
+            };
+
+            if name_matches {
+                let modified = common::format_modified_time(metadata.modified());
+
+                results.push(SearchResult {
+                    path: path.display().to_string(),
+                    name: name.to_string(),
+                    file_type: if metadata.is_dir() { "directory" } else { "file" }.to_string(),
+                    size: metadata.len(),
+                    modified,
+                    match_context: None,
+                });
+            }
         }
-    }
 
-    Ok(serde_json::json!({
-        "results": results,
-        "total": results.len(),
-        "query": query,
-        "search_path": full_path.display().to_string(),
-        "max_results_reached": results.len() >= handler.config().max_search_results,
-    }))
+        Ok(serde_json::json!({
+            "results": results,
+            "total": results.len(),
+            "query": query,
+            "search_path": full_path.display().to_string(),
+            "max_results_reached": results.len() >= handler.config().max_search_results,
+        }))
+    }
 }
