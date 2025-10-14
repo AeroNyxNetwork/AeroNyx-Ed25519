@@ -207,12 +207,14 @@ pub async fn handle_batch_copy(
                     match file_name {
                         Ok(name) => {
                             let dst_path = dst_dir.join(name);
-                            let error_fn = |msg: String| handler.create_error("SYSTEM_ERROR", msg, None);
-                            
                             let copy_result = if src_path.is_file() {
-                                fs::copy(&src_path, &dst_path).await.map(|_| ())
+                                fs::copy(&src_path, &dst_path).await
+                                    .map(|_| ())
+                                    .map_err(|e| format!("Failed to copy: {}", e))
                             } else {
+                                let error_fn = |msg: String| handler.create_error("SYSTEM_ERROR", msg, None);
                                 common::copy_dir_recursive(&src_path, &dst_path, &error_fn).await
+                                    .map_err(|e| e.message)
                             };
 
                             match copy_result {
