@@ -12,12 +12,11 @@ use crate::remote_command_handler::RemoteCommandError;
 pub async fn copy_dir_recursive(
     src: &Path,
     dst: &Path,
-    error_creator: &dyn Fn(String) -> RemoteCommandError,
-) -> Result<(), RemoteCommandError> {
+) -> Result<(), String> {
     use std::collections::VecDeque;
     
     fs::create_dir_all(dst).await.map_err(|e| {
-        error_creator(format!("Failed to create directory: {}", e))
+        format!("Failed to create directory: {}", e)
     })?;
 
     let mut queue = VecDeque::new();
@@ -29,34 +28,32 @@ pub async fn copy_dir_recursive(
     while let Some((src_dir, dst_dir)) = queue.pop_front() {
         depth += 1;
         if depth > MAX_DEPTH {
-            return Err(error_creator(
-                format!("Directory nesting exceeds maximum depth of {}", MAX_DEPTH)
-            ));
+            return Err(format!("Directory nesting exceeds maximum depth of {}", MAX_DEPTH));
         }
 
         let mut entries = fs::read_dir(&src_dir).await.map_err(|e| {
-            error_creator(format!("Failed to read directory: {}", e))
+            format!("Failed to read directory: {}", e)
         })?;
 
         while let Some(entry) = entries.next_entry().await.map_err(|e| {
-            error_creator(format!("Failed to read entry: {}", e))
+            format!("Failed to read entry: {}", e)
         })? {
             let entry_path = entry.path();
             let file_name = entry.file_name();
             let dst_path = dst_dir.join(&file_name);
 
             let metadata = entry.metadata().await.map_err(|e| {
-                error_creator(format!("Failed to get metadata: {}", e))
+                format!("Failed to get metadata: {}", e)
             })?;
 
             if metadata.is_dir() {
                 fs::create_dir_all(&dst_path).await.map_err(|e| {
-                    error_creator(format!("Failed to create directory: {}", e))
+                    format!("Failed to create directory: {}", e)
                 })?;
                 queue.push_back((entry_path, dst_path));
             } else {
                 fs::copy(&entry_path, &dst_path).await.map_err(|e| {
-                    error_creator(format!("Failed to copy file: {}", e))
+                    format!("Failed to copy file: {}", e)
                 })?;
             }
         }
@@ -70,8 +67,7 @@ pub async fn copy_dir_recursive(
 pub async fn chmod_recursive(
     path: &Path,
     mode: u32,
-    error_creator: &dyn Fn(String) -> RemoteCommandError,
-) -> Result<(), RemoteCommandError> {
+) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     use std::collections::VecDeque;
 
@@ -80,21 +76,21 @@ pub async fn chmod_recursive(
 
     while let Some(current_path) = queue.pop_front() {
         let metadata = fs::metadata(&current_path).await.map_err(|e| {
-            error_creator(format!("Failed to get metadata: {}", e))
+            format!("Failed to get metadata: {}", e)
         })?;
 
         let permissions = std::fs::Permissions::from_mode(mode);
         fs::set_permissions(&current_path, permissions).await.map_err(|e| {
-            error_creator(format!("Failed to set permissions: {}", e))
+            format!("Failed to set permissions: {}", e)
         })?;
 
         if metadata.is_dir() {
             let mut entries = fs::read_dir(&current_path).await.map_err(|e| {
-                error_creator(format!("Failed to read directory: {}", e))
+                format!("Failed to read directory: {}", e)
             })?;
 
             while let Some(entry) = entries.next_entry().await.map_err(|e| {
-                error_creator(format!("Failed to read entry: {}", e))
+                format!("Failed to read entry: {}", e)
             })? {
                 queue.push_back(entry.path());
             }
