@@ -64,10 +64,10 @@ pub async fn handle_upload(
     })?;
 
     // Atomic rename
-    fs::rename(&temp_path, &full_path).await.map_err(|e| {
+    if let Err(e) = fs::rename(&temp_path, &full_path).await {
         let _ = fs::remove_file(&temp_path).await;
-        handler.create_error("SYSTEM_ERROR", format!("Failed to finalize upload: {}", e), None)
-    })?;
+        return Err(handler.create_error("SYSTEM_ERROR", format!("Failed to finalize upload: {}", e), None));
+    }
 
     // Set file permissions if specified
     #[cfg(unix)]
@@ -277,10 +277,10 @@ pub async fn handle_copy(
             handler.create_error("SYSTEM_ERROR", format!("Failed to copy file: {}", e), None)
         })?;
         
-        fs::rename(&temp_path, &dst_full_path).await.map_err(|e| {
+        if let Err(e) = fs::rename(&temp_path, &dst_full_path).await {
             let _ = fs::remove_file(&temp_path).await;
-            handler.create_error("SYSTEM_ERROR", format!("Failed to finalize copy: {}", e), None)
-        })?;
+            return Err(handler.create_error("SYSTEM_ERROR", format!("Failed to finalize copy: {}", e), None));
+        }
     } else if metadata.is_dir() {
         if !command.recursive.unwrap_or(false) {
             return Err(handler.create_error(
