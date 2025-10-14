@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::info;
 use crate::remote_command_handler::{
     RemoteCommandData, RemoteCommandError, RemoteCommandHandler,
 };
