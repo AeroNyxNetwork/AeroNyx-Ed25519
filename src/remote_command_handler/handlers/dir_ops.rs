@@ -5,13 +5,17 @@
 
 use tokio::fs;
 use tracing::info;
-use regex::Regex;
-use walkdir::WalkDir;
 use std::time::SystemTime;
 use crate::remote_command_handler::{
     RemoteCommandData, RemoteCommandError, RemoteCommandHandler, SearchResult,
 };
 use super::common;
+
+#[cfg(feature = "regex")]
+use regex::Regex;
+
+#[cfg(feature = "walkdir")]
+use walkdir::WalkDir;
 
 /// Handle directory listing
 pub async fn handle_list(
