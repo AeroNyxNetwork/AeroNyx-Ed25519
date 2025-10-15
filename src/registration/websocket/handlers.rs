@@ -553,6 +553,7 @@ impl RegistrationManager {
                             details: None,
                         }),
                         executed_at: chrono::Utc::now().to_rfc3339(),
+                        execution_time_ms: Some(0), 
                     };
                     
                     let response_msg = WebSocketMessage::RemoteCommandResponse {
@@ -580,6 +581,7 @@ impl RegistrationManager {
                     details: None,
                 }),
                 executed_at: chrono::Utc::now().to_rfc3339(),
+                execution_time_ms: Some(0), 
             };
             
             let response_msg = WebSocketMessage::RemoteCommandResponse {
