@@ -213,8 +213,8 @@ pub async fn handle_batch_copy(
                                     .map_err(|e| format!("Failed to copy: {}", e))
                             } else {
                                 let error_fn = |msg: String| handler.create_error("SYSTEM_ERROR", msg, None);
-                                common::copy_dir_recursive(&src_path, &dst_path, &error_fn).await
-                                    .map_err(|e| e.message)
+                                common::copy_dir_recursive(&src_path, &dst_path).await
+                                    .map_err(|e| e)  // e is already a String
                             };
 
                             match copy_result {
