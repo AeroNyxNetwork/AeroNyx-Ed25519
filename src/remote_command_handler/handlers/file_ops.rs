@@ -290,7 +290,6 @@ pub async fn handle_copy(
             ));
         }
         
-        let error_fn = |msg: String| handler.create_error("SYSTEM_ERROR", msg, None);
         common::copy_dir_recursive(&src_full_path, &dst_full_path).await
             .map_err(|e| handler.create_error("SYSTEM_ERROR", e, None))?;
     }
@@ -354,7 +353,6 @@ pub async fn handle_chmod(
         })?;
 
         if metadata.is_dir() {
-            let error_fn = |msg: String| handler.create_error("SYSTEM_ERROR", msg, None);
             common::chmod_recursive(&full_path, mode).await
                 .map_err(|e| handler.create_error("SYSTEM_ERROR", e, None))?;
         }
