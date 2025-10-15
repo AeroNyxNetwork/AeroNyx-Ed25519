@@ -381,7 +381,7 @@ impl VpnServer {
         }
 
         // --- Start WebSocket connection if registered ---
-        if let Some(reg_manager) = &self.registration_manager {
+        if let Some(_reg_manager) = &self.registration_manager {
             if let Some(reference_code) = &self.config.registration_reference_code {
                 info!("Starting WebSocket connection for registered node");
                 
