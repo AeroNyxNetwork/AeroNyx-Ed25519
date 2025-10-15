@@ -20,7 +20,7 @@ use walkdir::WalkDir;
 /// Handle directory listing
 pub async fn handle_list(
     handler: &RemoteCommandHandler,
-    command: RemoteCommandData,
+    _command: RemoteCommandData,
 ) -> Result<serde_json::Value, RemoteCommandError> {
     let path = command.path.ok_or_else(|| {
         handler.create_error("INVALID_COMMAND", "Missing 'path' field".to_string(), None)
@@ -135,7 +135,7 @@ async fn list_directory_iterative(
 /// Handle directory creation
 pub async fn handle_create_directory(
     handler: &RemoteCommandHandler,
-    command: RemoteCommandData,
+    _command: RemoteCommandData,
 ) -> Result<serde_json::Value, RemoteCommandError> {
     let path = command.path.ok_or_else(|| {
         handler.create_error("INVALID_COMMAND", "Missing 'path' field".to_string(), None)
@@ -176,7 +176,7 @@ pub async fn handle_create_directory(
 /// Handle directory deletion
 pub async fn handle_delete_directory(
     handler: &RemoteCommandHandler,
-    command: RemoteCommandData,
+    _command: RemoteCommandData,
 ) -> Result<serde_json::Value, RemoteCommandError> {
     let path = command.path.ok_or_else(|| {
         handler.create_error("INVALID_COMMAND", "Missing 'path' field".to_string(), None)
@@ -241,7 +241,7 @@ pub async fn handle_delete_directory(
 /// Handle file/directory search
 pub async fn handle_search(
     handler: &RemoteCommandHandler,
-    command: RemoteCommandData,
+    _command: RemoteCommandData,
 ) -> Result<serde_json::Value, RemoteCommandError> {
     #[cfg(not(all(feature = "regex", feature = "walkdir")))]
     {
