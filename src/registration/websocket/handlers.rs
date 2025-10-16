@@ -1,5 +1,5 @@
 // src/registration/websocket/handlers.rs
-// WebSocket message handling logic - Fixed version with terminal output support
+// WebSocket message handling logic - Fixed version with correct response format
 
 use crate::registration::{RegistrationManager, WebSocketMessage};
 use crate::hardware::HardwareInfo;
@@ -312,8 +312,13 @@ impl RegistrationManager {
                             let from_session = json_value.get("from_session")
                                 .and_then(|v| v.as_str());
                             
+                            // Get node reference code
+                            let node_reference = self.reference_code.clone()
+                                .unwrap_or_else(|| "UNKNOWN".to_string());
+                            
                             info!("Request ID: {}", request_id);
                             info!("From session: {:?}", from_session);
+                            info!("Node reference: {}", node_reference);
                             
                             if let Some(command_json) = json_value.get("command") {
                                 info!("Command JSON: {:?}", command_json);
@@ -339,32 +344,25 @@ impl RegistrationManager {
                                             command_data
                                         ).await;
                                         
-                                        // Build response message
-                                        let response_msg = if response.success {
-                                            serde_json::json!({
-                                                "type": "remote_command_response",
-                                                "request_id": request_id,
-                                                "success": true,
-                                                "result": response.result,
-                                                "executed_at": response.executed_at
-                                            })
-                                        } else {
-                                            serde_json::json!({
-                                                "type": "remote_command_response",
-                                                "request_id": request_id,
-                                                "success": false,
-                                                "error": response.error,
-                                                "executed_at": response.executed_at
-                                            })
-                                        };
+                                        // 🔥 FIXED: Build response message with correct format
+                                        let response_msg = serde_json::json!({
+                                            "type": "remote_command_response",
+                                            "request_id": request_id,
+                                            "node_reference": node_reference,
+                                            "success": response.success,
+                                            "result": response.result,
+                                            "error": response.error,
+                                            "timestamp": response.executed_at,
+                                            "execution_time_ms": response.execution_time_ms
+                                        });
                                         
                                         // Send response
                                         info!("Sending remote command response for request_id: {}", request_id);
                                         let response_json = response_msg.to_string();
                                         
                                         match write.send(Message::Text(response_json)).await {
-                                            Ok(_) => info!("Response sent successfully"),
-                                            Err(e) => error!("Failed to send response: {}", e),
+                                            Ok(_) => info!("✅ Response sent successfully"),
+                                            Err(e) => error!("❌ Failed to send response: {}", e),
                                         }
                                     }
                                     Err(e) => {
@@ -381,15 +379,18 @@ impl RegistrationManager {
                                             );
                                         }
                                         
-                                        // Send error response
+                                        // 🔥 FIXED: Send error response with correct format
                                         let error_response = serde_json::json!({
                                             "type": "remote_command_response",
                                             "request_id": request_id,
+                                            "node_reference": node_reference,
                                             "success": false,
+                                            "result": null,
                                             "error": {
                                                 "code": "INVALID_COMMAND",
                                                 "message": format!("Failed to parse command: {}", e)
-                                            }
+                                            },
+                                            "timestamp": chrono::Utc::now().to_rfc3339()
                                         });
                                         
                                         let _ = write.send(Message::Text(error_response.to_string())).await;
@@ -398,15 +399,18 @@ impl RegistrationManager {
                             } else {
                                 error!("No 'command' field in message");
                                 
-                                // Send error response
+                                // 🔥 FIXED: Send error response with correct format
                                 let error_response = serde_json::json!({
                                     "type": "remote_command_response",
                                     "request_id": request_id,
+                                    "node_reference": node_reference,
                                     "success": false,
+                                    "result": null,
                                     "error": {
                                         "code": "MISSING_COMMAND",
                                         "message": "Command field is missing"
-                                    }
+                                    },
+                                    "timestamp": chrono::Utc::now().to_rfc3339()
                                 });
                                 
                                 let _ = write.send(Message::Text(error_response.to_string())).await;
@@ -417,17 +421,24 @@ impl RegistrationManager {
                     } else {
                         warn!("Remote management is disabled");
                         
-                        // If remote management is disabled, also send response
+                        // Get node reference
+                        let node_reference = self.reference_code.clone()
+                            .unwrap_or_else(|| "UNKNOWN".to_string());
+                        
+                        // 🔥 FIXED: If remote management is disabled, also send response with correct format
                         if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(text) {
                             if let Some(request_id) = json_value.get("request_id").and_then(|v| v.as_str()) {
                                 let error_response = serde_json::json!({
                                     "type": "remote_command_response",
                                     "request_id": request_id,
+                                    "node_reference": node_reference,
                                     "success": false,
+                                    "result": null,
                                     "error": {
                                         "code": "REMOTE_MANAGEMENT_DISABLED",
                                         "message": "Remote management is disabled on this node"
-                                    }
+                                    },
+                                    "timestamp": chrono::Utc::now().to_rfc3339()
                                 });
                                 
                                 let _ = write.send(Message::Text(error_response.to_string())).await;
@@ -513,6 +524,10 @@ impl RegistrationManager {
             .unwrap_or("unknown")
             .to_string();
         
+        // Get node reference code
+        let node_reference = self.reference_code.clone()
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        
         info!("Processing remote command with request ID: {}", request_id);
         
         // Parse remote command data from the command field instead of parameters
@@ -528,10 +543,17 @@ impl RegistrationManager {
                         remote_cmd_data
                     ).await;
                     
-                    // Send response back using RemoteCommandResponse
-                    let response_msg = WebSocketMessage::RemoteCommandResponse {
-                        response,
-                    };
+                    // 🔥 FIXED: Send response with correct format
+                    let response_msg = serde_json::json!({
+                        "type": "remote_command_response",
+                        "request_id": request_id,
+                        "node_reference": node_reference,
+                        "success": response.success,
+                        "result": response.result,
+                        "error": response.error,
+                        "timestamp": response.executed_at,
+                        "execution_time_ms": response.execution_time_ms
+                    });
                     
                     let response_json = serde_json::to_string(&response_msg)
                         .map_err(|e| format!("Failed to serialize response: {}", e))?;
@@ -542,25 +564,21 @@ impl RegistrationManager {
                 Err(e) => {
                     warn!("Invalid remote command format: {}", e);
                     
-                    // Send error response
-                    let error_response = crate::remote_command_handler::RemoteCommandResponse {
-                        request_id,
-                        success: false,
-                        result: None,
-                        error: Some(RemoteCommandError {
-                            code: "INVALID_COMMAND".to_string(),
-                            message: format!("Invalid command format: {}", e),
-                            details: None,
-                        }),
-                        executed_at: chrono::Utc::now().to_rfc3339(),
-                        execution_time_ms: Some(0), 
-                    };
+                    // 🔥 FIXED: Send error response with correct format
+                    let error_response = serde_json::json!({
+                        "type": "remote_command_response",
+                        "request_id": request_id,
+                        "node_reference": node_reference,
+                        "success": false,
+                        "result": null,
+                        "error": {
+                            "code": "INVALID_COMMAND",
+                            "message": format!("Invalid command format: {}", e)
+                        },
+                        "timestamp": chrono::Utc::now().to_rfc3339()
+                    });
                     
-                    let response_msg = WebSocketMessage::RemoteCommandResponse {
-                        response: error_response,
-                    };
-                    
-                    let response_json = serde_json::to_string(&response_msg)
+                    let response_json = serde_json::to_string(&error_response)
                         .map_err(|e| format!("Failed to serialize error response: {}", e))?;
                     
                     write.send(Message::Text(response_json)).await
@@ -570,25 +588,21 @@ impl RegistrationManager {
         } else {
             warn!("Remote command missing command data");
             
-            // Send error response
-            let error_response = crate::remote_command_handler::RemoteCommandResponse {
-                request_id,
-                success: false,
-                result: None,
-                error: Some(RemoteCommandError {
-                    code: "INVALID_COMMAND".to_string(),
-                    message: "Missing command data".to_string(),
-                    details: None,
-                }),
-                executed_at: chrono::Utc::now().to_rfc3339(),
-                execution_time_ms: Some(0), 
-            };
+            // 🔥 FIXED: Send error response with correct format
+            let error_response = serde_json::json!({
+                "type": "remote_command_response",
+                "request_id": request_id,
+                "node_reference": node_reference,
+                "success": false,
+                "result": null,
+                "error": {
+                    "code": "INVALID_COMMAND",
+                    "message": "Missing command data"
+                },
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            });
             
-            let response_msg = WebSocketMessage::RemoteCommandResponse {
-                response: error_response,
-            };
-            
-            let response_json = serde_json::to_string(&response_msg)
+            let response_json = serde_json::to_string(&error_response)
                 .map_err(|e| format!("Failed to serialize error response: {}", e))?;
             
             write.send(Message::Text(response_json)).await
@@ -692,6 +706,10 @@ impl RegistrationManager {
                 info!("From session: {}", from_session);
                 info!("Command: {:?}", command);
                 
+                // Get node reference code
+                let node_reference = self.reference_code.clone()
+                    .unwrap_or_else(|| "UNKNOWN".to_string());
+                
                 if *self.remote_management_enabled.read().await {
                     match serde_json::from_value::<RemoteCommandData>(command.clone()) {
                         Ok(command_data) => {
@@ -712,24 +730,17 @@ impl RegistrationManager {
                                 command_data
                             ).await;
                             
-                            // Build response message
-                            let response_msg = if response.success {
-                                serde_json::json!({
-                                    "type": "remote_command_response",
-                                    "request_id": request_id,
-                                    "success": true,
-                                    "result": response.result,
-                                    "executed_at": response.executed_at
-                                })
-                            } else {
-                                serde_json::json!({
-                                    "type": "remote_command_response",
-                                    "request_id": request_id,
-                                    "success": false,
-                                    "error": response.error,
-                                    "executed_at": response.executed_at
-                                })
-                            };
+                            // 🔥 FIXED: Build response message with correct format
+                            let response_msg = serde_json::json!({
+                                "type": "remote_command_response",
+                                "request_id": request_id,
+                                "node_reference": node_reference,
+                                "success": response.success,
+                                "result": response.result,
+                                "error": response.error,
+                                "timestamp": response.executed_at,
+                                "execution_time_ms": response.execution_time_ms
+                            });
                             
                             // Send response
                             info!("Sending remote command response for request_id: {}", request_id);
@@ -738,20 +749,23 @@ impl RegistrationManager {
                             write.send(Message::Text(response_json)).await
                                 .map_err(|e| format!("Failed to send response: {}", e))?;
                             
-                            info!("Response sent successfully");
+                            info!("✅ Response sent successfully");
                         }
                         Err(e) => {
                             error!("Failed to parse remote command: {}", e);
                             
-                            // Send error response
+                            // 🔥 FIXED: Send error response with correct format
                             let error_response = serde_json::json!({
                                 "type": "remote_command_response",
                                 "request_id": request_id,
+                                "node_reference": node_reference,
                                 "success": false,
+                                "result": null,
                                 "error": {
                                     "code": "INVALID_COMMAND",
                                     "message": format!("Failed to parse command: {}", e)
-                                }
+                                },
+                                "timestamp": chrono::Utc::now().to_rfc3339()
                             });
                             
                             write.send(Message::Text(error_response.to_string())).await
@@ -761,14 +775,18 @@ impl RegistrationManager {
                 } else {
                     warn!("Remote management is disabled");
                     
+                    // 🔥 FIXED: Error response with correct format
                     let error_response = serde_json::json!({
                         "type": "remote_command_response",
                         "request_id": request_id,
+                        "node_reference": node_reference,
                         "success": false,
+                        "result": null,
                         "error": {
                             "code": "REMOTE_MANAGEMENT_DISABLED",
                             "message": "Remote management is disabled on this node"
-                        }
+                        },
+                        "timestamp": chrono::Utc::now().to_rfc3339()
                     });
                     
                     write.send(Message::Text(error_response.to_string())).await
