@@ -432,14 +432,14 @@ impl RegistrationManager {
                             if let Some(command_json) = json.get("command") {
                                 info!("Command JSON: {:?}", command_json);
                                 
-                                // Import required types (fixed import path)
+                                // Import required types
                                 use crate::remote_command_handler::RemoteCommandData;
                                 
                                 match serde_json::from_value::<RemoteCommandData>(command_json.clone()) {
                                     Ok(command_data) => {
                                         info!("Processing remote command: type={}", command_data.command_type);
                                         
-                                        // Log the command execution (inline logging instead of function call)
+                                        // Log the command execution
                                         if let Some(session_id) = from_session {
                                             info!("[REMOTE_CMD] Session: {}, Type: {}, Request: {}", 
                                                   session_id, command_data.command_type, request_id);
@@ -456,7 +456,14 @@ impl RegistrationManager {
                                         
                                         let execution_time_ms = start_time.elapsed().as_millis() as u64;
                                         
-                                        // Build response message (fixed the unwrap_or_else issue)
+                                        // Build response message
+                                        // Check if executed_at is present, otherwise use current time
+                                        let timestamp = if !response.executed_at.is_empty() {
+                                            response.executed_at.clone()
+                                        } else {
+                                            chrono::Utc::now().to_rfc3339()
+                                        };
+                                        
                                         let response_msg = serde_json::json!({
                                             "type": "remote_command_response",
                                             "request_id": request_id,
@@ -464,7 +471,7 @@ impl RegistrationManager {
                                             "success": response.success,
                                             "result": response.result,
                                             "error": response.error,
-                                            "timestamp": response.executed_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                                            "timestamp": timestamp,
                                             "execution_time_ms": response.execution_time_ms.unwrap_or(execution_time_ms)
                                         });
                                         
