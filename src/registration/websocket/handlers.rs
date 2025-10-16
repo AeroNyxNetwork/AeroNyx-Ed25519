@@ -299,7 +299,7 @@ impl RegistrationManager {
                     }
                 }
                 
-                Some("remote_command") => {
+                Some("remote_command") | Some("REMOTE_COMMAND") => {
                     info!("=== REMOTE COMMAND RECEIVED ===");
                     info!("Raw message: {}", text);
                     
