@@ -432,21 +432,17 @@ impl RegistrationManager {
                             if let Some(command_json) = json.get("command") {
                                 info!("Command JSON: {:?}", command_json);
                                 
-                                // Import required types
-                                use crate::remote_command_handler::{RemoteCommandData, log_remote_command};
+                                // Import required types (fixed import path)
+                                use crate::remote_command_handler::RemoteCommandData;
                                 
                                 match serde_json::from_value::<RemoteCommandData>(command_json.clone()) {
                                     Ok(command_data) => {
                                         info!("Processing remote command: type={}", command_data.command_type);
                                         
-                                        // Log the command execution
+                                        // Log the command execution (inline logging instead of function call)
                                         if let Some(session_id) = from_session {
-                                            log_remote_command(
-                                                session_id,
-                                                &command_data.command_type,
-                                                true,
-                                                &format!("request_id={}", request_id)
-                                            );
+                                            info!("[REMOTE_CMD] Session: {}, Type: {}, Request: {}", 
+                                                  session_id, command_data.command_type, request_id);
                                         }
                                         
                                         // Execute the command
@@ -460,7 +456,7 @@ impl RegistrationManager {
                                         
                                         let execution_time_ms = start_time.elapsed().as_millis() as u64;
                                         
-                                        // Build response message
+                                        // Build response message (fixed the unwrap_or_else issue)
                                         let response_msg = serde_json::json!({
                                             "type": "remote_command_response",
                                             "request_id": request_id,
@@ -468,7 +464,7 @@ impl RegistrationManager {
                                             "success": response.success,
                                             "result": response.result,
                                             "error": response.error,
-                                            "timestamp": response.executed_at.unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                                            "timestamp": response.executed_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
                                             "execution_time_ms": response.execution_time_ms.unwrap_or(execution_time_ms)
                                         });
                                         
@@ -482,12 +478,8 @@ impl RegistrationManager {
                                         
                                         // Log successful completion
                                         if let Some(session_id) = from_session {
-                                            log_remote_command(
-                                                session_id,
-                                                "response_sent",
-                                                true,
-                                                &format!("request_id={}, execution_time={}ms", request_id, execution_time_ms)
-                                            );
+                                            info!("[REMOTE_CMD] Response sent - Session: {}, Request: {}, Time: {}ms", 
+                                                  session_id, request_id, execution_time_ms);
                                         }
                                     }
                                     Err(e) => {
@@ -496,12 +488,8 @@ impl RegistrationManager {
                                         
                                         // Log failed parsing
                                         if let Some(session_id) = from_session {
-                                            log_remote_command(
-                                                session_id,
-                                                "parse_error",
-                                                false,
-                                                &format!("request_id={}, error={}", request_id, e)
-                                            );
+                                            error!("[REMOTE_CMD] Parse error - Session: {}, Request: {}, Error: {}", 
+                                                   session_id, request_id, e);
                                         }
                                         
                                         let error_response = serde_json::json!({
@@ -527,12 +515,8 @@ impl RegistrationManager {
                                 
                                 // Log missing command field
                                 if let Some(session_id) = from_session {
-                                    log_remote_command(
-                                        session_id,
-                                        "missing_command",
-                                        false,
-                                        &format!("request_id={}", request_id)
-                                    );
+                                    error!("[REMOTE_CMD] Missing command - Session: {}, Request: {}", 
+                                           session_id, request_id);
                                 }
                                 
                                 let error_response = serde_json::json!({
