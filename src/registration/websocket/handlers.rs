@@ -1047,7 +1047,6 @@ impl RegistrationManager {
                         info!("Received connection confirmation from server");
                         
                         if !*auth_sent {
-                            // Send authentication using the simplified format
                             let auth_code = self.reference_code.clone()
                                 .or_else(|| self.registration_code.clone())
                                 .ok_or("No authentication code available")?;
@@ -1070,14 +1069,13 @@ impl RegistrationManager {
                     "auth_success" | "auth_response" => {
                         let success = json.get("success")
                             .and_then(|s| s.as_bool())
-                            .unwrap_or(true); // Default to true for "auth_success"
+                            .unwrap_or(true);
                         
                         if success {
                             info!("Authentication successful");
                             *authenticated = true;
                             *last_heartbeat_ack = std::time::Instant::now();
                             
-                            // Update heartbeat interval if provided
                             if let Some(interval) = json.get("heartbeat_interval")
                                 .and_then(|v| v.as_u64()) {
                                 *heartbeat_interval = time::interval(Duration::from_secs(interval));
@@ -1097,30 +1095,157 @@ impl RegistrationManager {
                         *last_heartbeat_ack = std::time::Instant::now();
                     }
                     
-                    "challenge_request" | "CHALLENGE_REQUEST" => {
-                        info!("Received ZKP challenge request");
+               
+                    "remote_command" | "REMOTE_COMMAND" => {
+                        info!("=== REMOTE COMMAND RECEIVED (GENERIC) ===");
+                        info!("Raw message: {}", text);
                         
-                        let challenge_id = json.get("challenge_id")
-                            .or_else(|| json.get("payload")
-                                .and_then(|p| p.get("challenge_id")))
-                            .and_then(|id| id.as_str())
+                        let node_reference = self.reference_code.clone()
+                            .unwrap_or_else(|| "UNKNOWN".to_string());
+                        
+                        let request_id = json.get("request_id")
+                            .and_then(|v| v.as_str())
                             .unwrap_or("unknown");
                         
-                        // Generate and send ZKP proof
-                        if let Err(e) = self.handle_zkp_challenge(
-                            challenge_id,
-                            hardware_info,
-                            setup_params,
-                            write
-                        ).await {
-                            error!("Failed to handle ZKP challenge: {}", e);
+                        if *self.remote_management_enabled.read().await {
+                            if let Some(command_json) = json.get("command") {
+                                info!("Command JSON: {:?}", command_json);
+                                
+                                match serde_json::from_value::<RemoteCommandData>(command_json.clone()) {
+                                    Ok(command_data) => {
+                                        info!("Processing remote command: type={}", command_data.command_type);
+                                        
+                      
+                                        if let Some(session_id) = json.get("from_session").and_then(|v| v.as_str()) {
+                                            log_remote_command(
+                                                session_id,
+                                                &command_data.command_type,
+                                                true,
+                                                &format!("request_id={}", request_id)
+                                            );
+                                        }
+                                        
+                           
+                                        let handler = self.remote_command_handler.clone();
+                                        let response = handler.handle_command(
+                                            request_id.to_string(), 
+                                            command_data
+                                        ).await;
+                           
+                                        let response_msg = serde_json::json!({
+                                            "type": "remote_command_response",
+                                            "request_id": request_id,
+                                            "node_reference": node_reference,
+                                            "success": response.success,
+                                            "result": response.result,
+                                            "error": response.error,
+                                            "timestamp": response.executed_at,
+                                            "execution_time_ms": response.execution_time_ms
+                                        });
+                                        
+                                        info!("Sending remote command response for request_id: {}", request_id);
+                                        let response_json = response_msg.to_string();
+                                        
+                                        match write.send(Message::Text(response_json)).await {
+                                            Ok(_) => info!("✅ Response sent successfully"),
+                                            Err(e) => error!("❌ Failed to send response: {}", e),
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to parse remote command: {}", e);
+                                        error!("Command JSON was: {:?}", command_json);
+                                        
+                                        let error_response = serde_json::json!({
+                                            "type": "remote_command_response",
+                                            "request_id": request_id,
+                                            "node_reference": node_reference,
+                                            "success": false,
+                                            "result": null,
+                                            "error": {
+                                                "code": "INVALID_COMMAND",
+                                                "message": format!("Failed to parse command: {}", e)
+                                            },
+                                            "timestamp": chrono::Utc::now().to_rfc3339()
+                                        });
+                                        
+                                        let _ = write.send(Message::Text(error_response.to_string())).await;
+                                    }
+                                }
+                            } else {
+                                error!("No 'command' field in message");
+                                
+                                let error_response = serde_json::json!({
+                                    "type": "remote_command_response",
+                                    "request_id": request_id,
+                                    "node_reference": node_reference,
+                                    "success": false,
+                                    "result": null,
+                                    "error": {
+                                        "code": "MISSING_COMMAND",
+                                        "message": "Command field is missing"
+                                    },
+                                    "timestamp": chrono::Utc::now().to_rfc3339()
+                                });
+                                
+                                let _ = write.send(Message::Text(error_response.to_string())).await;
+                            }
+                        } else {
+                            warn!("Remote management is disabled");
+                            
+                            let error_response = serde_json::json!({
+                                "type": "remote_command_response",
+                                "request_id": request_id,
+                                "node_reference": node_reference,
+                                "success": false,
+                                "result": null,
+                                "error": {
+                                    "code": "REMOTE_MANAGEMENT_DISABLED",
+                                    "message": "Remote management is disabled on this node"
+                                },
+                                "timestamp": chrono::Utc::now().to_rfc3339()
+                            });
+                            
+                            let _ = write.send(Message::Text(error_response.to_string())).await;
+                        }
+                        
+                        info!("=== REMOTE COMMAND PROCESSING COMPLETE ===");
+                    }
+                    
+                    "remote_auth" => {
+                        info!("Received remote_auth message");
+                        
+                        let jwt_token = json.get("jwt_token")
+                            .and_then(|v| v.as_str());
+                        
+                        if let Some(token) = jwt_token {
+                            info!("Remote auth JWT token received, length: {}", token.len());
+                            
+                            *self.remote_management_enabled.write().await = true;
+                            
+                            let success_response = serde_json::json!({
+                                "type": "remote_auth_success",
+                                "message": "Remote authentication successful"
+                            });
+                            
+                            write.send(Message::Text(success_response.to_string())).await
+                                .map_err(|e| format!("Failed to send remote auth response: {}", e))?;
+                            
+                            info!("Remote auth success response sent, remote management enabled");
+                        } else {
+                            let error_response = serde_json::json!({
+                                "type": "error",
+                                "error_code": "MISSING_JWT",
+                                "message": "JWT token is required for remote authentication"
+                            });
+                            
+                            write.send(Message::Text(error_response.to_string())).await
+                                .map_err(|e| format!("Failed to send error response: {}", e))?;
                         }
                     }
                     
                     "term_init" | "term_input" | "term_resize" | "term_close" => {
                         info!("=== TERMINAL MESSAGE DETECTED ===");
                         
-                        // Check if remote management is enabled
                         if !*self.remote_management_enabled.read().await {
                             let error_response = serde_json::json!({
                                 "type": "term_error",
@@ -1134,9 +1259,7 @@ impl RegistrationManager {
                             return Ok(());
                         }
                         
-                        // Parse terminal message
                         if let Ok(term_msg) = serde_json::from_str::<TerminalMessage>(text) {
-                            // Get or create terminal manager
                             let terminal_manager = self.get_terminal_manager();
                             
                             match handle_terminal_message(&terminal_manager, term_msg).await {
@@ -1148,15 +1271,10 @@ impl RegistrationManager {
                                         error!("Failed to send terminal response: {}", e);
                                     }
                                     
-                                    // If this was an init message, start output reader
                                     if let TerminalMessage::Ready { session_id } = response {
-                                        // Create channel for terminal output
                                         let (tx, rx) = mpsc::channel::<TerminalMessage>(100);
-                                        
-                                        // Store the receiver
                                         terminal_output_channels.insert(session_id.clone(), rx);
                                         
-                                        // Start output reader
                                         self.start_terminal_output_reader(
                                             terminal_manager.clone(),
                                             session_id,
@@ -1183,34 +1301,22 @@ impl RegistrationManager {
                         }
                     }
                     
-                    "remote_command" => {
-                        info!("=== REMOTE COMMAND DETECTED ===");
-                        info!("Full remote command JSON: {}", serde_json::to_string_pretty(&json).unwrap_or_default());
+                    "challenge_request" | "CHALLENGE_REQUEST" => {
+                        info!("Received ZKP challenge request");
                         
-                        // Call the existing handler
-                        if let Err(e) = self.handle_websocket_message(
-                            text,
-                            write,
-                            authenticated,
-                            heartbeat_interval,
-                            last_heartbeat_ack
-                        ).await {
-                            error!("Failed to handle remote command: {}", e);
-                        }
-                    }
-                    
-                    "remote_auth" => {
-                        info!("=== REMOTE AUTH DETECTED ===");
+                        let challenge_id = json.get("challenge_id")
+                            .or_else(|| json.get("payload")
+                                .and_then(|p| p.get("challenge_id")))
+                            .and_then(|id| id.as_str())
+                            .unwrap_or("unknown");
                         
-                        // Also handle remote_auth through the legacy handler
-                        if let Err(e) = self.handle_websocket_message(
-                            text,
-                            write,
-                            authenticated,
-                            heartbeat_interval,
-                            last_heartbeat_ack
+                        if let Err(e) = self.handle_zkp_challenge(
+                            challenge_id,
+                            hardware_info,
+                            setup_params,
+                            write
                         ).await {
-                            error!("Failed to handle remote auth: {}", e);
+                            error!("Failed to handle ZKP challenge: {}", e);
                         }
                     }
                     
@@ -1224,7 +1330,6 @@ impl RegistrationManager {
                         
                         error!("Server error [{}]: {}", error_code, message);
                         
-                        // Handle specific errors
                         if message.contains("Message too large") {
                             warn!("Command output exceeded size limit. Consider using pagination or filtering.");
                         }
@@ -1237,18 +1342,7 @@ impl RegistrationManager {
                     }
                     
                     _ => {
-                        info!("Unhandled message type: {}, trying legacy handler", msg_type);
-                        
-                        // For any other message type, try the legacy handler
-                        if let Err(e) = self.handle_websocket_message(
-                            text,
-                            write,
-                            authenticated,
-                            heartbeat_interval,
-                            last_heartbeat_ack
-                        ).await {
-                            error!("Legacy handler failed: {}", e);
-                        }
+                        debug!("Unhandled message type: {}", msg_type);
                     }
                 }
             } else {
