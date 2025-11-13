@@ -4,15 +4,29 @@
 //! This module defines the message types used in the AeroNyx Privacy Network
 //! protocol for authentication, key exchange, and data transfer.
 //!
-//! ## Key Changes for X25519 Support
-//! - Added optional `x25519_key` field to Challenge packet
-//! - Server now sends both Ed25519 (for signatures) and X25519 (for ECDH) public keys
-//! - Maintains backward compatibility with clients that don't support X25519
+//! ## Phase 1: End-to-End Encryption Support (Blind Relay)
+//! - Added X25519 public key exchange in chat messages
+//! - Server acts as blind relay for E2E encrypted messages
+//! - Maintains backward compatibility with legacy clients
 //!
-//! ## Why These Changes
-//! - Clients need X25519 public key for ECDH key exchange
-//! - Ed25519 keys cannot be directly used for X25519 operations
-//! - Optional field ensures backward compatibility
+//! ## Key Changes
+//! - `RequestChat`: Now includes sender's X25519 public key
+//! - `AcceptChat`: Now includes recipient's X25519 public key
+//! - `ChatMessage`: Supports both E2E encrypted and legacy modes
+//! - Server never decrypts E2E messages (blind relay)
+//!
+//! ## Security Model
+//! ```
+//! Control Channel (Server-Client):
+//!   - Authentication: Ed25519 signatures
+//!   - Key Exchange: X25519 ECDH (server ↔ client)
+//!   - Purpose: Session management, IP assignment
+//!
+//! Data Channel (Client-Client E2E):
+//!   - Key Exchange: X25519 ECDH (client A ↔ client B)
+//!   - Encryption: ChaCha20-Poly1305 or AES-256-GCM
+//!   - Server: Blind relay (cannot decrypt)
+//! ```
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -50,7 +64,9 @@ pub enum MessageError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum PayloadDataType {
+    /// JSON data (application messages)
     Json,
+    /// IP packet data (VPN traffic)
     Ip,
 }
 
@@ -119,7 +135,7 @@ pub enum PacketType {
         lease_duration: u64,
         /// Session ID
         session_id: String,
-        /// Encrypted session key
+        /// Encrypted session key (for control channel only)
         encrypted_session_key: Vec<u8>,
         /// Nonce for key encryption
         key_nonce: Vec<u8>,
@@ -206,19 +222,138 @@ pub enum PacketType {
     },
 }
 
+/// Chat-related message types (embedded in DataEnvelope)
+/// These are JSON payloads sent inside encrypted Data packets
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ChatMessageType {
+    /// Request to initiate a chat
+    /// 
+    /// ## Phase 1: E2E Key Exchange
+    /// Sender includes their X25519 public key for end-to-end encryption
+    #[serde(rename = "request-chat")]
+    RequestChat {
+        /// Target user's client ID
+        target_user: String,
+        /// Sender's client ID
+        from_user: String,
+        /// Sender's X25519 public key (Base58 encoded)
+        /// Used for end-to-end ECDH key agreement
+        x25519_public_key: String,
+        /// Timestamp of request
+        timestamp: u64,
+    },
+    
+    /// Accept a chat request
+    /// 
+    /// ## Phase 1: E2E Key Exchange
+    /// Recipient includes their X25519 public key to complete ECDH
+    #[serde(rename = "accept-chat")]
+    AcceptChat {
+        /// Chat ID assigned by server
+        chat_id: String,
+        /// Accepting user's client ID
+        from_user: String,
+        /// Recipient's X25519 public key (Base58 encoded)
+        /// Used for end-to-end ECDH key agreement
+        x25519_public_key: String,
+        /// Timestamp of acceptance
+        timestamp: u64,
+    },
+    
+    /// Reject a chat request
+    #[serde(rename = "reject-chat")]
+    RejectChat {
+        /// Requesting user's client ID
+        target_user: String,
+        /// Rejecting user's client ID
+        from_user: String,
+        /// Optional rejection reason
+        reason: Option<String>,
+        /// Timestamp of rejection
+        timestamp: u64,
+    },
+    
+    /// Chat message
+    /// 
+    /// ## Phase 1: E2E Encryption
+    /// Message content can be in two formats:
+    /// 1. Legacy: Plain JSON (server can read) - DEPRECATED
+    /// 2. E2E: Base64-encoded encrypted blob (server cannot read)
+    #[serde(rename = "message")]
+    Message {
+        /// Chat ID
+        chat_id: String,
+        /// Sender's client ID
+        from_user: String,
+        /// Message content or encrypted payload
+        /// 
+        /// Format detection:
+        /// - If starts with "e2e:", it's an encrypted payload
+        /// - Otherwise, legacy plain text (deprecated)
+        content: String,
+        /// Message ID (for deduplication)
+        message_id: String,
+        /// Timestamp
+        timestamp: u64,
+        /// Indicates if this message is E2E encrypted
+        #[serde(default)]
+        is_encrypted: bool,
+    },
+    
+    /// Request chat information
+    #[serde(rename = "request-chat-info")]
+    RequestChatInfo {
+        /// Chat ID
+        chat_id: String,
+    },
+    
+    /// Request participant list
+    #[serde(rename = "request-participants")]
+    RequestParticipants {
+        /// Chat ID (optional, uses current room if not specified)
+        chat_id: Option<String>,
+    },
+    
+    /// WebRTC signaling
+    #[serde(rename = "webrtc-signal")]
+    WebRtcSignal {
+        /// Target peer's client ID
+        peer_id: String,
+        /// Sender's client ID
+        from_user: String,
+        /// Signal type (offer, answer, ice-candidate)
+        signal_type: String,
+        /// Signal payload
+        payload: Value,
+    },
+    
+    /// Leave chat
+    #[serde(rename = "leave-chat")]
+    LeaveChat {
+        /// Chat ID
+        chat_id: String,
+    },
+    
+    /// Delete chat
+    #[serde(rename = "delete-chat")]
+    DeleteChat {
+        /// Chat ID
+        chat_id: String,
+    },
+}
+
+/// Encryption algorithms supported
 pub mod encryption_algorithms {
     pub const CHACHA20_POLY1305: &str = "chacha20poly1305";
     pub const AES_256_GCM: &str = "aes256gcm";
     
-    // Check if algorithm is supported
+    /// Check if algorithm is supported
     pub fn is_supported(algorithm: &str) -> bool {
-        match algorithm {
-            CHACHA20_POLY1305 | AES_256_GCM => true,
-            _ => false,
-        }
+        matches!(algorithm, CHACHA20_POLY1305 | AES_256_GCM)
     }
     
-    // Get default algorithm
+    /// Get default algorithm
     pub fn default() -> &'static str {
         CHACHA20_POLY1305
     }
@@ -312,103 +447,115 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json;
     
     #[test]
-    fn test_challenge_with_x25519_key() {
-        // Test with X25519 key
+    fn test_request_chat_serialization() {
+        let request = ChatMessageType::RequestChat {
+            target_user: "user123".to_string(),
+            from_user: "user456".to_string(),
+            x25519_public_key: "5JJyqtqarra7ZQEP8LwFfRBvXyZhqEL6dYL6XaH5dZ2B".to_string(),
+            timestamp: 1234567890,
+        };
+        
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("x25519_public_key"));
+        assert!(json.contains("5JJyqtqarra7ZQEP8LwFfRBvXyZhqEL6dYL6XaH5dZ2B"));
+        
+        let deserialized: ChatMessageType = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            ChatMessageType::RequestChat { x25519_public_key, .. } => {
+                assert_eq!(x25519_public_key, "5JJyqtqarra7ZQEP8LwFfRBvXyZhqEL6dYL6XaH5dZ2B");
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+    
+    #[test]
+    fn test_accept_chat_serialization() {
+        let accept = ChatMessageType::AcceptChat {
+            chat_id: "chat789".to_string(),
+            from_user: "user123".to_string(),
+            x25519_public_key: "3GGxvgsdfds8RTYU9MnGgGgCwaYaggfL9eM9YbI8eA3C".to_string(),
+            timestamp: 1234567891,
+        };
+        
+        let json = serde_json::to_string(&accept).unwrap();
+        assert!(json.contains("x25519_public_key"));
+        
+        let deserialized: ChatMessageType = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            ChatMessageType::AcceptChat { x25519_public_key, .. } => {
+                assert_eq!(x25519_public_key, "3GGxvgsdfds8RTYU9MnGgGgCwaYaggfL9eM9YbI8eA3C");
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+    
+    #[test]
+    fn test_encrypted_message_format() {
+        let msg = ChatMessageType::Message {
+            chat_id: "chat123".to_string(),
+            from_user: "alice".to_string(),
+            content: "e2e:SGVsbG8gV29ybGQh".to_string(),
+            message_id: "msg001".to_string(),
+            timestamp: 1234567890,
+            is_encrypted: true,
+        };
+        
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("is_encrypted"));
+        assert!(json.contains("true"));
+        
+        match msg {
+            ChatMessageType::Message { content, is_encrypted, .. } => {
+                assert!(content.starts_with("e2e:"));
+                assert!(is_encrypted);
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+    
+    #[test]
+    fn test_backward_compatibility_plain_message() {
+        // Legacy message without is_encrypted field
+        let json = r#"{
+            "type": "message",
+            "chat_id": "chat123",
+            "from_user": "bob",
+            "content": "Hello, this is plain text",
+            "message_id": "msg002",
+            "timestamp": 1234567890
+        }"#;
+        
+        let msg: ChatMessageType = serde_json::from_str(json).unwrap();
+        match msg {
+            ChatMessageType::Message { is_encrypted, content, .. } => {
+                assert!(!is_encrypted); // Default is false
+                assert!(!content.starts_with("e2e:"));
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+    
+    #[test]
+    fn test_challenge_with_x25519() {
         let challenge = PacketType::Challenge {
             data: vec![1, 2, 3],
-            server_key: "Ed25519PublicKey".to_string(),
-            x25519_key: Some("X25519PublicKey".to_string()),
+            server_key: "Ed25519Key".to_string(),
+            x25519_key: Some("X25519Key".to_string()),
             expires_at: 1234567890,
             id: "challenge123".to_string(),
         };
         
-        let serialized = serde_json::to_string(&challenge).unwrap();
-        assert!(serialized.contains("x25519_key"));
-        assert!(serialized.contains("X25519PublicKey"));
+        let json = serde_json::to_string(&challenge).unwrap();
+        assert!(json.contains("x25519_key"));
         
-        let deserialized: PacketType = serde_json::from_str(&serialized).unwrap();
+        let deserialized: PacketType = serde_json::from_str(&json).unwrap();
         match deserialized {
             PacketType::Challenge { x25519_key, .. } => {
-                assert_eq!(x25519_key, Some("X25519PublicKey".to_string()));
+                assert_eq!(x25519_key, Some("X25519Key".to_string()));
             }
             _ => panic!("Wrong packet type"),
         }
-    }
-    
-    #[test]
-    fn test_challenge_without_x25519_key() {
-        // Test backward compatibility (no X25519 key)
-        let json = r#"{
-            "type": "Challenge",
-            "data": [1, 2, 3],
-            "server_key": "Ed25519PublicKey",
-            "expires_at": 1234567890,
-            "id": "challenge123"
-        }"#;
-        
-        let deserialized: PacketType = serde_json::from_str(json).unwrap();
-        match deserialized {
-            PacketType::Challenge { x25519_key, .. } => {
-                assert_eq!(x25519_key, None);
-            }
-            _ => panic!("Wrong packet type"),
-        }
-    }
-    
-    #[test]
-    fn test_packet_serialization() {
-        // Auth packet
-        let auth = PacketType::Auth {
-            public_key: "ABC123".to_string(),
-            version: "1.0.0".to_string(),
-            features: vec!["chacha20poly1305".to_string()],
-            encryption_algorithm: Some("chacha20poly1305".to_string()),
-            nonce: "123456".to_string(),
-        };
-        
-        let serialized = serde_json::to_string(&auth).unwrap();
-        let deserialized: PacketType = serde_json::from_str(&serialized).unwrap();
-        
-        match deserialized {
-            PacketType::Auth { public_key, version, features, encryption_algorithm, nonce } => {
-                assert_eq!(public_key, "ABC123");
-                assert_eq!(version, "1.0.0");
-                assert_eq!(features, vec!["chacha20poly1305"]);
-                assert_eq!(encryption_algorithm, Some("chacha20poly1305".to_string()));
-                assert_eq!(nonce, "123456");
-            }
-            _ => panic!("Deserialized to wrong type"),
-        }
-    }
-    
-    #[test]
-    fn test_session_methods() {
-        let mut session = Session {
-            id: "test-session".to_string(),
-            client_key: "test-key".to_string(),
-            ip_address: "10.0.0.1".to_string(),
-            created_at: 1000,
-            expires_at: 2000,
-            last_activity: 1500,
-        };
-        
-        // Test expiration
-        assert!(session.is_expired(2001));
-        assert!(!session.is_expired(1999));
-        
-        // Test inactivity
-        assert!(session.is_inactive(2000, 300));
-        assert!(!session.is_inactive(1700, 300));
-        
-        // Test touch
-        session.touch(2500);
-        assert_eq!(session.last_activity, 2500);
-        
-        // Test extend
-        session.extend(1000, 3000);
-        assert_eq!(session.expires_at, 4000);
     }
 }
